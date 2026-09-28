@@ -1,0 +1,13 @@
+.venv/
+.env
+*.env
+__pycache__/
+*/__pycache__/
+*.py[cod]
+.pytest_cache/
+.telegraph
+*.db
+*.sqlite3
+.DS_Store
+Thumbs.db
+*.log

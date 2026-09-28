@@ -1,0 +1,214 @@
+from decimal import Decimal
+
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from bot.models import Setting
+
+# key: (default, type, title)
+SPEC: dict[str, tuple[str, str, str]] = {
+    "rate": ("100", "dec", "Курс сервиса за 1 USDT"),
+    "seller_pct": ("5", "pct", "Процент мерчанта со статичной картой"),
+    "order_seller_pct": ("4", "pct", "Процент ордерного мерчанта"),
+    "platform_pct": ("6", "pct", "Процент площадки"),
+    "deposit_fee": ("1.5", "pct", "Комиссия пополнения xRocket"),
+    "deposit_min": ("1", "dec", "Минимальное пополнение"),
+    "withdraw_min": ("1", "dec", "Минимальный вывод"),
+    "withdraw_fee": ("0", "dec", "Комиссия вывода"),
+    "deal_minutes": ("30", "int", "Время на оплату сделки"),
+    "confirm_minutes": ("30", "int", "Покупатель может открыть спор через"),
+    "escalate_minutes": ("1440", "int", "Автоспор, если продавец молчит"),
+    "late_hold_minutes": ("30", "int", "Удержание залога после истечения"),
+    "late_minutes": ("720", "int", "Приём позднего чека после срока"),
+    "buyer_fail_limit": ("3", "int", "Лимит отмен покупателя за 24 ч"),
+    "adjust_approval_usdt": ("0", "dec", "Второй админ для корректировок от"),
+    "online_minutes": ("60", "int0", "Автоконец смены без действий"),
+    "receipt_images": ("0", "int0", "Формат чеков"),
+    "log_all": ("1", "int0", "Лог-чат"),
+    "support": ("", "text", "Ник поддержки"),
+    "manual_url": ("https://telegra.ph/Strait-Pay--P2P-obmen-USDT--RUB-v-Telegram-09-27", "url", "Ссылка на инструкцию"),
+    "order_min_rub": ("1000", "dec", "Ордер: минимальная сумма"),
+    "order_max_rub": ("1000000", "dec", "Ордер: максимальная сумма"),
+    "order_search_minutes": ("15", "int", "Ордер: поиск мерчанта"),
+    "order_take_minutes": ("10", "int", "Ордер: мерчанту на выдачу реквизитов"),
+    "order_pay_minutes": ("15", "int", "Ордер: минимальное время на оплату"),
+    "ton_sweep_address": ("", "ton", "Адрес для автоперевода USDT TON"),
+    "ton_sweep_min": ("1", "dec", "Автоперевод USDT TON от"),
+    "ton_withdraw_min": ("3", "dec", "Минимальный вывод на TON"),
+    "ton_withdraw_fee": ("2", "dec", "Комиссия вывода на TON"),
+    "tutorial": (
+        "<b>Купить USDT</b>: выберите продавца и сумму, переведите рубли на показанные реквизиты "
+        "и отправьте PDF-чек. USDT придут на баланс после подтверждения продавца.\n"
+        "<b>Продать USDT</b>: пополните кошелёк, добавьте карту или СБП, выйдите на смену. "
+        "Когда покупатель пришлёт чек, проверьте поступление в банке и подтвердите.\n"
+        "<b>Пополнение и вывод</b>: USDT в сети TON на ваш личный адрес / кошелёк или персональным чеком xRocket.",
+        "html",
+        "Текст «Как это работает»",
+    ),
+}
+
+# admin panel sections: (title, keys); every SPEC key is in exactly one section
+GROUPS: list[tuple[str, list[str]]] = [
+    ("Курс и комиссии", ["rate", "seller_pct", "order_seller_pct", "platform_pct", "deposit_fee", "withdraw_fee"]),
+    ("Сроки сделок", ["deal_minutes", "confirm_minutes", "escalate_minutes", "late_hold_minutes", "late_minutes",
+                      "online_minutes"]),
+    ("Кошелёк и лимиты", ["deposit_min", "withdraw_min", "buyer_fail_limit", "adjust_approval_usdt"]),
+    ("Правила и лог-чат", ["receipt_images", "log_all"]),
+    ("Тексты и поддержка", ["support", "tutorial", "manual_url"]),
+    ("Ордерные реквизиты", ["order_min_rub", "order_max_rub", "order_search_minutes", "order_take_minutes",
+                            "order_pay_minutes"]),
+    ("USDT в сети TON", ["ton_sweep_address", "ton_sweep_min", "ton_withdraw_min", "ton_withdraw_fee"]),
+]
+HINTS = {
+    "dec": "Число, дробная часть через точку или запятую.",
+    "pct": "Процент от 0 до 99,999.",
+    "int": "Целое число от 1 до 1440 (для сроков — минуты; 1440 = сутки).",
+    "int0": "Целое число от 0 до 1440; 0 — выключено.",
+    "text": "Ник без @, 5–32 латинских букв, цифр или _. «-» — убрать.",
+    "html": "Текст до 3000 символов, можно с форматированием Telegram.",
+    "receipt_images": "1 — принимать PDF и фото/скриншоты, 0 — только PDF.",
+    "log_all": "1 — в лог-чат идут все шаги сделок, 0 — только проблемы.",
+    "order_seller_pct": "Процент от суммы ордерной сделки, который получает ордерный мерчант. Не больше процента "
+                        "статичного мерчанта; разница остаётся площадке. Покупатель платит ту же комиссию.",
+    "seller_pct": "Процент от суммы сделки по статичной карте, который получает мерчант. Не больше процента площадки.",
+    "ton": "Адрес вашего кошелька в сети TON (UQ… или EQ…), куда бот будет пересылать поступившие USDT, или "
+           "<code>xrocket</code> — пересылать на баланс приложения xRocket. «-» — убрать (автоперевод остановится).",
+    "url": "Ссылка https://… (например, на статью в Telegraph). «-» — убрать ссылку из бота.",
+    "ton_withdraw_fee": "USDT, удерживаются с каждого вывода на кошелёк TON. Вывод выполняет xRocket с баланса "
+                        "приложения; его собственная комиссия сети покрывается из этой суммы.",
+    "ton_sweep_min": "Меньшие суммы копятся на адресе пользователя: каждый перевод стоит ~0,05 TON.",
+    "buyer_fail_limit": "Целое число: сколько отмен/просрочек за сутки допускается до блокировки покупок.",
+}
+FLAGS = ("receipt_images", "log_all")
+
+_cache: dict[str, str] = {}
+
+
+async def load(s: AsyncSession) -> None:
+    rows = (await s.scalars(select(Setting))).all()
+    # No await between clear() and update(): concurrent handlers must never observe
+    # defaults instead of configured values (e.g. a default rate while pricing a deal).
+    fresh = {k: v[0] for k, v in SPEC.items()} | {r.key: r.value for r in rows}
+    _cache.clear()
+    _cache.update(fresh)
+
+
+def merchant_pct(user, order: bool) -> Decimal:
+    """The merchant's percent: personal if an admin set one, the general one otherwise; never above the platform's,
+    so a later cut of platform_pct can never make the platform pay out of pocket."""
+    personal = user.pct_order if order else user.pct_static
+    general = dec("order_seller_pct" if order else "seller_pct")
+    return min(personal if personal is not None else general, dec("platform_pct"))
+
+
+def group_of(key: str) -> int:
+    return next(i for i, (_, keys) in enumerate(GROUPS) if key in keys)
+
+
+def human(key: str, value: str | None = None) -> str:
+    """Value as an admin reads it: units, yes/no, text length."""
+    v = get(key) if value is None else value
+    kind = SPEC[key][1]
+    if key in FLAGS:
+        return {"receipt_images": {"1": "PDF и фото", "0": "только PDF"},
+                "log_all": {"1": "все события", "0": "только проблемы"}}[key].get(v, v)
+    if key == "online_minutes" and v == "0":
+        return "выключено"
+    if key == "adjust_approval_usdt" and Decimal(v) == 0:
+        return "выключено"
+    if kind == "pct":
+        return f"{v}%"
+    if kind in ("int", "int0"):
+        if not key.endswith("minutes"):
+            return v
+        n = int(v)
+        return f"{n // 60} ч" if n >= 60 and n % 60 == 0 else f"{n} мин"
+    if kind == "int" and key.startswith("order_"):
+        return f"{v} мин"
+    if kind == "dec":
+        return f"{v} ₽" if key == "rate" or key.endswith("_rub") else f"{v} USDT"
+    if kind == "html":
+        return f"текст, {len(v)} симв."
+    if kind == "url":
+        return v.split("//", 1)[-1][:24] + "…" if v else "не задана"
+    if kind == "ton":
+        return "баланс xRocket" if v == "xrocket" else f"{v[:6]}…{v[-4:]}" if v else "не задан"
+    return f"@{v}" if v else "не задан"
+
+
+def get(key: str) -> str:
+    return _cache.get(key, SPEC[key][0])
+
+
+def dec(key: str) -> Decimal:
+    return Decimal(get(key))
+
+
+def num(key: str) -> int:
+    return int(get(key))
+
+
+async def put(s: AsyncSession, key: str, value: str) -> None:
+    await s.merge(Setting(key=key, value=value))
+    _cache[key] = value
+
+
+def validate(key: str, raw: str) -> str:
+    """Return normalized value or raise ValueError with a human message."""
+    kind = SPEC[key][1]
+    raw = raw.strip()
+    if kind in ("dec", "pct"):
+        try:
+            v = Decimal(raw.replace(",", "."))
+        except Exception:
+            raise ValueError("Введите число")
+        if not v.is_finite() or v < 0 or (kind == "pct" and v >= 100) or (key == "rate" and v == 0):
+            raise ValueError("Недопустимое значение")
+        places = 3 if kind == "pct" else 2 if key == "rate" else 6
+        if v.as_tuple().exponent < -places or v >= Decimal("10000000"):
+            raise ValueError(f"Слишком большая сумма или более {places} знаков после запятой")
+        sp = v if key == "seller_pct" else dec("seller_pct")
+        op = v if key == "order_seller_pct" else dec("order_seller_pct")
+        pp = v if key == "platform_pct" else dec("platform_pct")
+        if key in ("seller_pct", "order_seller_pct", "platform_pct"):
+            if pp < sp:
+                raise ValueError("Процент площадки должен быть ≥ проценту мерчанта со статичной картой")
+            if op > sp:  # a static card is always available to buyers: it is worth more than on-demand requisites
+                raise ValueError("Ордерный мерчант не может получать больше мерчанта со статичной картой")
+        return format(v.normalize(), "f")
+    if kind in ("int", "int0"):
+        low = 0 if kind == "int0" else 1
+        if not raw.isdigit() or not low <= int(raw) <= 1440:
+            raise ValueError(f"Введите целое число от {low} до 1440")
+        if key in ("receipt_images", "log_all") and int(raw) > 1:
+            raise ValueError("Введите 1 или 0")
+        return str(int(raw))
+    if kind == "url":
+        if raw == "-":
+            return ""
+        if not raw.startswith("https://") or len(raw) > 300 or any(c.isspace() for c in raw) or "\"" in raw:
+            raise ValueError("Нужна ссылка https://… без пробелов, до 300 символов")
+        return raw
+    if kind == "ton":
+        from bot.services import ton
+        if raw == "-":
+            return ""
+        if raw.lower() == "xrocket":
+            return "xrocket"
+        addr = ton.parse_address(raw)
+        if not addr:
+            raise ValueError("Это не адрес TON. Скопируйте адрес кошелька целиком (UQ… или EQ…)")
+        if ton.enabled() and ton.raw(addr) == ton.gas_address():
+            raise ValueError("Это газ-кошелёк бота, а нужен ваш личный кошелёк")
+        return addr
+    if key == "support":
+        raw = raw.lstrip("@")
+        if raw == "-":
+            return ""
+        if not 5 <= len(raw) <= 32 or not all(c.isascii() and (c.isalnum() or c == "_") for c in raw):
+            raise ValueError("Некорректный ник")
+    if key == "tutorial" and len(raw) > 3000:
+        raise ValueError("Туториал не длиннее 3000 символов")
+    if not raw:
+        raise ValueError("Пустое значение")
+    return raw
