@@ -22,19 +22,13 @@ def _u(v) -> str:
 
 
 def render(sn: finance.Snapshot) -> str:
-    wallet = {"address": f"Ваш кошелёк (автоперевод): <b>{_u(sn.wallet)}</b>",
-              "xrocket": "Автоперевод идёт на баланс xRocket",
-              "none": "Кошелёк для автоперевода не задан"}[sn.wallet_kind]
     free = sn.free
     lines = [
         title(pe("stats"), "Финансы Strait Pay"),
         f"обновлено {now().astimezone(MSK):%d.%m %H:%M} МСК",
         "",
         "<b>Что есть</b>",
-        f"xRocket (из него платятся выводы): <b>{_u(sn.xrocket)}</b>",
-        wallet,
-        f"Ещё на адресах пополнения: <b>{money.usdt(sn.unswept)} USDT</b>" if sn.unswept else "",
-        f"Итого: <b>{money.usdt(sn.assets)} USDT</b>",
+        f"xRocket — сюда пополнения, отсюда выводы: <b>{_u(sn.xrocket)}</b>",
         f"Пришло на Bybit операторов по ордерам (в «есть» не входит — переведите на xRocket): 24 ч "
         f"<b>{money.usdt(sn.bybit['24h'])}</b> · 7 д {money.usdt(sn.bybit['7d'])} · всего "
         f"{money.usdt(sn.bybit['all'])} USDT" if sn.bybit["all"] else "",
@@ -57,8 +51,7 @@ def render(sn: finance.Snapshot) -> str:
         short = sn.queued - (sn.xrocket or 0)
         lines += ["", f"⚠️ В очереди на вывод {sn.queued_n} на {money.usdt(sn.queued)} USDT"
                       + (f" — пополните xRocket минимум на {money.usdt(short)} USDT" if short > 0 else "")]
-    lines += ["", "«Можно забрать» = что есть − что должны пользователям; прибыль уже внутри. Если на кошельке "
-                  "автоперевода есть и ваши личные средства, они тоже учтены."]
+    lines += ["", "«Можно забрать» = что есть − что должны пользователям; прибыль уже внутри."]
     return "\n".join(line for line in lines if line is not None)
 
 

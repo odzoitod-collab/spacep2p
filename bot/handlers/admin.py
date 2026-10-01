@@ -95,16 +95,14 @@ async def admin_screen(bot: Bot, s: AsyncSession, user: User, src=None):
     active = [line for n, line in todo if n]
     await show(bot, user, "\n".join([
         title(pe("settings"), "Админ-панель"),
-        "",
-        title(pe("bell"), "Требует внимания"),
+        "<b>Требует внимания</b>",
         quote(*active) if active else f"{pe('ok')} Очереди пусты",
-        title(pe("stats"), "Сводка"),
+        "<b>Сводка</b>",
         quote(
-            f"{pe('people')} Пользователей: <b>{users}</b> · на смене: <b>{online}</b> · карт в работе: <b>{cards}</b>",
-            f"{pe('ok')} За 24 ч: <b>{done24}</b> сделок на <b>{money.fmt(Decimal(volume24))} ₽</b>, "
-            f"доход <b>{money.usdt(Decimal(income24))} USDT</b> · открыто сейчас: {opened}",
-            f"{pe('up')} Доход площадки всего: <b>{money.usdt(Decimal(income))} USDT</b>",
-            f"{pe('lock')} Балансы пользователей: <b>{money.usdt(held)} USDT</b> · xRocket: {rocket}",
+            f"Пользователей: <b>{users}</b> · на смене: <b>{online}</b> · карт в работе: <b>{cards}</b>",
+            f"За 24 ч: <b>{done24}</b> сделок · <b>{money.fmt(Decimal(volume24))} ₽</b> · открыто сейчас: {opened}",
+            f"Доход: 24 ч <b>{money.usdt(Decimal(income24))}</b> · всего <b>{money.usdt(Decimal(income))} USDT</b>",
+            f"Балансы пользователей: <b>{money.usdt(held)} USDT</b> · xRocket: {rocket}",
         ),
     ]) + solvency, kb(
         btn(f"Споры ({disputes})", "adl:dispute", "flag", style="danger") if disputes else None,
@@ -114,12 +112,12 @@ async def admin_screen(bot: Bot, s: AsyncSession, user: User, src=None):
         btn(f"Корректировки ({approvals})", "aadjl", "dollar", style="primary") if approvals else None,
         btn(f"Заявки на API ({api_apps})", "aapi", "key", style="primary") if api_apps else None,
         btn(f"Анкеты мерчантов ({om_apps})", "aoml", "key", style="primary") if om_apps else None,
+        btn("Финансы: сколько можно забрать", "afin", style="success"),
         [btn("Найти", "au", "search"), btn("Сделки", "ad", "list")],
         [btn("Ввод и вывод", "al", "wallet"), btn("Карты", "ac:0", "card")],
-        [btn("Отчёты CSV", "arp", "doc"), btn("Обращения", "atl", "support")],
-        [btn("USDT TON", "atn", "wallet"), btn("API для сервисов", "aapi", "key")],
-        btn("Финансы: сколько можно забрать", "afin", style="success"),
         [btn("Комиссии", "acm", "percent"), btn("Ордерные мерчанты", "aoml", "key")],
+        [btn("API-клиенты", "aapi", "key"), btn("Чат и рассылка", "ach", "people")],
+        [btn("Обращения", "atl", "support"), btn("Отчёты CSV", "arp", "doc")],
         [btn("Настройки", "as", "settings"), btn("Журнал", "aa", "list")],
         [btn("Обновить", "a", "refresh"), back("menu", "В меню")],
     ), src)
@@ -189,12 +187,12 @@ def _ret(data: dict, key: str) -> str:
     return data.get("ret") or f"asg:{settings.group_of(key)}"
 
 
-RETURN = {"acs": "acm", "asr": "atn:sw"}  # editor opened from «Комиссии и проценты» / TON auto-transfer: back there
+RETURN = {"acs": "acm", "acx": "ach"}  # editor opened from «Комиссии и проценты» / the chat screen: back there
 
 
-@router.callback_query(F.data.startswith("as:") | F.data.startswith("acs:") | F.data.startswith("asr:"))
+@router.callback_query(F.data.startswith("as:") | F.data.startswith("acs:") | F.data.startswith("acx:"))
 async def cb_setting(c: CallbackQuery, bot: Bot, user: User, state: FSMContext):
-    """as:<key> from Settings; acs:<key> / asr:<key> return to their screen after saving."""
+    """as:<key> from Settings; acs:<key> / acx:<key> return to their screen after saving."""
     prefix, key = c.data.split(":", 1)
     if key not in settings.SPEC:
         return await c.answer()
@@ -215,16 +213,16 @@ async def msg_setting(m: Message, bot: Bot, s: AsyncSession, user: User, state: 
     old = settings.get(key)
     await settings.put(s, key, value)
     audit.log(s, user.id, "setting", key, f"{old} → {value}"[:2000])
-    if key == "ton_sweep_address":  # where the money goes: every change is visible to all admins
-        events.add(s, "app:ton", "target_changed", f"Адрес автоперевода USDT TON изменён администратором "
-                   f"{user.name} ({user.id}): {old or '—'} → {value or '—'}", user.id, alert=True)
+    if key == "chat_id":
+        events.add(s, "app:chat", "chat_changed", f"Чат сообщества: {old or '—'} → {value or 'отключён'} "
+                   f"({user.name}, {user.id})", user.id, alert=True)
     await state.set_state(None)
     note = ok(f"Сохранено: {esc(settings.human(key, old))} → {esc(settings.human(key))}")
     if data.get("ret") == "acm":
         return await commissions_screen(bot, s, user, note=note)
-    if data.get("ret") == "atn:sw":
-        from bot.handlers.admin_ton import ton_sweep_screen
-        return await ton_sweep_screen(bot, s, user, note=note)
+    if data.get("ret") == "ach":
+        from bot.handlers.admin_chat import chat_screen
+        return await chat_screen(bot, s, user, note=note)
     await group_screen(bot, user, settings.group_of(key), note=note)
 
 
@@ -253,9 +251,10 @@ async def commissions_screen(bot: Bot, s: AsyncSession, admin: User, src=None, n
         f"На 10 000 ₽ покупатель получает {money.usdt(q.buyer_credit)} USDT; площадке {money.usdt(q.platform_fee)} "
         f"(карта) или {money.usdt(qo.platform_fee)} USDT (ордер: мерчант отдаёт {money.usdt(qo.seller_debit)}).",
         title(pe("wallet"), "Кошелёк"),
-        quote(f"{pe('down')} Пополнение xRocket: {settings.get('deposit_fee')}% · USDT TON: без комиссии",
-              f"{pe('up')} Вывод чеком xRocket: {settings.human('withdraw_fee')} · на TON: "
-              f"{settings.human('ton_withdraw_fee')}"),
+        quote(f"{pe('down')} Пополнение (счёт и адрес): {settings.get('deposit_fee')}%",
+              f"{pe('up')} Вывод чеком: {settings.human('withdraw_fee')} · на кошелёк: "
+              f"{settings.human('chain_withdraw_fee')} + сеть xRocket"),
+        "API-клиенты могут работать по своим условиям (курс и процент) — «API-клиенты» → клиент.",
         title(pe("star"), f"Личные ставки мерчантов ({len(personal)})"),
         quote(*[f"<code>{u.id}</code> {esc((u.name or '—')[:20])}: карта {pct(u.pct_static)}" for u in personal])
         if personal else "Нет — все работают по общим ставкам. Задать: профиль пользователя → «Проценты мерчанта».",
@@ -264,7 +263,7 @@ async def commissions_screen(bot: Bot, s: AsyncSession, admin: User, src=None, n
         [btn("Покупатель", "acs:platform_pct", "dollar"), btn("Курс", "acs:rate", "swap")],
         [btn("Мерчант: карта", "acs:seller_pct", "card"), btn("Курс ордерного", "acs:order_rate", "key")],
         [btn("Пополнение", "acs:deposit_fee", "down"), btn("Вывод чеком", "acs:withdraw_fee", "up")],
-        btn("Вывод на TON", "acs:ton_withdraw_fee", "up"),
+        btn("Вывод на кошелёк", "acs:chain_withdraw_fee", "up"),
         *[btn(f"Личная ставка · {u.id} {(u.name or '')[:16]}", f"aup:{u.id}", "star") for u in personal],
         back("a", "Админ-панель"),
     ), src)

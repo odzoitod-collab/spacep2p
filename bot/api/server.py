@@ -138,7 +138,7 @@ async def balance(request: web.Request) -> web.Response:
 
 
 async def rates(request: web.Request) -> web.Response:
-    return web.json_response(api.rates())
+    return web.json_response(api.rates(request[CLIENT]))
 
 
 async def liquidity(request: web.Request) -> web.Response:

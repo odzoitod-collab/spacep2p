@@ -1,6 +1,7 @@
 """Strait Pay API for services: application form, then the owner's console (token, webhook, limits, orders)."""
 import secrets
 from datetime import timedelta
+from decimal import Decimal
 
 from aiogram import Bot, F, Router
 from aiogram.fsm.context import FSMContext
@@ -12,7 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from bot.config import config
 from bot.emoji import back, btn, kb, pe
 from bot.models import ApiApplication, ApiClient, Deal, User, now
-from bot.services import api, deals, events, money
+from bot.services import api, deals, events, money, settings
 from bot.ui import BRAND, at, esc, ok, quote, show, title, warn
 
 router = Router()
@@ -53,25 +54,23 @@ async def api_screen(bot: Bot, s: AsyncSession, user: User, src=None, note: str 
                          .order_by(ApiApplication.id.desc()).limit(1))
     intro = [
         title(pe("key"), f"{BRAND} API"),
-        "",
-        "Принимайте оплату рублями, получайте USDT: ваш сервис открывает заказ на нужную сумму, показывает "
-        "покупателю реквизиты продавца, отправляет PDF-чек и получает статус «успешно» — USDT зачисляются на ваш "
-        "баланс на тех же условиях, что и при обычной покупке.",
-        quote(f"{pe('swap')} Заказ на любую доступную сумму · реквизиты мерчанта в ответе",
-              f"{pe('doc')} Загрузка PDF-чека · статусы и вебхуки с подписью HMAC",
-              f"{pe('wallet')} Баланс и вывод — в Кошельке: xRocket или USDT в сети TON"),
+        "Принимайте рубли — получайте USDT на баланс. Заказ → реквизиты → PDF-чек → «успешно».",
+        quote("Реквизиты статичных карт и ордерных мерчантов — в одном API",
+              "Одни условия (курс и процент) на все заказы",
+              "Статусы по запросу и вебхуки с подписью HMAC",
+              "Вывод — в Кошельке: чек xRocket или кошелёк в любой сети"),
     ]
     if app and app.status == "pending":
-        lines = intro + ["", f"{pe('clock')} <b>Заявка «{esc(app.project)}» на рассмотрении</b> с {at(app.created_at, 'dt')}. "
+        lines = intro + [f"{pe('clock')} <b>Заявка «{esc(app.project)}» на рассмотрении</b> с {at(app.created_at, 'dt')}. "
                              "Ответ придёт в этот чат."]
         markup = kb(btn("Документация API", icon="doc", url=docs_url()), back("menu", "В меню"))
     else:
         if app and app.status == "rejected":
-            intro += ["", f"{pe('cross')} Прошлая заявка отклонена"
+            intro += [f"{pe('cross')} Прошлая заявка отклонена"
                       + (f": <i>{esc(app.reason)}</i>" if app.reason else "") + "."]
         wait = app and app.status == "rejected" and now() - deals.aware(app.decided_at) < REAPPLY_AFTER
-        lines = intro + ["", f"Подать заявку снова можно после {at(deals.aware(app.decided_at) + REAPPLY_AFTER, 'dt')}."
-                         if wait else "Доступ выдаётся по заявке: расскажите о проекте, трафике и объёме."]
+        lines = intro + [f"Подать заявку снова можно после {at(deals.aware(app.decided_at) + REAPPLY_AFTER, 'dt')}."
+                         if wait else f"{pe('info')} Доступ — по заявке: проект, трафик и объём, 5 шагов."]
         markup = kb(None if wait else btn("Подать заявку", "api:apply", "pencil", style="primary"),
                     btn("Документация API", icon="doc", url=docs_url()), back("menu", "В меню"))
     await show(bot, user, "\n".join(lines) + note, markup, src)
@@ -202,32 +201,37 @@ async def console(bot: Bot, s: AsyncSession, user: User, client: ApiClient, src=
     total, success = (await s.execute(select(func.count(Deal.id), func.count(Deal.id).filter(
         Deal.status == "completed")).where(Deal.api_client_id == client.id))).one()
     active = client.status == "active"
+    rate, pct = settings.client_terms(client)
+    example = money.split(Decimal(10000), Decimal("Infinity"), rate, pct).buyer_credit
     await show(bot, user, "\n".join([
         title(pe("key"), f"{BRAND} API · {esc(client.project)}"),
         f"{pe('ok') if active else pe('pause')} <b>{'Доступ активен' if active else 'Доступ приостановлен'}</b>"
         + ("" if active else " — напишите в поддержку"),
-        "",
+        "<b>Условия</b>",
+        quote(f"Курс: <b>{money.fmt(rate)} ₽</b> · комиссия <b>{money.fmt(pct, 3)}%</b> — на все заказы",
+              f"10 000 ₽ → <b>{money.usdt(example)} USDT</b> на баланс"),
+        "<b>Подключение</b>",
         quote(f"{pe('search')} Base URL: <code>{config.api_url}/v1</code>",
               f"{pe('key')} Токен: " + (f"<code>{api.TOKEN_PREFIX}…{client.token_hint}</code> · выпущен "
                                         f"{at(client.token_at, 'dt')}" if client.token_hash else "<b>не выпущен</b>"),
               f"{pe('bell')} Вебхук: " + (f"<code>{esc(client.webhook_url)}</code>" if client.webhook_url
                                          else "не задан — статусы только по запросу GET /v1/orders/{id}")),
-        title(pe("filter"), "Лимиты"),
+        "<b>Лимиты</b>",
         quote(f"{pe('ruble')} Заказ: от {money.fmt(client.min_rub)} до {money.fmt(client.max_rub)} ₽",
               f"{pe('clock')} В сутки: {money.fmt(used['today_rub'])} из {money.fmt(client.daily_rub)} ₽",
               f"{pe('fire')} Неоплаченных заказов: {used['open_orders']} из {client.max_open}",
               f"{pe('stats')} Запросов в секунду: {client.rps}"),
-        title(pe("wallet"), "Баланс API"),
+        "<b>Баланс</b>",
         quote(f"{pe('dollar')} Доступно: <b>{money.usdt(user.balance)} USDT</b>"
               + (f" · заморожено {money.usdt(user.frozen)}" if user.frozen else ""),
               f"{pe('ok')} Заказов: {total}, успешных: {success}"),
-        "USDT по успешным заказам приходят на этот баланс; вывести — в «Кошелёк».",
+        f"{pe('info')} USDT по успешным заказам приходят на этот баланс; вывести — в «Кошелёк».",
     ]) + note, kb(
         btn("Перевыпустить токен" if client.token_hash else "Выпустить токен", "api:tok", "key",
             style=None if client.token_hash else "primary") if active else None,
         [btn("Вебхук", "api:wh", "bell"), btn("Секрет вебхука", "api:sec", "lock")],
         [btn("Заказы API", "api:orders", "list"), btn("Документация", icon="doc", url=docs_url())],
-        [btn("Кошелёк", "w", "wallet"), back("menu", "В меню")],
+        back("menu", "В меню"),
     ), src)
 
 

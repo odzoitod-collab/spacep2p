@@ -11,10 +11,10 @@ SPEC: dict[str, tuple[str, str, str]] = {
     "seller_pct": ("5", "pct", "Процент мерчанта со статичной картой"),
     "order_rate": ("104", "dec", "Курс ордерного мерчанта за 1 USDT"),
     "platform_pct": ("6", "pct", "Процент площадки"),
-    "deposit_fee": ("1.5", "pct", "Комиссия пополнения xRocket"),
+    "deposit_fee": ("1.5", "pct", "Комиссия пополнения"),
     "deposit_min": ("1", "dec", "Минимальное пополнение"),
     "withdraw_min": ("1", "dec", "Минимальный вывод"),
-    "withdraw_fee": ("0", "dec", "Комиссия вывода"),
+    "withdraw_fee": ("0", "dec", "Комиссия вывода чеком"),
     "deal_minutes": ("30", "int", "Время на оплату сделки"),
     "confirm_minutes": ("30", "int", "Покупатель может открыть спор через"),
     "escalate_minutes": ("1440", "int", "Автоспор, если продавец молчит"),
@@ -33,16 +33,13 @@ SPEC: dict[str, tuple[str, str, str]] = {
     "order_take_minutes": ("10", "int", "Ордер: мерчанту на выдачу реквизитов"),
     "order_pay_minutes": ("15", "int", "Ордер: минимальное время на оплату"),
     "order_check_minutes": ("15", "int", "Ордер: оператору на Bybit-ордер"),
-    "ton_sweep_address": ("", "ton", "Адрес для автоперевода USDT TON"),
-    "ton_sweep_min": ("1", "dec", "Автоперевод USDT TON от"),
-    "ton_withdraw_min": ("3", "dec", "Минимальный вывод на TON"),
-    "ton_withdraw_fee": ("2", "dec", "Комиссия вывода на TON"),
+    "chain_withdraw_min": ("3", "dec", "Минимальный вывод на кошелёк"),
+    "chain_withdraw_fee": ("1", "dec", "Комиссия вывода на кошелёк"),
+    "chat_id": ("", "chat", "Чат сообщества"),
     "tutorial": (
-        "<b>Купить USDT</b>: выберите продавца и сумму, переведите рубли на показанные реквизиты "
-        "и отправьте PDF-чек. USDT придут на баланс после подтверждения продавца.\n"
-        "<b>Продать USDT</b>: пополните кошелёк, добавьте карту или СБП, выйдите на смену. "
-        "Когда покупатель пришлёт чек, проверьте поступление в банке и подтвердите.\n"
-        "<b>Пополнение и вывод</b>: USDT в сети TON на ваш личный адрес / кошелёк или персональным чеком xRocket.",
+        "<b>Купить</b>: продавец → сумма → перевод по реквизитам → PDF-чек. USDT придут после подтверждения.\n"
+        "<b>Продать</b>: пополните кошелёк, добавьте карту, выйдите на смену, подтверждайте поступления.\n"
+        "<b>Кошелёк</b>: пополнение и вывод USDT через xRocket — счёт, адрес в любой сети или чек.",
         "html",
         "Текст «Как это работает»",
     ),
@@ -50,15 +47,16 @@ SPEC: dict[str, tuple[str, str, str]] = {
 
 # admin panel sections: (title, keys); every SPEC key is in exactly one section
 GROUPS: list[tuple[str, list[str]]] = [
-    ("Курс и комиссии", ["rate", "order_rate", "seller_pct", "platform_pct", "deposit_fee", "withdraw_fee"]),
+    ("Курс и комиссии", ["rate", "order_rate", "seller_pct", "platform_pct", "deposit_fee", "withdraw_fee",
+                         "chain_withdraw_fee"]),
     ("Сроки сделок", ["deal_minutes", "confirm_minutes", "escalate_minutes", "late_hold_minutes", "late_minutes",
                       "online_minutes"]),
-    ("Кошелёк и лимиты", ["deposit_min", "withdraw_min", "buyer_fail_limit", "adjust_approval_usdt"]),
+    ("Кошелёк и лимиты", ["deposit_min", "withdraw_min", "chain_withdraw_min", "buyer_fail_limit",
+                          "adjust_approval_usdt"]),
     ("Правила и лог-чат", ["receipt_images", "log_all"]),
-    ("Тексты и поддержка", ["support", "tutorial", "manual_url"]),
+    ("Тексты, поддержка, чат", ["support", "tutorial", "manual_url", "chat_id"]),
     ("Ордерные реквизиты", ["order_min_rub", "order_max_rub", "order_search_minutes", "order_take_minutes",
                             "order_pay_minutes", "order_check_minutes"]),
-    ("USDT в сети TON", ["ton_sweep_address", "ton_sweep_min", "ton_withdraw_min", "ton_withdraw_fee"]),
 ]
 HINTS = {
     "dec": "Число, дробная часть через точку или запятую.",
@@ -73,12 +71,12 @@ HINTS = {
                   "(через Bybit-ордер или из баланса). Процента у ордерных мерчантов нет. Не выше курса сервиса / "
                   "(1 − процент площадки), иначе площадка доплачивала бы покупателю из своих.",
     "seller_pct": "Процент от суммы сделки по статичной карте, который получает мерчант. Не больше процента площадки.",
-    "ton": "Адрес вашего кошелька в сети TON (UQ… или EQ…), куда бот будет пересылать поступившие USDT, или "
-           "<code>xrocket</code> — пересылать на баланс приложения xRocket. «-» — убрать (автоперевод остановится).",
+    "chat": "ID группы, например <code>-1001234567890</code> (бот — админ с правом приглашать и закреплять). "
+            "«-» — отключить чат.",
     "url": "Ссылка https://… (например, на статью в Telegraph). «-» — убрать ссылку из бота.",
-    "ton_withdraw_fee": "USDT, удерживаются с каждого вывода на кошелёк TON. Вывод выполняет xRocket с баланса "
-                        "приложения; его собственная комиссия сети покрывается из этой суммы.",
-    "ton_sweep_min": "Меньшие суммы копятся на адресе пользователя: каждый перевод стоит ~0,05 TON.",
+    "chain_withdraw_fee": "USDT площадке с каждого вывода на кошелёк. Комиссия сети xRocket добавляется сверху "
+                          "и зависит от сети.",
+    "deposit_fee": "Процент с каждого пополнения — и счётом, и по адресу. Удерживается из поступившей суммы.",
     "buyer_fail_limit": "Целое число: сколько отмен/просрочек за сутки допускается до блокировки покупок.",
 }
 FLAGS = ("receipt_images", "log_all")
@@ -100,6 +98,13 @@ def merchant_pct(user) -> Decimal:
     """A static-card merchant's percent: personal if an admin set one, the general one otherwise; never above the
     platform's, so a later cut of platform_pct can never make the platform pay out of pocket."""
     return min(user.pct_static if user.pct_static is not None else dec("seller_pct"), dec("platform_pct"))
+
+
+def client_terms(client) -> tuple[Decimal, Decimal]:
+    """(rate, platform percent) an API client is priced by — his own if an admin set them — for every order,
+    static card or order requisites alike."""
+    return (client.rate if client.rate is not None else dec("rate"),
+            client.pct if client.pct is not None else dec("platform_pct"))
 
 
 def order_rate_cap(rate: Decimal, platform_pct: Decimal) -> Decimal:
@@ -137,8 +142,8 @@ def human(key: str, value: str | None = None) -> str:
         return f"текст, {len(v)} симв."
     if kind == "url":
         return v.split("//", 1)[-1][:24] + "…" if v else "не задана"
-    if kind == "ton":
-        return "баланс xRocket" if v == "xrocket" else f"{v[:6]}…{v[-4:]}" if v else "не задан"
+    if kind == "chat":
+        return v or "не задан"
     return f"@{v}" if v else "не задан"
 
 
@@ -200,18 +205,12 @@ def validate(key: str, raw: str) -> str:
         if not raw.startswith("https://") or len(raw) > 300 or any(c.isspace() for c in raw) or "\"" in raw:
             raise ValueError("Нужна ссылка https://… без пробелов, до 300 символов")
         return raw
-    if kind == "ton":
-        from bot.services import ton
+    if kind == "chat":
         if raw == "-":
             return ""
-        if raw.lower() == "xrocket":
-            return "xrocket"
-        addr = ton.parse_address(raw)
-        if not addr:
-            raise ValueError("Это не адрес TON. Скопируйте адрес кошелька целиком (UQ… или EQ…)")
-        if ton.enabled() and ton.raw(addr) == ton.gas_address():
-            raise ValueError("Это газ-кошелёк бота, а нужен ваш личный кошелёк")
-        return addr
+        if not raw.lstrip("-").isdigit() or not raw.startswith("-"):
+            raise ValueError("Нужен числовой ID группы, начинается с «-», например -1001234567890")
+        return raw
     if key == "support":
         raw = raw.lstrip("@")
         if raw == "-":

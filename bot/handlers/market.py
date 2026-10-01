@@ -64,7 +64,7 @@ async def buy_list(bot: Bot, s: AsyncSession, user: User, state: FSMContext, pag
     filters = " · ".join([f"{money.fmt(amount)} ₽" if amount else "любая сумма",
                           esc(bank) if bank else "любой банк", KINDS[kind].lower() if kind else "карта и СБП"])
     has_filters = bool(amount or bank or kind)
-    lines = [title(pe("down"), "RUB ⇄ USDT · покупка USDT"), "", rate_block(), "", f"{pe('filter')} Фильтр: {filters}", ""]
+    lines = [title(pe("down"), "RUB ⇄ USDT · покупка USDT"), rate_block(), f"Фильтр: {filters}"]
     own = await s.scalar(select(func.count(Card.id)).where(Card.user_id == user.id, Card.is_active, ~Card.is_deleted))
     if own:
         lines.append(f"{pe('info')} Ваши карты ({own}) здесь не показываются — покупатели видят их в своём списке. "
@@ -72,7 +72,8 @@ async def buy_list(bot: Bot, s: AsyncSession, user: User, state: FSMContext, pag
     if active:
         lines.append(f"{pe('warn')} У вас открыта сделка #{active.id}. Новую можно создать после неё.")
     elif rows:
-        lines.append(f"{pe('people')} Продавцов на смене: <b>{len(rows)}</b>. Кнопка: банк · суммы · сделок у продавца.")
+        lines.append(f"{pe('info')} Продавцов на смене: <b>{len(rows)}</b>. Кнопка: банк · суммы · сделок у продавца. "
+                     "Нет нужной суммы — «Реквизиты под сумму».")
     else:
         lines.append(f"{pe('clock')} Сейчас нет продавцов " + ("под этот фильтр. Сбросьте фильтр или обновите позже."
                                                              if has_filters else "на смене. Загляните через несколько минут."))

@@ -82,30 +82,26 @@ async def seller_menu(bot: Bot, s: AsyncSession, user: User, src=None, note: str
     lines = [
         title(pe("card"), "USDT ⇄ RUB · панель мерчанта"),
         status,
-        "",
         quote(
-            f"{pe('stats')} Сегодня: <b>{today['n']}</b> сделок на <b>{money.fmt(today['rub'])} ₽</b> · "
-            f"доход <b>+{money.usdt(today['income'])} USDT</b>" if today["n"] else "",
-            f"{pe('wallet')} Доступно: <b>{money.usdt(user.balance)} USDT</b> — хватит на сделку до {money.fmt(cap)} ₽",
-            f"{pe('lock')} Заморожено в сделках: <b>{money.usdt(user.frozen)} USDT</b>",
-            f"{pe('up')} Ваш доход: <b>{money.fmt(settings.merchant_pct(user), 3)}%</b> по картам"
-            + (" (личная ставка)" if user.pct_static is not None else "")
-            + f" · ордера — фиксированный курс <b>{money.fmt(settings.dec('order_rate'))} ₽</b>",
-            f"{pe('fire')} Открытых сделок: <b>{len(todo)}</b>" + (f", ждут проверки: <b>{len(need_check)}</b>"
-                                                                  if need_check else ""),
+            f"Сегодня: <b>{today['n']}</b> · {money.fmt(today['rub'])} ₽ · <b>+{money.usdt(today['income'])} USDT</b>"
+            if today["n"] else "",
+            f"Доступно: <b>{money.usdt(user.balance)} USDT</b> — сделка до {money.fmt(cap)} ₽",
+            f"В сделках: {money.usdt(user.frozen)} USDT" if user.frozen else "",
+            f"Ваш доход: <b>{money.fmt(settings.merchant_pct(user), 3)}%</b> с каждой сделки"
+            + (" (личная ставка)" if user.pct_static is not None else ""),
+            f"Открытых сделок: <b>{len(todo)}</b>" + (f" · ждут проверки: <b>{len(need_check)}</b>" if need_check else ""),
         ),
     ]
     if not cards:
-        lines += ["", "Добавьте карту или номер для СБП — после этого вы сразу выйдете на смену и "
-                      "покупатели увидят вас в списке «Купить USDT»."]
+        lines.append(f"{pe('info')} Добавьте карту или СБП — сразу выйдете на смену и попадёте в список покупателей.")
     elif user.balance <= 0:
-        lines += ["", f"{pe('warn')} Нет свободного баланса — пополните кошелёк, иначе карты не видны покупателям."]
+        lines.append(f"{pe('warn')} Нет свободного баланса — пополните кошелёк, иначе карты не видны.")
     elif user.is_online and not visible:
-        lines += ["", f"{pe('warn')} Ни одна карта сейчас не видна покупателям — откройте карту, там указана причина."]
-    lines += ["", "У карты в списке ниже видно, показывается ли она покупателям. Свои карты в «RUB ⇄ USDT» вы не видите. "
-              f"Как работать с картами и сделками — в {manual('инструкции')}.",
-              f"Смена завершается сама после {settings.get('online_minutes')} мин без действий в боте."
-              if settings.num("online_minutes") else "Смена длится, пока вы сами её не завершите."]
+        lines.append(f"{pe('warn')} Ни одна карта не видна покупателям — откройте карту, там причина.")
+    lines.append(f"{pe('info')} У каждой карты в списке видно, показывается ли она покупателям. Подробно — в "
+                 f"{manual('инструкции')}. "
+                 + (f"Смена закончится сама через {settings.get('online_minutes')} мин без действий."
+                    if settings.num("online_minutes") else "Смена длится, пока вы её не завершите."))
     await show(bot, user, "\n".join(lines) + note, kb(
         btn(f"Проверить оплату ({len(need_check)})", f"dl:{need_check[0].id}", "bell", style="danger")
         if need_check else None,
@@ -115,7 +111,6 @@ async def seller_menu(bot: Bot, s: AsyncSession, user: User, src=None, note: str
         btn("Добавить карту", "sl:add", "plus", style=None if cards else "primary"),
         [btn(f"В работе ({len(todo)})" if todo else "В работе", "sl:work", "fire"), btn("Статистика", "sl:st", "stats")],
         btn("Настройки", "sl:cfg", "settings"),
-        btn("Пополнить", "w", "wallet"),
         back("menu", "В меню"),
     ), src)
 
@@ -177,7 +172,7 @@ async def cb_seller_settings(c: CallbackQuery, bot: Bot, s: AsyncSession, user: 
         quote(f"{pe('bell')} Уведомления о сделках: <b>{'без звука' if user.quiet else 'со звуком'}</b>",
               f"{pe('pause')} Смена завершается сама после {auto} мин без действий (за 5 мин придёт напоминание)"
               if auto else f"{pe('live')} Смена длится, пока вы её не завершите"),
-        "Суммы и лимит в день — у каждой карты отдельно; заявки на ордерные реквизиты — в «Ордерные реквизиты».",
+        f"{pe('info')} Суммы и лимит в день задаются у каждой карты.",
     ]) + note, kb(
         btn("Включить звук" if user.quiet else "Уведомления без звука", "sl:quiet", "bell"),
         btn("Выключить все карты", "sl:alloff", "pause"),

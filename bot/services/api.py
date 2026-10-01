@@ -95,7 +95,7 @@ def order_json(d: Deal, card: Card | None) -> dict:
         "status": status,
         "amount_rub": str(d.amount_rub),
         "amount_usdt": str(d.buyer_credit),
-        "rate": str(d.rate),
+        "rate": str(d.buyer_rate or d.rate),
         "fee_percent": str(d.platform_pct),
         "created_at": iso(d.created_at),
         "expires_at": iso(d.expires_at),
@@ -141,11 +141,12 @@ async def usage(s: AsyncSession, client: ApiClient) -> dict:
     return {"open_orders": waiting, "today_rub": Decimal(today)}
 
 
-def rates() -> dict:
-    rate, sp, pp = settings.dec("rate"), settings.dec("seller_pct"), settings.dec("platform_pct")
+def rates(client: ApiClient) -> dict:
+    """The client's own terms: the same for orders on static cards and on order requisites."""
     from bot.services import money
-    example = money.quote(Decimal(10000), rate, sp, pp)
-    return {"pair": "RUB/USDT", "rate": str(rate), "fee_percent": str(pp),
+    rate, pp = settings.client_terms(client)
+    example = money.split(Decimal(10000), Decimal("Infinity"), rate, pp)
+    return {"pair": "RUB/USDT", "rate": format(rate.normalize(), "f"), "fee_percent": format(pp.normalize(), "f"),
             "example": {"amount_rub": "10000", "amount_usdt": str(example.buyer_credit)}}
 
 

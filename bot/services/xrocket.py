@@ -15,8 +15,8 @@ ERRORS_RU = {
     "client_id_already_taken": "операция уже создана",
     "unauthorized": "ошибка авторизации API",
     "operation_disabled": "операция временно отключена",
-    "network_is_suspended": "вывод в сети TON временно приостановлен",
-    "withdrawal_incorrect_address": "адрес не принят — проверьте, что это адрес в сети TON",
+    "network_is_suspended": "сеть временно приостановлена",
+    "withdrawal_incorrect_address": "адрес не принят — проверьте адрес и сеть",
     "withdrawal_incorrect_comment": "комментарий (memo) не принят — проверьте его",
     "withdrawal_asset_not_allowed": "вывод USDT временно недоступен",
 }
@@ -71,18 +71,47 @@ class XRocket:
         code = str(body.get("type", r.status_code)).rsplit("/", 1)[-1]
         raise XRocketError(code, body.get("detail") or body.get("title") or r.text[:300], r.status_code)
 
-    async def create_invoice(self, amount: Decimal, client_id: str, description: str) -> dict:
-        result = await self._req("POST", "/api/v1/invoices", json={
-            "priceAmount": str(amount),
-            "priceCurrency": "USDT",
-            "payoutCurrency": "USDT",
-            "clientInvoiceId": client_id,
-            "description": description,
-            "expiresIn": 3_600_000,
-        })
+    async def create_invoice(self, amount: Decimal | None, client_id: str, description: str,
+                             min_payment: Decimal | None = None, expires_ms: int = 3_600_000) -> dict:
+        """amount None: an open-amount invoice (one payment of at least min_payment) — used for an address deposit."""
+        body = {"priceCurrency": "USDT", "payoutCurrency": "USDT", "clientInvoiceId": client_id,
+                "description": description, "expiresIn": expires_ms}
+        if amount is None:
+            body |= {"minPayment": str(min_payment or 1), "numPayments": 1, "payCurrencies": ["USDT"]}
+        else:
+            body["priceAmount"] = str(amount)
+        result = await self._req("POST", "/api/v1/invoices", json=body)
         if not result.get("id"):
             raise XRocketError("invalid_response", "invoice id missing")
         return result
+
+    async def payment_address(self, invoice_id: str, network: str) -> dict:
+        """On-chain address that pays the invoice: {address, payNetwork, expiresAt, minAmount}."""
+        result = await self._req("POST", "/api/v1/invoices/payments/address", params={"invoiceId": invoice_id},
+                                 json={"payNetwork": network})
+        if not result.get("address"):
+            raise XRocketError("invalid_response", "payment address missing")
+        return result
+
+    async def usdt_networks(self) -> list[str]:
+        """Networks xRocket supports for USDT right now (GET /api/v1/currencies)."""
+        for cur in await self._req_list("GET", "/api/v1/currencies", params={"kind": "crypto"}):
+            if cur.get("code") == "USDT":
+                return [n["code"] for n in cur.get("networks") or [] if n.get("code")]
+        return []
+
+    async def _req_list(self, method: str, path: str, **kw) -> list:
+        try:
+            r = await self._http.request(method, path, **kw)
+        except httpx.HTTPError as e:
+            raise XRocketError("network", str(e)) from e
+        if not r.is_success:
+            raise XRocketError(str(r.status_code), r.text[:300], r.status_code)
+        try:
+            body = r.json()
+        except ValueError as e:
+            raise XRocketError("invalid_response", str(e)) from e
+        return body if isinstance(body, list) else body.get("data") or body.get("items") or []
 
     async def get_invoice(self, invoice_id: str) -> dict:
         return await self._req("GET", "/api/v1/invoice", params={"invoiceId": invoice_id})
@@ -123,10 +152,11 @@ class XRocket:
     async def delete_cheque_by_client(self, client_id: str) -> None:
         await self._req("DELETE", "/api/v1/cheques", params={"clientChequeId": client_id})
 
-    async def create_withdrawal(self, client_id: str, address: str, amount: Decimal, comment: str | None) -> dict:
-        """USDT in the TON network from the app balance to an external address. clientWithdrawalId makes a repeated
+    async def create_withdrawal(self, client_id: str, network: str, address: str, amount: Decimal,
+                                comment: str | None) -> dict:
+        """USDT from the app balance to an external address in `network`. clientWithdrawalId makes a repeated
         request safe: xRocket executes one withdrawal per id."""
-        body = {"clientWithdrawalId": client_id, "network": "TON", "address": address, "asset": "USDT",
+        body = {"clientWithdrawalId": client_id, "network": network, "address": address, "asset": "USDT",
                 "amount": str(amount)}
         if comment:
             body["comment"] = comment
@@ -138,24 +168,9 @@ class XRocket:
     async def get_withdrawal(self, client_id: str) -> dict:
         return await self._req("GET", "/api/v1/withdrawal", params={"clientWithdrawalId": client_id})
 
-    async def deposit_address(self, amount: Decimal, client_id: str) -> str:
-        """A TON address that tops up the app balance by `amount` USDT: an invoice for exactly this amount and its
-        on-chain payment address (POST /api/v1/invoices, POST /api/v1/invoices/payments/address)."""
-        inv = await self._req("POST", "/api/v1/invoices", json={
-            "priceAmount": str(amount), "priceCurrency": "USDT", "payoutCurrency": "USDT", "payCurrencies": ["USDT"],
-            "clientInvoiceId": client_id, "description": "Strait Pay: автоперевод USDT TON на баланс приложения",
-            "expiresIn": 3_600_000})
-        if not inv.get("id"):
-            raise XRocketError("invalid_response", "invoice id missing")
-        addr = await self._req("POST", "/api/v1/invoices/payments/address", params={"invoiceId": inv["id"]},
-                               json={"payNetwork": "TON"})
-        if not addr.get("address"):
-            raise XRocketError("invalid_response", "payment address missing")
-        return addr["address"]
-
-    async def withdrawal_quota(self) -> dict:
-        """Minimum and xRocket's own fee for USDT in TON: {withdrawMinSize, withdrawFee, withdrawFeeAsset}."""
-        return await self._req("GET", "/api/v1/withdrawal-quotas", params={"network": "TON", "asset": "USDT"})
+    async def withdrawal_quota(self, network: str) -> dict:
+        """Minimum and xRocket's own fee for USDT in `network`: {withdrawMinSize, withdrawFee, withdrawFeeAsset}."""
+        return await self._req("GET", "/api/v1/withdrawal-quotas", params={"network": network, "asset": "USDT"})
 
     async def balances(self) -> list[dict]:
         return (await self._req("GET", "/api/v1/balances"))["balances"]
@@ -164,6 +179,47 @@ class XRocket:
     def link(obj: dict) -> str | None:
         links = obj.get("links") or {}
         return links.get("telegramBotLink") or links.get("webLink") or links.get("telegramMiniAppLink")
+
+
+# network code -> how users know it
+NETWORKS = {"TON": "TON", "TRX": "TRC-20 (Tron)", "ETH": "ERC-20 (Ethereum)", "BSC": "BEP-20 (BNB Chain)",
+            "SOL": "Solana", "BTC": "Bitcoin"}
+NETWORKS_TTL = 3600
+_networks: tuple[float, list[str]] | None = None
+QUOTA_TTL = 600
+_quotas: dict[str, tuple[float, dict]] = {}
+
+
+def net_name(code: str | None) -> str:
+    return NETWORKS.get(code or "TON", code or "TON")
+
+
+async def networks() -> list[str]:
+    """USDT networks of xRocket (cached 1 h); TON if xRocket does not answer."""
+    global _networks
+    t = asyncio.get_running_loop().time()
+    if _networks is None or t - _networks[0] > NETWORKS_TTL:
+        try:
+            found = await asyncio.wait_for(rocket.usdt_networks(), 5)
+        except Exception:  # noqa: BLE001 - keep the last answer
+            return _networks[1] if _networks else ["TON"]
+        _networks = t, [n for n in found if n in NETWORKS] or ["TON"]
+    return _networks[1]
+
+
+async def quota(network: str) -> dict | None:
+    """xRocket's minimum and own fee for USDT in `network` (cached 10 min); None if xRocket does not answer."""
+    t = asyncio.get_running_loop().time()
+    if network not in _quotas or t - _quotas[network][0] > QUOTA_TTL:
+        try:
+            _quotas[network] = t, await asyncio.wait_for(rocket.withdrawal_quota(network), 5)
+        except Exception:  # noqa: BLE001 - the withdrawal request itself is the final check
+            return None
+    return _quotas[network][1]
+
+
+def net_fee(q: dict | None) -> Decimal:
+    return Decimal(str(q["withdrawFee"])) if q and q.get("withdrawFeeAsset") == "USDT" else Decimal(0)
 
 
 rocket: XRocket | None = None

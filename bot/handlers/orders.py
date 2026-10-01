@@ -32,32 +32,32 @@ def offer_text(d: Deal, m: OrderMerchant) -> str:
     bybit = m.mode == "bybit"
     return "\n".join([
         f"{pe('bell')} <b>Ордерная заявка #{d.id} · {money.fmt(d.amount_rub)} ₽</b>",
-        "",
-        quote(f"{pe('bank')} Перевод из: <b>{esc(d.sender_bank or 'банк не указан')}</b>",
-              f"{pe('swap')} Ваш курс: <b>{money.fmt(d.merchant_rate)} ₽</b> → ордер на <b>{money.usdt(d.seller_debit)} "
-              "USDT</b>",
-              f"{pe('shop')} Через Bybit-ордер: пришлёте ссылку, баланс не нужен" if bybit else
-              f"{pe('lock')} Заморозится у вас: <b>{money.usdt(d.seller_debit)} USDT</b>",
-              f"{pe('clock')} Взять до {at(d.expires_at)}, на {'ссылку' if bybit else 'реквизиты'} — "
+        quote(f"Перевод из: <b>{esc(d.sender_bank or 'банк не указан')}</b>",
+              f"Ордер: <b>{money.usdt(d.seller_debit)} USDT</b> по {money.fmt(d.merchant_rate)} ₽",
+              "Через Bybit-ордер — баланс не нужен" if bybit else
+              f"Заморозится: <b>{money.usdt(d.seller_debit)} USDT</b>",
+              f"Взять до {at(d.expires_at)} · на {'ссылку' if bybit else 'реквизиты'} "
               f"{settings.get('order_take_minutes')} мин"),
-        "Кто первым нажмёт «Взять», тот и выдаёт " + ("ордер." if bybit else "реквизиты."),
+        f"{pe('info')} Кто первым нажмёт «Взять», тот и работает заявку.",
     ])
 
 
 async def broadcast(bot: Bot, s: AsyncSession, d: Deal, first: bool = True) -> int:
     """Send the request to every merchant who can take it now and has not seen it. Commits.
-    first=False: a periodic re-send to merchants who became available later — quiet if nobody new."""
+    The most reliable merchants (more completed orders) get it first; first=False: a periodic re-send to merchants
+    who became available later — quiet if nobody new."""
     merchants = await orders.eligible(s, d)
+    done = await deals.completed_count(s, [u.id for _, u in merchants])
     sent = 0
-    for om, u in merchants:
+    for om, u in sorted(merchants, key=lambda mu: -done[mu[1].id]):
         m = await notify(bot, u.id, offer_text(d, om), kb(btn("Взять заявку", f"orq:take:{d.id}", "fire", style="success"),
                                                      back("x", "Скрыть", "cross")), silent=u.quiet)
         if m is not None:
             s.add(OrderOffer(deal_id=d.id, user_id=u.id, msg_id=m.message_id))
             sent += 1
     if sent or first:
-        deal_log(s, d, "offered", f"Ордерная заявка на {money.fmt(d.amount_rub)} ₽ разослана мерчантам: {sent}",
-                 notice=True)
+        deal_log(s, d, "offered", f"Заявка на {money.fmt(d.amount_rub)} ₽ разослана мерчантам: {sent}"
+                 + ("" if first else " (досыл)"), notice=True)
     if not sent and first:
         await events.alert_once(s, f"deal:{d.id}", "no_merchants", f"Ордерная заявка на {money.fmt(d.amount_rub)} ₽: "
                                 "нет свободных ордерных мерчантов под сумму", d.buyer_id)
@@ -612,29 +612,28 @@ async def cb_merchant(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User, s
 
 async def merchant_screen(bot: Bot, s: AsyncSession, user: User, src=None, note: str = ""):
     m = await s.get(OrderMerchant, user.id)
-    buyer_part = ["<b>Нужны реквизиты под вашу сумму?</b>",
-                  "Если в «RUB ⇄ USDT» нет карты на нужную сумму, мерчант выдаст реквизиты специально под ваш перевод.",
-                  ""]
-    about = ["<b>Хотите выдавать реквизиты?</b>",
-             f"Работаете по фиксированному курсу <b>{money.fmt(settings.dec('order_rate'))} ₽</b> за USDT, без процентов. "
-             "Берёте заявку → присылаете ссылку на свой ордер Bybit P2P (баланс в боте не нужен, реквизиты из ордера "
-             "покупателю выдаёт оператор) или работаете с баланса: под заявку замораживаются ваши USDT, реквизиты "
-             f"выдаёте сами. На ответ — {settings.get('order_take_minutes')} мин. Подробно — в {manual('инструкции')}."]
-    request_btn = btn("Запросить реквизиты", "orb:new", style="primary")
     if m is None or m.status == "rejected":
         wait = m is not None and now() - deals.aware(m.decided_at) < REAPPLY_AFTER
-        lines = [title(pe("key"), "Ордерные реквизиты"), "", *buyer_part, *about]
+        lines = [title(pe("key"), "Ордерные реквизиты · для мерчантов"),
+                 "Выдавайте реквизиты под точную сумму покупателя и зарабатывайте на курсе.",
+                 quote(f"Курс: <b>{money.fmt(settings.dec('order_rate'))} ₽</b> за USDT, без процентов",
+                       "Bybit-ордер — присылаете ссылку, баланс в боте не нужен",
+                       "Баланс — под заявку замораживаются ваши USDT, реквизиты выдаёте сами",
+                       f"На ответ по заявке — {settings.get('order_take_minutes')} мин")]
         if m:
             lines.append("Прошлая анкета отклонена" + (f": <i>{esc(m.reason)}</i>" if m.reason else "") + ".")
         lines.append(f"Подать снова можно после {at(deals.aware(m.decided_at) + REAPPLY_AFTER, 'dt')}." if wait
-                     else "Чтобы начать — заполните анкету, администрация её рассмотрит.")
+                     else f"{pe('info')} Анкета — 7 коротких шагов, ответ обычно в течение суток. "
+                          f"Подробно — в {manual('инструкции')}.")
+        lines.append("Покупаете? Реквизиты под вашу сумму — в «RUB ⇄ USDT» → «Реквизиты под сумму».")
         return await show(bot, user, "\n".join(lines) + note, kb(
-            request_btn, None if wait else btn("Стать мерчантом", "om:apply"), back("menu", "В меню")), src)
+            None if wait else btn("Заполнить анкету", "om:apply", "pencil", style="success"),
+            back("menu", "В меню")), src)
     if m.status == "pending":
-        return await show(bot, user, "\n".join([title(pe("key"), "Ордерные реквизиты"), "", *buyer_part,
-                                                f"{pe('clock')} <b>Ваша анкета мерчанта на рассмотрении</b> с "
-                                                f"{at(m.created_at, 'dt')}. Ответ придёт в этот чат."]) + note,
-                          kb(request_btn, back("menu", "В меню")), src)
+        return await show(bot, user, "\n".join([
+            title(pe("key"), "Ордерные реквизиты · анкета"),
+            f"{pe('clock')} <b>На рассмотрении</b> с {at(m.created_at, 'dt')}. Ответ придёт в этот чат."]) + note,
+            kb(back("menu", "В меню")), src)
     busy = await orders.open_rub(s, user.id)
     bybit = m.mode == "bybit"
     cap = min(m.max_rub, m.max_open_rub - busy)
@@ -648,41 +647,37 @@ async def merchant_screen(bot: Bot, s: AsyncSession, user: User, src=None, note:
     active = m.status == "approved"
     status = (f"{pe('pause')} <b>Приостановлено администрацией</b>" if not active
               else f"{pe('live')} <b>Принимаю заявки</b>" if m.accepting else f"{pe('pause')} <b>Заявки не принимаю</b>")
+    hint = ("Сейчас можете взять заявку до <b>" + money.fmt(max(cap, Decimal(0))) + " ₽</b>" if cap >= m.min_rub
+            else f"{pe('warn')} Заявки не придут: " + ("лимит «в работе» занят" if bybit
+                                                     else "мало баланса или лимит занят"))
     await show(bot, user, "\n".join([
-        title(pe("key"), "Ордерные реквизиты · кабинет мерчанта"),
+        title(pe("key"), "Ордерный кабинет"),
         status,
-        "",
-        quote(f"{pe('shop')} Режим: <b>Bybit-ордер</b> — присылаете ссылку на ордер, баланс не нужен" if bybit else
-              f"{pe('lock')} Режим: <b>баланс</b> — под заявку замораживаются ваши USDT, реквизиты выдаёте сами",
-              f"{pe('swap')} Ваш курс: <b>{money.fmt(settings.dec('order_rate'))} ₽</b> за USDT",
-              f"{pe('ruble')} Заявка: от {money.fmt(m.min_rub)} до {money.fmt(m.max_rub)} ₽",
-              f"{pe('fire')} В работе: {money.fmt(busy)} из {money.fmt(m.max_open_rub)} ₽",
-              "" if bybit else f"{pe('wallet')} Свободно: {money.usdt(user.balance)} USDT",
-              f"{pe('ok')} Сейчас можете взять заявку до <b>{money.fmt(max(cap, Decimal(0)))} ₽</b>"
-              if cap >= m.min_rub else f"{pe('warn')} Сейчас заявки не придут: "
-              + ("лимит «в работе» занят" if bybit else "мало баланса или лимит занят"),
-              f"{pe('clock')} На оплату даёте по умолчанию: {m.pay_minutes} мин"),
-        title(pe("stats"), "Ордера: результаты"),
-        quote(f"Сегодня: <b>{today['n']}</b> на {money.fmt(today['rub'])} ₽ · <b>+{money.usdt(today['income'])} USDT</b>",
-              f"7 дней: <b>{week['n']}</b> на {money.fmt(week['rub'])} ₽ · <b>+{money.usdt(week['income'])} USDT</b>",
-              f"Всего: {total['n']} на {money.fmt(total['rub'])} ₽ · +{money.usdt(total['income'])} USDT"
-              + (f" · успешных {total['success']}%" if total["success"] is not None else "")
-              + (f" · реквизиты подтверждаете за {total['confirm_min']} мин" if total["confirm_min"] is not None else "")),
-        "Лимит «в работе» — чтобы учитывать ваш внешний баланс (например, на бирже): больше него заявок не придёт. "
-        f"Подробно — в {manual('инструкции')}.",
+        "<b>Условия</b>",
+        quote(f"Режим: <b>{'Bybit-ордер' if bybit else 'баланс'}</b>"
+              + (" — ссылка на ордер, баланс не нужен" if bybit else " — замораживаем USDT, реквизиты ваши"),
+              f"Курс: <b>{money.fmt(settings.dec('order_rate'))} ₽</b> за USDT",
+              f"Заявка: {money.fmt(m.min_rub)}–{money.fmt(m.max_rub)} ₽ · оплата {m.pay_minutes} мин",
+              f"В работе: {money.fmt(busy)} из {money.fmt(m.max_open_rub)} ₽"
+              + ("" if bybit else f" · свободно {money.usdt(user.balance)} USDT")),
+        hint,
+        "<b>Результаты</b>",
+        quote(f"Сегодня: <b>{today['n']}</b> · {money.fmt(today['rub'])} ₽ · <b>+{money.usdt(today['income'])} USDT</b>",
+              f"7 дней: <b>{week['n']}</b> · {money.fmt(week['rub'])} ₽ · <b>+{money.usdt(week['income'])} USDT</b>",
+              f"Всего: {total['n']} · {money.fmt(total['rub'])} ₽ · +{money.usdt(total['income'])} USDT"
+              + (f" · успешных {total['success']}%" if total["success"] is not None else "")),
+        f"{pe('info')} «В работе» — сколько рублей держите одновременно: учтите внешний баланс (биржа).",
     ]) + note, kb(
         *[btn(f"#{d.id} · {money.fmt(d.amount_rub)} ₽ · "
               + ({'assigned': 'прислать ссылку' if d.via_bybit else 'выдать реквизиты', 'checking': 'у оператора'}
                  .get(d.status, 'открыть')),
               f"dl:{d.id}", "fire", style="primary" if d.status == "assigned" else None) for d in working],
-        (btn("Не принимать заявки", "om:acc:0", "pause") if m.accepting
-         else btn("Принимать заявки", "om:acc:1", "live", style="success")) if active else None,
-        btn("Работать с баланса" if bybit else "Работать через Bybit-ордер", "om:mode",
-            "lock" if bybit else "shop") if active else None,
+        (btn("Заявки: принимаю · выключить", "om:acc:0", "pause", wide=True) if m.accepting
+         else btn("Заявки: не принимаю · включить", "om:acc:1", "live", style="success")) if active else None,
+        btn(f"Режим: {'Bybit-ордер' if bybit else 'баланс'} · сменить", "om:mode",
+            "lock" if bybit else "shop", wide=True) if active else None,
         [btn("Мин. заявка", "om:set:min", "down"), btn("Макс. заявка", "om:set:max", "up")],
         [btn("В работе", "om:set:open", "filter"), btn(f"Оплата {m.pay_minutes} мин", "om:pay", "clock")],
-        [btn("Статистика", "sl:st", "stats"), btn("Пополнить", "w", "wallet")],
-        btn("Запросить реквизиты", "orb:new"),
         back("menu", "В меню"),
     ), src)
 

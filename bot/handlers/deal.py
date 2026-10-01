@@ -94,7 +94,7 @@ def _money_block(d: Deal, buyer: bool) -> str:
     if buyer:
         return quote(
             f"{pe('ruble')} Сумма перевода: <b>{money.fmt(d.amount_rub)} ₽</b>",
-            f"{pe('swap')} Курс: {money.fmt(d.rate)} ₽ · комиссия {money.fmt(d.platform_pct, 3)}%",
+            f"{pe('swap')} Курс: {money.fmt(d.buyer_rate or d.rate)} ₽ · комиссия {money.fmt(d.platform_pct, 3)}%",
             "" if back_ else f"{pe('dollar')} {'Получено' if done else 'Вы получите'}: "
                              f"<b>{money.usdt(d.buyer_credit)} USDT</b>",
         )
@@ -369,7 +369,7 @@ async def deals_screen(bot: Bot, s: AsyncSession, user: User, page: int = 0, src
     pages = max(1, (total + PAGE - 1) // PAGE)
     text = title(pe("list"), "Мои сделки") + "\n\n" + (
         f"Всего: <b>{total}</b>. Сначала открытые. ↓ — покупка, ↑ — продажа." if rows else
-        f"{pe('clock')} Сделок пока нет. Купите USDT или добавьте карту, чтобы продавать.")
+        f"{pe('info')} Сделок пока нет — они появятся здесь после покупки или продажи.")
     nav = []
     if page > 0:
         nav.append(btn(f"{page}/{pages}", f"deals:{page - 1}", "prev"))
@@ -379,7 +379,6 @@ async def deals_screen(bot: Bot, s: AsyncSession, user: User, page: int = 0, src
         *[btn(f"{'↓' if d.buyer_id == user.id else '↑'} #{d.id} · {money.fmt(d.amount_rub)} ₽ · {STATUS[d.status][1]}",
               f"dl:{d.id}", STATUS[d.status][0]) for d in rows],
         nav,
-        None if rows else [btn("Купить USDT", "buy:0", "down"), btn("Продать USDT", "sl", "up")],
         back("menu", "В меню"),
     ), src)
 

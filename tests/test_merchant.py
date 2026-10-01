@@ -18,7 +18,7 @@ def test_sales_stats_and_today_line(go):
         d = await create_deal(b)
         await b.run(cb(BUYER, f"dl:rc:{d.id}"), msg(BUYER, document=PDF), cb(SELLER, f"dl:ok2:{d.id}"))
         await b.run(cb(SELLER, "sl"))
-        assert "Сегодня: 1 сделок на 10 000 ₽ · доход +5 USDT" in plain(b.session.last(SELLER))
+        assert "Сегодня: 1 · 10 000 ₽ · +5 USDT" in plain(b.session.last(SELLER))
         await b.run(cb(SELLER, "sl:st"))
         text = plain(b.session.last(SELLER))
         assert "Статистика и доход" in text and "Доход: +5 USDT" in text and "Подтверждаете в среднем" in text

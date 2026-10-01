@@ -10,7 +10,7 @@ from bot import models, tasks
 from bot.app import build_dispatcher
 from bot.config import config
 from bot.handlers import commands
-from bot.services import api, settings, ton, xrocket
+from bot.services import api, settings, xrocket
 
 
 async def main() -> None:
@@ -29,9 +29,6 @@ async def main() -> None:
     async with models.Session() as s:
         await settings.load(s)
     xrocket.rocket = xrocket.XRocket(config.xrocket_token, config.xrocket_base_url)
-    if ton.enabled():
-        ton.chain = ton.Chain()
-        logging.info("USDT TON deposits on; gas wallet %s", ton.friendly(ton.gas_address()))
 
     bot = Bot(config.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = build_dispatcher()
@@ -46,7 +43,7 @@ async def main() -> None:
         await web.TCPSite(runner, config.api_host, config.api_port).start()
         logging.info("Strait Pay API on %s:%s, public %s", config.api_host, config.api_port, config.api_url)
     try:
-        await dp.start_polling(bot, allowed_updates=["message", "callback_query", "inline_query"])
+        await dp.start_polling(bot, allowed_updates=["message", "callback_query", "inline_query", "chat_member"])
     finally:
         for task in background:
             task.cancel()
@@ -55,8 +52,6 @@ async def main() -> None:
             await runner.cleanup()
         await api.close()
         await xrocket.rocket.close()
-        if ton.chain is not None:
-            await ton.chain.close()
         if lock_conn is not None:
             await lock_conn.close()
         await models.engine.dispose()

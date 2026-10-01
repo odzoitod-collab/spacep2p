@@ -51,6 +51,13 @@ class Context(BaseMiddleware):
         if tg is None or not isinstance(event, Update):
             return await handler(event, data)
         msg = event.message
+        if event.chat_member is not None:  # joins in the community chat (handlers.admin_chat)
+            async with Session() as s:
+                data.update(s=s)
+                result = await handler(event, data)
+                await s.commit()
+            events.kick()
+            return result
         if event.inline_query is not None:  # inline search (deals, operations): no screen, just results
             async with Session() as s:
                 user = await s.get(User, tg.id)

@@ -108,6 +108,9 @@ class Deal(Base):
     via_bybit: Mapped[bool] = mapped_column(default=False, server_default=false())
     bybit_url: Mapped[str | None] = mapped_column(String(300), index=True)
     operator_id: Mapped[int | None] = mapped_column(BigInteger)
+    # the buyer's side rate when it differs from `rate` (an API client with its own terms); `rate` stays the
+    # merchant side rate, so the merchant's terms and income never depend on the client
+    buyer_rate: Mapped[Decimal | None] = mapped_column(RUB)
 
 
 class Deposit(Base):
@@ -120,6 +123,10 @@ class Deposit(Base):
     link: Mapped[str | None] = mapped_column(String(256))
     status: Mapped[str] = mapped_column(String(16), index=True, default="new")  # new|active|paid|expired
     created_at: Mapped[datetime] = mapped_column(default=now)
+    # by address: an open-amount xRocket invoice and its payment address in `network`; None = invoice link
+    network: Mapped[str | None] = mapped_column(String(8))
+    address: Mapped[str | None] = mapped_column(String(128))
+    expires_at: Mapped[datetime | None]
 
 
 class Withdrawal(Base):
@@ -132,16 +139,18 @@ class Withdrawal(Base):
     fee: Mapped[Decimal] = mapped_column(USDT)
     cheque_id: Mapped[str | None] = mapped_column(String(64))
     link: Mapped[str | None] = mapped_column(String(256))
-    # xrocket: pending|unknown|done|failed. ton: pending -> sending -> sent -> done | failed; sending/unknown
-    # without an on-chain transfer after 15 min go back to pending (the signed message has expired by then)
+    # cheque (xrocket): pending|unknown|done|failed. chain: pending -> sent -> done | failed; unknown = no answer
     status: Mapped[str] = mapped_column(String(16), default="pending")
     error: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(default=now)
-    method: Mapped[str] = mapped_column(String(8), default="xrocket", server_default="xrocket")  # xrocket | ton
-    address: Mapped[str | None] = mapped_column(String(70))  # ton: recipient (user-friendly)
-    memo: Mapped[str | None] = mapped_column(String(120))  # ton: comment an exchange may require
-    tx_hash: Mapped[str | None] = mapped_column(String(64))  # ton: transaction of the jetton transfer (hex)
+    # xrocket: personal cheque; chain: xRocket pays USDT to an external address in `network`
+    method: Mapped[str] = mapped_column(String(8), default="xrocket", server_default="xrocket")
+    address: Mapped[str | None] = mapped_column(String(128))  # chain: recipient
+    memo: Mapped[str | None] = mapped_column(String(120))  # chain: comment an exchange may require (TON)
+    tx_hash: Mapped[str | None] = mapped_column(String(128))
     sent_at: Mapped[datetime | None]
+    network: Mapped[str | None] = mapped_column(String(8))  # chain: TON | TRX | ETH | BSC | SOL ...
+    net_fee: Mapped[Decimal] = mapped_column(USDT, default=Decimal(0), server_default=text("0"))  # xRocket's part of fee
 
 
 class Ledger(Base):
@@ -224,44 +233,6 @@ class FsmState(Base):
     updated_at: Mapped[datetime] = mapped_column(default=now, onupdate=now)
 
 
-class TonWallet(Base):
-    """User's USDT-on-TON deposit address. The key is derived from TON_SEED and the user id, never stored."""
-    __tablename__ = "ton_wallets"
-    user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"), primary_key=True)
-    address: Mapped[str] = mapped_column(String(70), unique=True)  # raw form 0:HEX (upper case), as Toncenter returns
-    need_sweep: Mapped[bool] = mapped_column(default=False)  # credited USDT still sits on this wallet
-    created_at: Mapped[datetime] = mapped_column(default=now)
-
-
-class TonDeposit(Base):
-    """Incoming USDT transfer, credited once: tx_hash is unique."""
-    __tablename__ = "ton_deposits"
-    id: Mapped[int] = mapped_column(primary_key=True)
-    user_id: Mapped[int] = mapped_column(BigInteger, index=True)
-    tx_hash: Mapped[str] = mapped_column(String(64), unique=True)  # hex
-    amount: Mapped[Decimal] = mapped_column(USDT)
-    source: Mapped[str] = mapped_column(String(70), default="")  # sender's wallet (raw)
-    tx_time: Mapped[datetime]
-    created_at: Mapped[datetime] = mapped_column(default=now)
-
-
-class TonOp(Base):
-    """Outgoing transfer made by the bot: gas (TON to a deposit wallet) or sweep (USDT to the admin's address).
-    sending -> sent -> done | failed."""
-    __tablename__ = "ton_ops"
-    id: Mapped[int] = mapped_column(primary_key=True)
-    user_id: Mapped[int] = mapped_column(BigInteger, index=True)
-    kind: Mapped[str] = mapped_column(String(8))  # gas | sweep
-    amount: Mapped[Decimal] = mapped_column(Numeric(20, 9))  # TON for gas, USDT for sweep
-    to_address: Mapped[str] = mapped_column(String(70))
-    msg_hash: Mapped[str | None] = mapped_column(String(64))  # external message hash (hex)
-    tx_hash: Mapped[str | None] = mapped_column(String(64))  # transaction of the jetton transfer, when known
-    status: Mapped[str] = mapped_column(String(10), index=True, default="sending")
-    error: Mapped[str | None] = mapped_column(Text)
-    created_at: Mapped[datetime] = mapped_column(default=now)
-    done_at: Mapped[datetime | None]
-
-
 class OrderMerchant(Base):
     """Merchant who gives requisites on request (order requisites). The row is also the application:
     pending -> approved | rejected; approved -> suspended by an admin."""
@@ -331,6 +302,10 @@ class ApiClient(Base):
     max_open: Mapped[int] = mapped_column(default=10)  # orders waiting for payment at the same time
     rps: Mapped[int] = mapped_column(default=5)  # requests per second
     created_at: Mapped[datetime] = mapped_column(default=now)
+    # the client's own terms for every order (static card or order requisites): RUB per USDT and the platform's
+    # percent; None = the general rate / platform_pct. 100 and 7% -> 10 000 RUB = 93 USDT to the client
+    rate: Mapped[Decimal | None] = mapped_column(RUB)
+    pct: Mapped[Decimal | None] = mapped_column(Numeric(6, 3))
 
 
 class ApiEvent(Base):
@@ -509,6 +484,21 @@ MIGRATIONS: list[tuple[int, list[str]]] = [
         "ALTER TABLE IF EXISTS order_merchants ADD COLUMN IF NOT EXISTS mode VARCHAR(8) NOT NULL DEFAULT 'balance'",
         "ALTER TABLE IF EXISTS order_merchants ALTER COLUMN mode SET DEFAULT 'bybit'",
         "ALTER TABLE users DROP COLUMN IF EXISTS pct_order",
+    ]),
+    (13, [
+        # USDT in every network through xRocket: the bot's own TON wallets are gone (old ton_* tables are kept
+        # untouched as history); API clients get their own terms
+        "ALTER TABLE deposits ADD COLUMN IF NOT EXISTS network VARCHAR(8)",
+        "ALTER TABLE deposits ADD COLUMN IF NOT EXISTS address VARCHAR(128)",
+        "ALTER TABLE deposits ADD COLUMN IF NOT EXISTS expires_at TIMESTAMP WITH TIME ZONE",
+        "ALTER TABLE withdrawals ADD COLUMN IF NOT EXISTS network VARCHAR(8)",
+        "ALTER TABLE withdrawals ADD COLUMN IF NOT EXISTS net_fee NUMERIC(20, 6) NOT NULL DEFAULT 0",
+        "ALTER TABLE withdrawals ALTER COLUMN address TYPE VARCHAR(128)",
+        "ALTER TABLE withdrawals ALTER COLUMN tx_hash TYPE VARCHAR(128)",
+        "UPDATE withdrawals SET method = 'chain', network = 'TON' WHERE method = 'ton'",
+        "ALTER TABLE IF EXISTS api_clients ADD COLUMN IF NOT EXISTS rate NUMERIC(14, 2)",
+        "ALTER TABLE IF EXISTS api_clients ADD COLUMN IF NOT EXISTS pct NUMERIC(6, 3)",
+        "ALTER TABLE deals ADD COLUMN IF NOT EXISTS buyer_rate NUMERIC(14, 2)",
     ]),
 ]
 

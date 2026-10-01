@@ -210,7 +210,7 @@ def test_order_cabinet_default_time_and_two_tap_template(go):
         await b.run(cb(BUYER, f"dl:rc:{d.id}"), msg(BUYER, document=PDF), cb(M1, f"dl:ok2:{d.id}"))
         await b.run(cb(M1, "om"))
         text = plain(b.session.last(M1))
-        assert "Сегодня: 1 на 52 000 ₽ · +20 USDT" in text and "Ордера: результаты" in text  # 520 − 500 at 104 ₽
+        assert "Сегодня: 1 · 52 000 ₽ · +20 USDT" in text and "Результаты" in text  # 520 − 500 at 104 ₽
         d2 = await request(b, "10400")
         await b.run(cb(M1, f"orq:take:{d2.id}"))
         tpl = next(x for x in b.session.buttons(M1) if x and x.startswith(f"orq:tpl:{d2.id}:"))
@@ -255,7 +255,7 @@ def test_admin_commissions_and_order_rate(go):
         static = await create_deal(b, amount="10000")
         assert (static.seller_pct, static.seller_debit, static.buyer_credit) == (D("5.5"), D("94.5"), D(94))
         order = await request(b, "10200", buyer=OTHER)
-        assert "Ваш курс: 102 ₽" in plain([t for t in b.session.texts(M1) if "Ордерная заявка" in t][-1])
+        assert "по 102 ₽" in plain([t for t in b.session.texts(M1) if "Ордерная заявка" in t][-1])
         await b.run(cb(M1, f"orq:take:{order.id}"))
         assert (await deal(order.id)).seller_debit == D(100)  # 10 200 / 102
 

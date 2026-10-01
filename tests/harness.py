@@ -4,26 +4,24 @@ Database: SQLite in memory by default; every test using `db_url` also runs on Po
 P2P_TEST_PG is set (e.g. postgresql+asyncpg://p2p@127.0.0.1:55432/p2p_test). The PG schema is
 dropped and re-created for every test.
 """
-import base64
 import html
 import itertools
 import os
 import re
 from datetime import datetime
-from decimal import Decimal
 from html.parser import HTMLParser
 
 os.environ.setdefault("BOT_TOKEN", "123:abc")
 os.environ["ADMIN_IDS"] = "[1, 2]"  # 2 = second admin for approvals
 os.environ["LOG_CHAT_ID"] = "1"  # never use the log chat from a developer's .env
 os.environ["EMOJI_MODE"] = "premium"
-os.environ["TON_SEED"] = "ab" * 32  # test-only secret: deposit addresses are derived from it
 
 from aiogram import Bot, Dispatcher  # noqa: E402
 from aiogram.client.default import DefaultBotProperties  # noqa: E402
 from aiogram.client.session.base import BaseSession  # noqa: E402
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError  # noqa: E402
-from aiogram.types import Animation, CallbackQuery, Chat, Document, File, ForumTopic, Message, PhotoSize, Update  # noqa: E402
+from aiogram.types import (Animation, CallbackQuery, Chat, ChatInviteLink, ChatMemberAdministrator, Document,  # noqa: E402
+                           File, ForumTopic, Message, MessageId, PhotoSize, Update)
 from aiogram.types import User as TgUser  # noqa: E402
 from sqlalchemy import text  # noqa: E402
 from sqlalchemy.ext.asyncio import create_async_engine  # noqa: E402
@@ -33,8 +31,8 @@ from bot.emoji import NavButton  # noqa: E402
 from bot.app import build_dispatcher  # noqa: E402
 from bot import ui  # noqa: E402
 from bot.api import server as api_server  # noqa: E402
-from bot.handlers import logchat, ton_wallet  # noqa: E402
-from bot.services import settings, ton, xrocket  # noqa: E402
+from bot.handlers import logchat  # noqa: E402
+from bot.services import settings, xrocket  # noqa: E402
 
 ui.MIN_GAP = 0  # no pacing delays in tests
 
@@ -95,6 +93,22 @@ class FakeSession(BaseSession):
         thread = getattr(method, "message_thread_id", None)
         if chat in self.forums and thread is not None and thread not in self.forums[chat]:
             raise TelegramBadRequest(method=method, message="Bad Request: message thread not found")
+        if name == "GetMe":
+            return TgUser(id=123, is_bot=True, first_name="Strait Pay", username="straitpay_bot")
+        if name == "CreateChatInviteLink":
+            return ChatInviteLink(invite_link=f"https://t.me/+inv{next(ids)}", creator=TgUser(id=123, is_bot=True,
+                                  first_name="bot"), creates_join_request=False, is_primary=False, is_revoked=False,
+                                  name=method.name, member_limit=method.member_limit)
+        if name == "GetChatMember":
+            return ChatMemberAdministrator(user=TgUser(id=method.user_id, is_bot=True, first_name="bot"),
+                                           can_be_edited=False, is_anonymous=False, can_manage_chat=True,
+                                           can_delete_messages=True, can_manage_video_chats=True,
+                                           can_restrict_members=True, can_promote_members=False,
+                                           can_change_info=True, can_invite_users=True, can_post_stories=False,
+                                           can_edit_stories=False, can_delete_stories=False, can_send_welcome_messages=False,
+                                           can_pin_messages=True)
+        if name == "CopyMessage":
+            return MessageId(message_id=next(ids))
         if name == "GetFile":
             return File(file_id=method.file_id, file_unique_id="f", file_path=f"documents/{method.file_id}")
         mid = getattr(method, "message_id", None)
@@ -163,9 +177,21 @@ class FakeRocket:
         self.withdrawal_calls: list[tuple] = []
         self.withdrawal_status = "CREATED"
         self.withdrawal_error: xrocket.XRocketError | None = None
+        self.invoices: list[tuple] = []  # (amount or None, client id, min payment)
+        self.addresses: list[tuple] = []  # (invoice id, network)
+        self.networks = ["TON", "TRX", "ETH", "BSC", "SOL"]
 
-    async def create_invoice(self, amount, client_id, description):
-        return {"id": "inv1", "links": {"telegramBotLink": "https://t.me/xRocket?start=inv1"}}
+    async def create_invoice(self, amount, client_id, description, min_payment=None, expires_ms=3_600_000):
+        self.invoices.append((amount, client_id, min_payment))
+        return {"id": f"inv{len(self.invoices)}", "links": {"telegramBotLink": "https://t.me/xRocket?start=inv1"}}
+
+    async def payment_address(self, invoice_id, network):
+        self.addresses.append((invoice_id, network))
+        return {"address": f"{network}addr{len(self.addresses)}" + "x" * 30, "payNetwork": network,
+                "expiresAt": "2099-01-01T00:00:00Z"}
+
+    async def usdt_networks(self):
+        return self.networks
 
     async def get_invoice(self, invoice_id):
         return {"id": invoice_id, "status": self.invoice_status}
@@ -193,12 +219,12 @@ class FakeRocket:
     async def balances(self):
         return [{"asset": "USDT", "available": "1000"}]
 
-    async def create_withdrawal(self, client_id, address, amount, comment):
+    async def create_withdrawal(self, client_id, network, address, amount, comment):
         if self.withdrawal_error:
             raise self.withdrawal_error
         w = self.withdrawals.setdefault(client_id, {"status": self.withdrawal_status, "amount": str(amount),
-                                                    "address": address, "comment": comment})
-        self.withdrawal_calls.append((client_id, address, amount, comment))
+                                                    "address": address, "comment": comment, "network": network})
+        self.withdrawal_calls.append((client_id, network, address, amount, comment))
         return dict(w)
 
     async def get_withdrawal(self, client_id):
@@ -206,51 +232,8 @@ class FakeRocket:
             raise xrocket.XRocketError("app_withdrawal_not_found", status=404)
         return dict(self.withdrawals[client_id])
 
-    async def withdrawal_quota(self):
+    async def withdrawal_quota(self, network):
         return {"withdrawMinSize": "0.5", "withdrawFee": "0.1", "withdrawFeeAsset": "USDT", "precision": 6}
-
-
-class FakeChain:
-    """TON network: incoming transfers, balances and what the bot sent."""
-
-    def __init__(self):
-        self.transfers: list[dict] = []
-        self.usdt: dict[str, Decimal] = {}
-        self.ton: dict[str, Decimal] = {}
-        self.out: dict[str, dict] = {}
-        self.sent: list[tuple] = []
-
-    async def incoming(self, owners, since):
-        return [t for t in self.transfers if t["destination"] in owners and t["transaction_now"] >= since]
-
-    async def last_outgoing(self, owner):
-        return self.out.get(owner)
-
-    async def usdt_balance(self, owner):
-        return self.usdt.get(owner, Decimal(0))
-
-    async def ton_balance(self, address):
-        return self.ton.get(address, Decimal(0))
-
-    async def send_gas(self, to, amount):
-        self.sent.append(("gas", to, amount))
-        return "aa" * 32
-
-    async def send_usdt(self, uid, amount, to):
-        self.sent.append(("usdt", uid, amount, to))
-        return "bb" * 32
-
-    def pay(self, uid: int, usdt: str, n: int = 1, master: str | None = None, aborted: bool = False) -> str:
-        """An incoming USDT transfer to the user's deposit address; returns its hex hash."""
-        h = bytes([n]) * 32
-        owner = ton.deposit_address(uid)
-        self.transfers.append({
-            "destination": owner, "amount": str(int(Decimal(usdt) * ton.USDT_UNIT)),
-            "jetton_master": master or ton.usdt_master_raw(), "transaction_hash": base64.b64encode(h).decode(),
-            "transaction_now": int(datetime.now().timestamp()), "transaction_aborted": aborted,
-            "source": "0:" + "11" * 32})
-        self.usdt[owner] = self.usdt.get(owner, Decimal(0)) + Decimal(usdt)
-        return h.hex()
 
 
 def tg(uid):
@@ -292,8 +275,8 @@ async def reset_db(url: str) -> None:
     ui._banner_id = None  # every test starts like a fresh process: banner not uploaded yet
     ui._emoji_off_until = 0.0
     xrocket._usdt = None
-    ton_wallet._quota = None
-    ton_wallet._checked.clear()
+    xrocket._quotas.clear()
+    xrocket._networks = None
     api_server.limiter._buckets.clear()
     logchat._forum.clear()
     logchat._topics.clear()
@@ -321,8 +304,6 @@ class Bench:
         self.bot = Bot("123:abc", session=self.session, default=DefaultBotProperties(parse_mode="HTML"))
         self.rocket = FakeRocket()
         xrocket.rocket = self.rocket
-        self.chain = FakeChain()
-        ton.chain = self.chain
         self.dp = make_dp()
 
     def restart(self):

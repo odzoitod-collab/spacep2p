@@ -8,15 +8,17 @@ from aiogram.fsm.strategy import FSMStrategy
 from aiogram.types import ErrorEvent
 
 from bot.emoji import btn, kb, pe
-from bot.handlers import admin, admin_api, admin_ops, admin_orders, admin_ton, api_user, commands, finance, inline, logchat, orders, deal, fallback, market, seller, start, ton_wallet, wallet
+from bot.handlers import (admin, admin_api, admin_chat, admin_ops, admin_orders, api_user, commands, deal, fallback,
+                          finance, inline, logchat, market, orders, seller, start, wallet)
 from bot.middlewares import Context
 from bot.storage import DbStorage, UserIsolation
 from bot.ui import notify
 
 log = logging.getLogger(__name__)
-ROUTERS = (logchat.router, inline.router, finance.router, commands.router, start.router, admin.router, admin_ops.router, admin_ton.router, admin_api.router,
-           admin_orders.router, market.router, seller.router, deal.router, orders.router, wallet.router,
-           ton_wallet.router, api_user.router, fallback.router)  # fallback must stay last
+ROUTERS = (logchat.router, admin_chat.events_router, inline.router, finance.router, commands.router, start.router,
+           admin.router, admin_ops.router, admin_chat.router, admin_api.router, admin_orders.router, market.router,
+           seller.router, deal.router, orders.router, wallet.router, api_user.router,
+           fallback.router)  # fallback must stay last
 
 
 async def on_error(event: ErrorEvent, bot: Bot, state=None) -> None:

@@ -154,7 +154,7 @@ async def scenario():
     assert rocket.cheques and rocket.cheques[0][2] == BUYER
     await tasks.poll_deposits(bot)
     async with models.Session() as s:
-        assert (await s.get(User, BUYER)).balance == D("131.6") - 10 + D("98.5")
+        assert (await s.get(User, BUYER)).balance == D("131.6") - 10 + D("97.0225")  # 98.5 − 1.5% fee
 
     # admin panel
     await run(cb(ADMIN, "as"), cb(ADMIN, "as:rate"), msg(ADMIN, "95"))
@@ -201,8 +201,8 @@ def test_deposit_credits_actual_net_payment_once():
             dep = await s.get(Deposit, 1)
             assert await wallet.check_deposit(s, dep) == "credited"
             assert await wallet.check_deposit(s, dep) == "paid"
-            assert (await s.get(User, 777)).balance == D("47.3")
-            assert dep.credit == D("47.3")
+            assert (await s.get(User, 777)).balance == D("46.5905")  # 47.3 received − 1.5% deposit fee
+            assert dep.credit == D("46.5905") and dep.amount == D("47.3")
     asyncio.run(scenario())
 
 

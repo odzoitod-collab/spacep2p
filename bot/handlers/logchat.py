@@ -1,9 +1,9 @@
 """Admin log chat: forum topics per kind of log and one live card per operation.
 
 If the log chat is a forum supergroup, the bot creates its topics itself (and re-creates a topic an admin deleted):
-deals, order requisites, deposits, withdrawals, TON, API, order merchants, users, cards, adjustments, tickets,
+deals, order requisites, deposits, withdrawals, API, order merchants, users, cards, adjustments, tickets, chat,
 service, and "needs attention". Every operation (deal #15, withdrawal #7, API application #2 …) has one card in its
-topic: status badge, key facts and the latest events. New events edit the card in place (silently); events that
+topic: status badge, one fact per line (people as @username · name · id) and the latest events. New events edit the card in place (silently); events that
 need an admin also go to the "needs attention" topic, which rings. Without topics (a plain group or admins'
 private chats) a card is edited for routine steps and re-posted at the bottom when something needs attention.
 Needs the bot to be an admin with the "Manage topics" right to create topics; otherwise everything goes to the
@@ -23,8 +23,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from bot.config import config
 from bot.emoji import back, btn, kb
 from bot.models import (Adjustment, ApiApplication, ApiClient, Card, Deal, Deposit, Event, LogMessage, OrderMerchant,
-                        Setting, Ticket, TonDeposit, TonOp, User, Withdrawal, now)
-from bot.services import events, money
+                        Setting, Ticket, User, Withdrawal, now)
+from bot.services import events, money, xrocket
 from bot.ui import at, clean, esc, paced
 
 log = logging.getLogger(__name__)
@@ -37,34 +37,34 @@ TOPICS = {
     "orders": ("🧾 Ордерные реквизиты", 13338331),
     "deposits": ("📥 Пополнения", 9367192),
     "withdrawals": ("📤 Выводы", 16766590),
-    "ton": ("💎 TON: автопереводы и газ", 7322096),
     "api": ("🔑 API: заявки и клиенты", 13338331),
     "om": ("🤝 Ордерные мерчанты", 9367192),
     "users": ("👤 Пользователи", 16749490),
     "cards": ("💳 Карты", 16766590),
     "adjust": ("✏️ Корректировки", 16749490),
     "tickets": ("💬 Обращения", 7322096),
+    "chat": ("👥 Чат и рассылки", 7322096),
     "service": ("⚙️ Сервис", 16478047),
 }
-KIND_TOPIC = {"wd": "withdrawals", "dep": "deposits", "tdep": "deposits", "tsw": "ton", "apa": "api", "apc": "api",
-              "om": "om", "user": "users", "card": "cards", "adj": "adjust", "ticket": "tickets", "app": "service"}
+KIND_TOPIC = {"wd": "withdrawals", "dep": "deposits", "apa": "api", "apc": "api", "om": "om", "user": "users",
+              "card": "cards", "adj": "adjust", "ticket": "tickets", "app": "service"}
 ABOUT = {
     "attention": "Всё, что ждёт решения администратора: споры, отказы xRocket, выводы на проверке, новые анкеты и "
                  "заявки, нехватка газа. Эту ветку стоит держать со звуком.",
-    "stats": "Одно живое сообщение: сколько денег на xRocket и на вашем кошельке, сколько должны пользователям, "
-             "прибыль и сколько можно забрать. Обновляется каждые 10 минут.",
+    "stats": "Одно живое сообщение: сколько денег на xRocket, сколько должны пользователям, прибыль и сколько "
+             "можно забрать. Обновляется каждые 10 минут.",
     "deals": "Сделки по статичным картам: одна карточка на сделку, статус меняется по ходу.",
     "orders": "Сделки по ордерным реквизитам: поиск мерчанта, выдача реквизитов, оплата, итог.",
-    "deposits": "Пополнения: счета xRocket и USDT в сети TON (сумма, хеш транзакции, отправитель).",
-    "withdrawals": "Выводы: чеки xRocket и переводы USDT в сети TON — от запроса до выполнения.",
-    "ton": "Автопереводы USDT с адресов пополнения и газ (TON на комиссии).",
+    "deposits": "Пополнения через xRocket: счета и адреса в сетях (сумма, комиссия, зачислено).",
+    "withdrawals": "Выводы через xRocket: чеки и переводы на кошельки в сетях — от запроса до выполнения.",
     "api": "Заявки на Strait Pay API и API-клиенты: одобрение, токены, приостановка.",
     "om": "Анкеты ордерных мерчантов и их статус.",
     "users": "Новые пользователи, баны, личные ставки мерчантов.",
     "cards": "Карты продавцов: добавление, блокировка.",
     "adjust": "Ручные корректировки баланса.",
     "tickets": "Обращения пользователей в поддержку.",
-    "service": "Сервисные сообщения: xRocket, TON, адрес автоперевода.",
+    "chat": "Чат сообщества: вступления по личным ссылкам, закреп, итоги рассылок.",
+    "service": "Сервисные сообщения: xRocket и настройки.",
 }
 IMPORTANT = ("failed", "unknown", "refunded", "dispute", "late_no_funds")
 TIMELINE = 6
@@ -75,9 +75,6 @@ _topics: dict[tuple[int, str], int | None] = {}  # (chat, key) -> thread id
 
 
 def important(ev: Event) -> bool:
-    kind = ev.ref.partition(":")[0]
-    if kind in ("tdep", "tsw"):
-        return ev.kind == "failed"  # a deposit or a completed sweep is news, not a problem
     return not ev.notice or ev.kind in IMPORTANT
 
 
@@ -161,65 +158,109 @@ def _badge(status: str) -> str:
     return WAIT
 
 
+async def who(s: AsyncSession, uid: int | None) -> str:
+    """A person in the log: @username · name · id — readable and searchable at once."""
+    if uid is None:
+        return "—"
+    u = await s.get(User, uid)
+    parts = [f"@{esc(u.username)}" if u and u.username else "", esc(u.name) if u and u.name else "", f"<code>{uid}</code>"]
+    return " · ".join(p for p in parts if p)
+
+
+def _mask(card: Card) -> str:
+    r = card.requisites
+    return f"{esc(card.bank)} •• {esc(r[-4:])}" + (" · СБП" if card.kind == "sbp" else "")
+
+
 async def describe(s: AsyncSession, ref: str) -> tuple[str, str, str, list[str]]:
-    """(topic key, status code, status label, facts) of an operation, read from its current state."""
-    from bot.handlers.admin import ADJ_STATUS, DEP_LABEL, WD_LABEL
+    """(topic key, status code, status label, facts — one per line) of an operation, read from its current state."""
+    from bot.handlers.admin import ADJ_REASONS, ADJ_STATUS, DEP_LABEL, WD_LABEL
     from bot.handlers.admin_api import APP_STATUS
     from bot.handlers.admin_ops import TICKET_STATUS
     from bot.handlers.admin_orders import STATUS as OM_STATUS
-    from bot.handlers.admin_ton import OP_STATUS
     from bot.handlers.deal import STATUS as DEAL_STATUS
     kind, _, oid = ref.partition(":")
     topic = KIND_TOPIC.get(kind, "service")
-    obj = None
-    if kind != "app" and oid.isdigit():
-        model = {"deal": Deal, "wd": Withdrawal, "dep": Deposit, "tdep": TonDeposit, "tsw": TonOp, "apa": ApiApplication,
-                 "apc": ApiClient, "om": OrderMerchant, "ticket": Ticket, "adj": Adjustment, "user": User,
-                 "card": Card}.get(kind)
-        obj = await s.get(model, int(oid)) if model else None
+    if kind == "app":
+        return ("chat" if oid in ("chat", "broadcast") else "service"), "attention", "сервис", []
+    model = {"deal": Deal, "wd": Withdrawal, "dep": Deposit, "apa": ApiApplication, "apc": ApiClient,
+             "om": OrderMerchant, "ticket": Ticket, "adj": Adjustment, "user": User, "card": Card}.get(kind)
+    obj = await s.get(model, int(oid)) if model and oid.isdigit() else None
     if obj is None:
-        return topic, "attention" if kind == "app" else "unknown", "сервис" if kind == "app" else "", []
+        return topic, "unknown", "", []
+    uids = {getattr(obj, a, None) for a in ("buyer_id", "seller_id", "operator_id", "user_id", "admin_id")}
+    names = {uid: await who(s, uid) for uid in uids if uid}
+    u = lambda label, uid: f"{label}: {names.get(uid, '—')}"  # noqa: E731
     if kind == "deal":
-        facts = [f"{money.fmt(obj.amount_rub)} ₽ → {money.usdt(obj.buyer_credit)} USDT",
-                 f"покупатель <code>{obj.buyer_id}</code>" + (f" · продавец <code>{obj.seller_id}</code>"
-                                                               if obj.seller_id else "")
-                 + (" · API" if obj.api_client_id else "")]
+        mode = "Bybit-ордер" if obj.via_bybit else "ордерные реквизиты" if obj.is_order else "статичная карта"
+        client = await s.get(ApiClient, obj.api_client_id) if obj.api_client_id else None
+        card = await s.get(Card, obj.card_id) if obj.card_id else None
+        facts = [f"Тип: {mode}" + (f" · API «{esc(client.project)}»" if client else ""),
+                 f"Сумма: <b>{money.fmt(obj.amount_rub)} ₽</b>",
+                 f"Покупатель получит: <b>{money.usdt(obj.buyer_credit)} USDT</b> · курс "
+                 f"{money.fmt(obj.buyer_rate or obj.rate)} ₽ · {money.fmt(obj.platform_pct, 3)}%",
+                 f"Мерчант отдаёт: {money.usdt(obj.seller_debit)} USDT" + (
+                     f" по {money.fmt(obj.merchant_rate)} ₽" if obj.merchant_rate else f" · {money.fmt(obj.seller_pct, 3)}%"),
+                 f"Доход площадки: {money.usdt(obj.platform_fee)} USDT",
+                 u("Покупатель", obj.buyer_id)]
+        if obj.seller_id:
+            facts.append(u("Мерчант", obj.seller_id))
+        if obj.via_bybit and obj.operator_id:
+            facts.append(u("Оператор", obj.operator_id))
+        if card:
+            facts.append(f"Реквизиты: {_mask(card)}")
+        if obj.sender_bank:
+            facts.append(f"Банк покупателя: {esc(obj.sender_bank)}")
         return ("orders" if obj.is_order else "deals"), obj.status, DEAL_STATUS[obj.status][1], facts
     if kind == "wd":
-        where = f"на {obj.address[:6]}…{obj.address[-4:]}" if obj.method == "ton" else "чеком xRocket"
+        where = (f"{xrocket.net_name(obj.network)} · <code>{esc(obj.address or '—')}</code>" if obj.method == "chain"
+                 else "чек xRocket")
         return topic, obj.status, WD_LABEL.get(obj.status, obj.status), [
-            f"{money.usdt(obj.amount)} USDT {where} · пользователь <code>{obj.user_id}</code>"]
+            u("Пользователь", obj.user_id), f"Способ: {where}",
+            f"Списано: <b>{money.usdt(obj.amount)} USDT</b> · комиссия {money.usdt(obj.fee)}",
+            f"К получению: <b>{money.usdt(obj.amount - obj.fee)} USDT</b>"]
     if kind == "dep":
+        how = f"адрес {xrocket.net_name(obj.network)}" if obj.address else "счёт xRocket"
         return topic, obj.status, DEP_LABEL.get(obj.status, obj.status), [
-            f"xRocket · {money.usdt(obj.amount)} USDT · пользователь <code>{obj.user_id}</code>"]
-    if kind == "tdep":
-        return topic, "credited", "зачислено", [
-            f"USDT TON · +{money.usdt(obj.amount)} USDT · пользователь <code>{obj.user_id}</code>"]
-    if kind == "tsw":
-        return topic, obj.status, OP_STATUS.get(obj.status, obj.status), [
-            f"{'автоперевод' if obj.kind == 'sweep' else 'газ'} {money.usdt(obj.amount)} · пользователь "
-            f"<code>{obj.user_id}</code>"]
+            u("Пользователь", obj.user_id), f"Способ: {how}",
+            f"Сумма: <b>{money.usdt(obj.amount)} USDT</b>" + (
+                f" · зачислено {money.usdt(obj.credit)}" if obj.status == "paid" else "")]
     if kind == "apa":
-        return topic, obj.status, APP_STATUS[obj.status], [f"{esc(obj.project)} · {esc(obj.url)} · {esc(obj.volume)}"]
+        return topic, obj.status, APP_STATUS[obj.status], [
+            u("Заявитель", obj.user_id), f"Проект: <b>{esc(obj.project)}</b>", f"Ссылка: {esc(obj.url)}",
+            f"Трафик: {esc(obj.traffic)}", f"Оборот: {esc(obj.volume)}"]
     if kind == "apc":
-        return topic, obj.status, "активен" if obj.status == "active" else "приостановлен", [esc(obj.project)]
+        return topic, obj.status, "активен" if obj.status == "active" else "приостановлен", [
+            u("Владелец", obj.user_id), f"Проект: <b>{esc(obj.project)}</b>",
+            f"Условия: курс {money.fmt(obj.rate) + ' ₽' if obj.rate else 'общий'} · "
+            f"{money.fmt(obj.pct, 3) + '%' if obj.pct is not None else 'общий %'}"]
     if kind == "om":
         return topic, obj.status, OM_STATUS[obj.status], [
-            f"{money.fmt(obj.min_rub)}–{money.fmt(obj.max_rub)} ₽ · в работе до {money.fmt(obj.max_open_rub)} ₽"]
+            u("Мерчант", obj.user_id), f"Режим: {'Bybit-ордер' if obj.mode == 'bybit' else 'баланс'}",
+            f"Заявки: {money.fmt(obj.min_rub)}–{money.fmt(obj.max_rub)} ₽ · в работе до {money.fmt(obj.max_open_rub)} ₽",
+            f"Банки: {esc(obj.banks)}"]
     if kind == "ticket":
-        return topic, obj.status, TICKET_STATUS[obj.status], [f"пользователь <code>{obj.user_id}</code>"]
+        return topic, obj.status, TICKET_STATUS[obj.status], [
+            u("Пользователь", obj.user_id), f"Текст: {esc(obj.text[:300])}"]
     if kind == "adj":
         return topic, obj.status, ADJ_STATUS[obj.status], [
-            f"{'+' if obj.delta > 0 else ''}{money.usdt(obj.delta)} USDT · пользователь <code>{obj.user_id}</code>"]
+            u("Пользователь", obj.user_id), f"Изменение: <b>{'+' if obj.delta > 0 else ''}{money.usdt(obj.delta)} USDT</b>",
+            f"Причина: {esc(ADJ_REASONS.get(obj.reason, obj.reason))}" + (f" — {esc(obj.comment)}" if obj.comment else ""),
+            u("Администратор", obj.admin_id)]
     if kind == "user":
         code = "banned" if obj.is_banned else "active"
         return topic, code, "заблокирован" if obj.is_banned else "активен", [
-            f"{esc(obj.name or '—')} @{esc(obj.username or '—')}"]
+            f"Пользователь: {await who(s, obj.id)}",
+            f"Баланс: {money.usdt(obj.balance)} USDT · в сделках {money.usdt(obj.frozen)}"]
     if kind == "card":
         code = "deleted" if obj.is_deleted else "banned" if obj.is_banned else "active" if obj.is_active else "off"
         label = {"deleted": "удалена", "banned": "заблокирована", "active": "включена", "off": "выключена"}[code]
-        return topic, code, label, [f"{esc(obj.bank)} · владелец <code>{obj.user_id}</code>"]
+        return topic, code, label, [u("Владелец", obj.user_id), f"Карта: {_mask(obj)}",
+                                    f"Суммы: {money.fmt(obj.min_rub)}–{money.fmt(obj.max_rub)} ₽"]
     return topic, "", "", []
+
+
+APP_NAMES = {"chat": ("Чат сообщества", "ach"), "broadcast": ("Рассылка", "ach"), "xrocket": ("xRocket", "al")}
 
 
 async def render(s: AsyncSession, ref: str, attention: bool) -> tuple[str, str, object]:
@@ -229,8 +270,9 @@ async def render(s: AsyncSession, ref: str, attention: bool) -> tuple[str, str, 
     topic, code, label, facts = await describe(s, ref)
     badge = ATTENTION if attention and code not in ("completed", "done") else _badge(code)
     if kind == "app":
-        head = f"{badge} <b>Сервис · {esc(oid)}</b>"
-        markup = kb(btn("USDT TON", "atn", "wallet") if oid == "ton" else btn("Ввод и вывод", "al", "wallet"))
+        name, cb = APP_NAMES.get(oid, (oid, "a"))
+        head = f"{badge} <b>{esc(name)}</b>"
+        markup = kb(btn("Открыть", cb, "search"))
     else:
         name, cb = REF_NAMES.get(kind, ("Событие", ""))
         head = f"{badge} <b>{name} #{oid}</b>" + (f" · {label}" if label else "")
@@ -238,8 +280,8 @@ async def render(s: AsyncSession, ref: str, attention: bool) -> tuple[str, str, 
     if attention:
         head += " · <b>нужно внимание</b>"
     rows = (await s.scalars(select(Event).where(Event.ref == ref).order_by(Event.id.desc()).limit(TIMELINE))).all()
-    timeline = [f"{at(e.created_at)} {esc(e.text[:300])}" for e in reversed(rows)]
-    text = "\n".join([head, *facts, "", *timeline])
+    timeline = [f"{at(e.created_at)} · {esc(e.text[:300])}" for e in reversed(rows)]
+    text = "\n".join([head, "", *facts, *(["", "<b>История</b>", *timeline] if timeline else [])])
     return topic, clean(text)[:3900], markup
 
 
@@ -286,10 +328,11 @@ async def _to_chat(bot: Bot, s: AsyncSession, chat: int, ref: str, topic: str, t
                                             message_id=card.msg_id)
         card = await _new_card(bot, s, chat, ref, topic, text, markup, card)
     if forum and attention:
-        head = text.split("\n", 1)[0]
-        what = "\n".join(esc(ev.text[:300]) for ev in evs if important(ev))
-        await post(bot, s, chat, "attention", clean(f"{head}\n{what}"), markup or kb(back("x", "Скрыть", "cross")),
-                   silent=False)
+        head, _, rest = text.partition("\n\n")
+        facts = rest.split("\n\n", 1)[0].split("\n")[:4]  # who and how much: enough to decide whether to open it
+        what = "\n".join(f"• {esc(ev.text[:300])}" for ev in evs if important(ev))
+        await post(bot, s, chat, "attention", clean("\n".join([head, *facts, "", what])),
+                   markup or kb(back("x", "Скрыть", "cross")), silent=False)
 
 
 async def _new_card(bot, s, chat, ref, topic, text, markup, card: LogMessage | None) -> LogMessage:

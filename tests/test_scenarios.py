@@ -59,7 +59,7 @@ def test_first_visit_and_empty_market_explain_next_step(go):
     async def fn(b):
         await b.run(msg(BUYER, "/start"), cb(BUYER, "buy:0"))
         first, market = b.session.texts(BUYER)[-2:]
-        assert "RUB ⇄ USDT — купить USDT за рубли" in plain(first) and "USDT ⇄ RUB — продать" in plain(first)
+        assert "RUB ⇄ USDT — купить за рубли" in plain(first) and "USDT ⇄ RUB — продавать" in plain(first)
         assert "нет продавцов" in plain(market) and "Например: 10 000 ₽ → 94 USDT" in plain(market)
         await b.run(msg(BUYER, "привет"))  # free text outside any step is not swallowed silently
         assert "Сообщение не распознано" in plain(b.session.last(BUYER))
@@ -491,7 +491,7 @@ def test_deposit_waits_for_pending_payment(go):
         assert (await user(BUYER)).balance == 0
         b.rocket.payments[1] = {"status": "paid", "receiveAmount": "19.5", "receiveCurrency": "USDT"}
         await tasks.poll_deposits(b.bot)
-        assert (await user(BUYER)).balance == D("29.5")
+        assert (await user(BUYER)).balance == D("29.0575")  # 29.5 − 1.5% deposit fee
     go(fn)
 
 

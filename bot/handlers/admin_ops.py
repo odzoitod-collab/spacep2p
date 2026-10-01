@@ -1,4 +1,4 @@
-"""Admin operation cards (withdrawal, deposit, USDT on TON), event history, support tickets, CSV reports, alert rendering."""
+"""Admin operation cards (withdrawal, deposit), event history, support tickets, CSV reports, alert rendering."""
 import csv
 import io
 from datetime import timedelta
@@ -14,8 +14,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from bot.config import config
 from bot.emoji import back, btn, kb, pe
 from bot.handlers.admin import DEP_LABEL, WD_LABEL
-from bot.handlers.wallet import check_deposit, reconcile, send_cheque
-from bot.models import Audit, Deal, Deposit, Event, Ledger, Ticket, TonDeposit, TonOp, User, Withdrawal, now
+from bot.handlers.wallet import check_deposit, notify_withdrawal, reconcile, send_cheque, sync_withdrawal
+from bot.models import Audit, Deal, Deposit, Event, Ledger, Ticket, User, Withdrawal, now
 from bot.services import audit, events, money, xrocket
 from bot.ui import at, esc, notify, ok, quote, show, title, warn
 
@@ -48,7 +48,7 @@ async def cb_payments(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User):
         "Откройте операцию: карточка показывает всю цепочку и следующее действие. Поиск — «Найти» → "
         "<code>в482</code> / <code>п12</code>.",
     ]) + ("" if wds or deps else f"\n\n{pe('ok')} Пусто"), kb(
-        *[btn(f"Вывод #{w.id} · {'TON' if w.method == 'ton' else 'чек'} · {money.usdt(w.amount)} USDT · "
+        *[btn(f"Вывод #{w.id} · {'чек' if w.method == 'xrocket' else w.network or 'TON'} · {money.usdt(w.amount)} USDT · "
               f"{WD_LABEL.get(w.status, w.status)}", f"awv:{w.id}", "up",
               style="danger" if w.status in ("unknown", "pending", "sending") else None) for w in wds],
         *[btn(f"Пополнение #{d.id} · {money.usdt(d.amount)} USDT · {DEP_LABEL.get(d.status, d.status)}",
@@ -71,14 +71,14 @@ async def withdrawal_screen(bot: Bot, s: AsyncSession, admin: User, wd: Withdraw
                             refund: bool = False):
     u = await s.get(User, wd.user_id)
     last = await s.scalar(select(Event).where(Event.ref == f"wd:{wd.id}").order_by(Event.id.desc()).limit(1))
-    if wd.method == "ton":
+    if wd.method == "chain":
         return await show(bot, admin, "\n".join([
-            title(pe("up"), f"Вывод на TON (xRocket) #{wd.id} · {WD_LABEL.get(wd.status, wd.status)}"),
-            "",
+            title(pe("up"), f"Вывод на кошелёк #{wd.id} · {WD_LABEL.get(wd.status, wd.status)}"),
             quote(
                 f"{pe('profile')} Пользователь: {_who(u, wd.user_id)}",
+                f"{pe('swap')} Сеть: <b>{xrocket.net_name(wd.network)}</b>",
                 f"{pe('wallet')} Списано: <b>{money.usdt(wd.amount)} USDT</b> · к отправке "
-                f"{money.usdt(wd.amount - wd.fee)} · комиссия {money.usdt(wd.fee)}",
+                f"{money.usdt(wd.amount - wd.fee)} · комиссия {money.usdt(wd.fee)} (сеть {money.usdt(wd.net_fee)})",
                 f"{pe('key')} Адрес: <code>{esc(wd.address or '—')}</code>"
                 + (f" · memo <code>{esc(wd.memo)}</code>" if wd.memo else ""),
                 f"{pe('clock')} Создан: {at(wd.created_at, 'dt')}" + (f" · отправлен {at(wd.sent_at, 'dt')}" if wd.sent_at else ""),
@@ -191,6 +191,24 @@ async def cb_refund_unknown(c: CallbackQuery, bot: Bot, s: AsyncSession, user: U
     await withdrawal_screen(bot, s, user, wd, c, ok("Средства возвращены"))
 
 
+@router.callback_query(F.data.regexp(r"^wt:(\d+)$"))
+async def cb_chain_check(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User):
+    """Ask xRocket about a withdrawal to an address right now."""
+    wd = await s.get(Withdrawal, int(c.data.split(":")[1]), with_for_update=True, populate_existing=True)
+    if not wd or wd.method != "chain":
+        return await c.answer("Вывод не найден", show_alert=True)
+    result = await sync_withdrawal(s, wd) if wd.status in ("pending", "sent", "unknown") else "final"
+    audit.log(s, user.id, "wd_check", f"wd:{wd.id}", result)
+    await s.commit()
+    await notify_withdrawal(bot, wd, result)
+    await withdrawal_screen(bot, s, user, wd, c, ok({
+        "done": "xRocket: выполнен.", "sent": "xRocket: принят, транзакция ещё в пути.",
+        "refunded": "xRocket: не выполнен — сумма возвращена пользователю.",
+        "retried": "xRocket не знал этот вывод — отправлен заново (тот же clientWithdrawalId, дубля не будет).",
+        "unknown": "xRocket не ответил — повторите позже.", "final": "Вывод уже завершён.",
+    }.get(result, f"Результат: {esc(result)}")))
+
+
 # ---------- deposit card ----------
 
 async def deposit_screen(bot: Bot, s: AsyncSession, admin: User, dep: Deposit, src=None, note: str = ""):
@@ -204,7 +222,9 @@ async def deposit_screen(bot: Bot, s: AsyncSession, admin: User, dep: Deposit, s
         "",
         quote(
             f"{pe('profile')} Пользователь: {_who(u, dep.user_id)}",
-            f"{pe('dollar')} Счёт: <b>{money.usdt(dep.amount)} USDT</b> · "
+            f"{pe('swap')} Адрес {xrocket.net_name(dep.network)}: <code>{esc(dep.address)}</code>" if dep.address
+            else f"{pe('wallet')} Счёт-ссылка xRocket",
+            f"{pe('dollar')} Сумма: <b>{money.usdt(dep.amount)} USDT</b> · "
             + (f"зачислено: <b>{money.usdt(dep.credit)} USDT</b>" if dep.status == "paid"
                else f"ожидается: {money.usdt(dep.credit)} USDT"),
             f"{pe('clock')} Создан: {at(dep.created_at, 'dt')}",
@@ -245,12 +265,11 @@ async def cb_deposit_check(c: CallbackQuery, bot: Bot, s: AsyncSession, user: Us
 # ---------- event history of any operation ----------
 
 REF_NAMES = {"om": ("Ордерный мерчант", "aom"), "apa": ("Заявка на API", "aap"), "apc": ("API-клиент", "acl"),
-             "tdep": ("Пополнение USDT TON", "atd"), "tsw": ("Автоперевод USDT TON", "ato"),
              "wd": ("Вывод", "awv"), "dep": ("Пополнение", "adp"), "deal": ("Сделка", "adv"), "user": ("Пользователь", "auv"),
              "card": ("Карта", "acv"), "adj": ("Корректировка", "adjv"), "ticket": ("Обращение", "atk")}
 
 
-@router.callback_query(F.data.regexp(r"^aev:(wd|dep|deal|user|card|adj|ticket|tdep|tsw|apa|apc|om):(\d+)$"))
+@router.callback_query(F.data.regexp(r"^aev:(wd|dep|deal|user|card|adj|ticket|apa|apc|om):(\d+)$"))
 async def cb_events(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User):
     _, kind, oid = c.data.split(":")
     rows = await events.history(s, f"{kind}:{oid}")
@@ -385,15 +404,12 @@ async def cb_report(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User):
     ledger_rows = (await s.execute(select(
         Ledger.id, Ledger.created_at, Ledger.user_id, Ledger.kind, Ledger.ref, Ledger.delta, Ledger.frozen_delta,
         Ledger.note).where(Ledger.created_at >= since).order_by(Ledger.id))).all()
-    pay_rows = [("withdrawal", w.id, w.created_at, w.user_id, w.status, w.amount, w.fee, w.amount - w.fee, w.cheque_id,
-                 w.error) for w in (await s.scalars(select(Withdrawal).where(Withdrawal.created_at >= since)))]
-    pay_rows += [("deposit", d.id, d.created_at, d.user_id, d.status, d.amount, Decimal(0), d.credit, d.invoice_id, "")
+    pay_rows = [("withdrawal", w.id, w.created_at, w.user_id, w.status, w.network or "cheque", w.amount, w.fee,
+                 w.amount - w.fee, w.cheque_id or w.tx_hash, w.error)
+                for w in (await s.scalars(select(Withdrawal).where(Withdrawal.created_at >= since)))]
+    pay_rows += [("deposit", d.id, d.created_at, d.user_id, d.status, d.network or "invoice", d.amount,
+                  d.amount - d.credit if d.status == "paid" else Decimal(0), d.credit, d.invoice_id, "")
                  for d in (await s.scalars(select(Deposit).where(Deposit.created_at >= since)))]
-    pay_rows += [("ton_deposit", d.id, d.created_at, d.user_id, "credited", d.amount, Decimal(0), d.amount, d.tx_hash, "")
-                 for d in (await s.scalars(select(TonDeposit).where(TonDeposit.created_at >= since)))]
-    pay_rows += [(f"ton_{o.kind}", o.id, o.created_at, o.user_id, o.status, o.amount, Decimal(0), o.amount,
-                  o.tx_hash or o.msg_hash or "", o.error or "")
-                 for o in (await s.scalars(select(TonOp).where(TonOp.created_at >= since)))]
     suffix = f"{days}d_{now():%Y%m%d}"
     files = [
         _csv(f"deals_{suffix}.csv", ["id", "created_at", "closed_at", "status", "close_reason", "buyer_id", "seller_id",
@@ -401,7 +417,7 @@ async def cb_report(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User):
                                      "dispute_reason"], deal_rows),
         _csv(f"ledger_{suffix}.csv", ["id", "created_at", "user_id(empty=platform)", "kind", "ref", "delta_total_usdt",
                                       "delta_frozen_usdt", "note"], ledger_rows),
-        _csv(f"payments_{suffix}.csv", ["type", "id", "created_at", "user_id", "status", "amount_usdt", "fee_usdt",
+        _csv(f"payments_{suffix}.csv", ["type", "id", "created_at", "user_id", "status", "network", "amount_usdt", "fee_usdt",
                                         "net_usdt", "xrocket_id", "error"], sorted(pay_rows, key=lambda r: r[2])),
     ]
     for f in files:

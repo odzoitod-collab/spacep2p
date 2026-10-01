@@ -13,7 +13,7 @@ from bot.config import config
 from bot.emoji import back, btn, kb, pe
 from bot.handlers.seller import parse_rub
 from bot.models import ApiApplication, ApiClient, Deal, User, now
-from bot.services import api, audit, deals, events, money
+from bot.services import api, audit, deals, events, money, settings
 from bot.ui import at, esc, notify, ok, quote, show, title, warn
 
 router = Router()
@@ -27,9 +27,28 @@ LIMITS = {"min_rub": ("Минимальный заказ, ₽", "rub"), "max_rub
           "rps": ("Запросов в секунду", "int")}
 
 
+TERMS = {"rate": "Курс клиента, ₽ за 1 USDT", "pct": "Процент площадки с клиента"}
+
+
 class AdmApi(StatesGroup):
     reason = State()
     limit = State()
+    terms = State()
+
+
+def terms_lines(cl: ApiClient) -> list[str]:
+    """The client's terms and what the platform keeps on 10 000 ₽ through a static card and an order merchant."""
+    rate, pct = settings.client_terms(cl)
+    amount = Decimal(10000)
+    card = money.seller_debit(amount, settings.dec("rate"), settings.dec("seller_pct"))
+    order = (amount / settings.dec("order_rate")).quantize(money.Q, "ROUND_UP")
+    credit = money.split(amount, Decimal("Infinity"), rate, pct).buyer_credit
+    margin = lambda debit: (f"<b>{money.usdt(debit - credit)}</b>" if debit >= credit  # noqa: E731
+                            else f"🔴 <b>{money.usdt(debit - credit)}</b> — в минус, заказы не создаются")
+    return [f"Курс: <b>{money.fmt(rate)} ₽</b>" + ("" if cl.rate is not None else " (общий)")
+            + f" · процент: <b>{money.fmt(pct, 3)}%</b>" + ("" if cl.pct is not None else " (общий)"),
+            f"10 000 ₽ → клиенту <b>{money.usdt(credit)} USDT</b> — одинаково для карт и ордеров",
+            f"Площадке: карта {margin(card)} · ордер {margin(order)} USDT"]
 
 
 def _who(u: User | None, uid: int) -> str:
@@ -159,11 +178,15 @@ async def client_screen(bot: Bot, s: AsyncSession, admin: User, cl: ApiClient, s
               f"{pe('key')} Токен: " + (f"…{cl.token_hint}, выпущен {at(cl.token_at, 'dt')}" if cl.token_hash else "нет"),
               f"{pe('bell')} Вебхук: {esc(cl.webhook_url or '—')}",
               f"{pe('dollar')} Баланс владельца: {money.usdt(u.balance)} USDT"),
+        "<b>Условия</b>",
+        quote(*terms_lines(cl)),
+        "<b>Лимиты</b>",
         quote(*[f"{t}: <b>{money.fmt(getattr(cl, k)) if kind == 'rub' else getattr(cl, k)}</b>"
                 for k, (t, kind) in LIMITS.items()],
               f"Сегодня: {money.fmt(used['today_rub'])} ₽ · неоплаченных сейчас: {used['open_orders']}"),
         quote(f"{pe('stats')} Заказов всего: {total}, успешных: {success} на {money.fmt(Decimal(volume))} ₽"),
     ]) + note, kb(
+        [btn("Курс клиента", f"acl:t:{cl.id}:rate", "swap"), btn("Процент клиента", f"acl:t:{cl.id}:pct", "percent")],
         *[btn(f"Изменить: {t}", f"acl:l:{cl.id}:{k}", "pencil") for k, (t, _) in LIMITS.items()],
         [btn("Приостановить", f"acl:st:{cl.id}:0", "pause", style="danger") if cl.status == "active"
          else btn("Возобновить", f"acl:st:{cl.id}:1", "ok", style="success"),
@@ -230,3 +253,54 @@ async def msg_limit(m: Message, bot: Bot, s: AsyncSession, user: User, state: FS
     setattr(cl, field, value)
     audit.log(s, user.id, "api_limit", f"apc:{cl.id}", f"{field}: {old} → {value}")
     await client_screen(bot, s, user, cl, note=ok(f"{LIMITS[field][0]}: {old} → {value}"))
+
+
+@router.callback_query(F.data.regexp(r"^acl:t:(\d+):(rate|pct)$"))
+async def cb_terms_ask(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User, state: FSMContext):
+    _, _, cid, field = c.data.split(":")
+    cl = await s.get(ApiClient, int(cid))
+    if not cl:
+        return await c.answer()
+    await state.set_state(AdmApi.terms)
+    await state.set_data({"client": cl.id, "field": field})
+    await show(bot, user, _terms_text(cl, field), kb(back(f"acl:{cid}", "Отмена")), c)
+
+
+def _terms_text(cl: ApiClient, field: str, err: str = "") -> str:
+    general = (f"{money.fmt(settings.dec('rate'))} ₽" if field == "rate"
+               else f"{money.fmt(settings.dec('platform_pct'), 3)}%")
+    return "\n".join([
+        title(pe("pencil"), TERMS[field]),
+        quote(*terms_lines(cl)),
+        f"Отправьте значение (например, <code>{'100' if field == 'rate' else '7'}</code>) или «-» — общий "
+        f"({general}). Действует на новые заказы, и по картам, и по ордерам.",
+    ]) + (warn(err) if err else "")
+
+
+@router.message(AdmApi.terms, F.text)
+async def msg_terms(m: Message, bot: Bot, s: AsyncSession, user: User, state: FSMContext):
+    data = await state.get_data()
+    cl = await s.get(ApiClient, data["client"])
+    field, raw = data["field"], m.text.strip().replace(",", ".").replace(" ", "")
+    value = None
+    if raw != "-":
+        try:
+            value = Decimal(raw)
+        except Exception:  # noqa: BLE001
+            value = Decimal(-1)
+        bad = (not value.is_finite() or value <= 0 or value >= 10_000_000 or value.as_tuple().exponent < -2
+               if field == "rate" else not value.is_finite() or not 0 <= value < 100 or value.as_tuple().exponent < -3)
+        if bad:
+            return await show(bot, user, _terms_text(cl, field, "Курс — число больше 0, до 2 знаков" if field == "rate"
+                                                     else "Процент от 0 до 99,999, до 3 знаков"),
+                              kb(back(f"acl:{cl.id}", "Отмена")))
+    await state.clear()
+    old = getattr(cl, field)
+    setattr(cl, field, value)
+    audit.log(s, user.id, "api_terms", f"apc:{cl.id}", f"{field}: {old} → {value}")
+    events.add(s, f"apc:{cl.id}", "terms", f"{TERMS[field]}: {old if old is not None else 'общий'} → "
+               f"{value if value is not None else 'общий'} ({user.name})", cl.user_id, alert=True)
+    rate, pct = settings.client_terms(cl)
+    await notify(bot, cl.user_id, f"{pe('key')} <b>Условия Strait Pay API изменены</b>\nКурс {money.fmt(rate)} ₽ · "
+                                  f"комиссия {money.fmt(pct, 3)}% — для новых заказов.")
+    await client_screen(bot, s, user, cl, note=ok("Сохранено"))

@@ -9,13 +9,13 @@ from sqlalchemy import select, update
 from bot.emoji import back, btn, kb, pe
 from bot.handlers import logchat
 from bot.handlers.deal import REASONS, push
+from bot.handlers import admin_chat
 from bot.handlers import orders as order_handlers
-from bot.handlers.ton_wallet import notify_withdrawal, sync_withdrawal
 from bot.handlers import finance as finance_handlers
 from bot.handlers import wallet as wallet_handlers
-from bot.handlers.wallet import check_deposit, reconcile, send_cheque
+from bot.handlers.wallet import check_deposit, notify_withdrawal, reconcile, sync_withdrawal
 from bot.models import Deal, Deposit, Session, User, Withdrawal, now
-from bot.services import api, deals, events, money, orders, settings, ton, xrocket
+from bot.services import api, deals, events, money, orders, settings, xrocket
 from bot.ui import notify
 
 log = logging.getLogger(__name__)
@@ -112,7 +112,7 @@ async def poll_deposits(bot: Bot) -> None:
                 continue
             if st == "credited":
                 await notify(bot, dep.user_id, f"{pe('ok')} <b>Баланс пополнен на {money.usdt(dep.credit)} USDT</b>"
-                                               f" · счёт #{dep.id}")
+                                               f" · пополнение #{dep.id}")
 
 
 async def reconcile_withdrawals(bot: Bot) -> None:
@@ -130,7 +130,7 @@ async def reconcile_withdrawals(bot: Bot) -> None:
             result, wd = await reconcile(s, wid)
             await s.commit()
             if result == "done":
-                await send_cheque(bot, wd)
+                await notify_withdrawal(bot, wd, "done")
             elif result == "refunded":
                 await notify(bot, wd.user_id, f"{pe('warn')} Чек по выводу #{wd.id} отменён. "
                                               f"{money.usdt(wd.amount)} USDT возвращены на баланс.")
@@ -150,15 +150,6 @@ async def alert_loop(bot: Bot) -> None:
         except Exception:
             log.exception("alert delivery failed")
         await events.wait(10)
-
-
-async def ton_cycle(bot: Bot) -> None:
-    """USDT on TON deposits (on-chain): credit new ones, then sweep them. One task: no races for a wallet."""
-    async with Session() as s:
-        for dep in await ton.scan(s):
-            await notify(bot, dep.user_id, f"{pe('ok')} <b>Баланс пополнен на {money.usdt(dep.amount)} USDT</b> "
-                                           "· USDT в сети TON")
-        await ton.sweep(s)
 
 
 async def order_timeouts(bot: Bot) -> None:
@@ -235,13 +226,9 @@ async def payout_queue(bot: Bot) -> None:
             if result == "queued":  # the balance dropped meanwhile
                 break
             funds -= need
-            if wd.method == "xrocket" and result == "done":
-                await send_cheque(bot, wd)
-            elif wd.method == "ton" and result in ("done", "sent"):
-                await (notify_withdrawal(bot, wd, "done") if result == "done" else
-                       notify(bot, wd.user_id, f"{pe('ok')} Вывод #{wd.id} отправлен: "
-                                               f"{money.usdt(wd.amount - wd.fee)} USDT уже в пути."))
-            elif result not in ("unknown", "sent", "done"):
+            if result in ("done", "sent"):
+                await notify_withdrawal(bot, wd, result)
+            elif result != "unknown":
                 await notify(bot, wd.user_id, f"{pe('warn')} Вывод #{wd.id} не выполнен: {result}. "
                                               f"{money.usdt(wd.amount)} USDT возвращены на баланс.")
 
@@ -251,11 +238,16 @@ async def stats_topic(bot: Bot) -> None:
         await finance_handlers.publish(bot, s)
 
 
-async def sync_ton_withdrawals(bot: Bot) -> None:
-    """Withdrawals to TON wallets are paid by xRocket: follow each one until COMPLETED or FAIL."""
+async def chat_pin(bot: Bot) -> None:
+    async with Session() as s:
+        await admin_chat.publish_pin(bot, s)
+
+
+async def sync_chain_withdrawals(bot: Bot) -> None:
+    """Withdrawals to addresses are paid by xRocket: follow each one until COMPLETED or FAIL."""
     async with Session() as s:
         rows = (await s.scalars(select(Withdrawal).where(
-            Withdrawal.method == "ton",
+            Withdrawal.method == "chain",
             (Withdrawal.status.in_(("unknown", "sent")))
             | ((Withdrawal.status == "pending") & (Withdrawal.created_at < now() - timedelta(minutes=2))))
             .order_by(Withdrawal.id).limit(30))).all()
@@ -324,8 +316,8 @@ def start(bot: Bot) -> list[asyncio.Task]:
             asyncio.create_task(loop(auto_offline, bot, 60)),
             asyncio.create_task(alert_loop(bot)),
             asyncio.create_task(loop(api_webhooks, bot, 5)),
-            asyncio.create_task(loop(sync_ton_withdrawals, bot, 60)),
+            asyncio.create_task(loop(sync_chain_withdrawals, bot, 60)),
             asyncio.create_task(loop(order_timeouts, bot, 20)),
             asyncio.create_task(loop(payout_queue, bot, 30)),
-            asyncio.create_task(loop(stats_topic, bot, 600))] + (
-        [asyncio.create_task(loop(ton_cycle, bot, 30))] if ton.enabled() else [])
+            asyncio.create_task(loop(stats_topic, bot, 600)),
+            asyncio.create_task(loop(chat_pin, bot, 300))]

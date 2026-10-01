@@ -10,9 +10,9 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.emoji import back, btn, kb, pe
-from bot.models import Ticket, User, now
+from bot.models import OrderMerchant, Ticket, User, now
 from bot.services import deals, events, money, settings
-from bot.ui import BRAND, TAGLINE, manual, ok, quote, show, title, warn
+from bot.ui import BRAND, manual, ok, quote, show, title, warn
 
 router = Router()
 TICKETS_PER_HOUR = 5
@@ -31,29 +31,27 @@ async def main_menu(bot: Bot, s: AsyncSession, user: User, is_admin: bool, src=N
     active = await deals.open_deal_of(s, user.id)
     todo = await deals.seller_todo(s, user.id)
     need_check = [d for d in todo if d.status == "paid"]
+    om = await s.get(OrderMerchant, user.id)
     lines = [
         title(pe("shop"), BRAND),
-        f"<i>{TAGLINE}</i>",
-        "",
-        f"Баланс: <b>{money.usdt(user.balance)} USDT</b>"
-        + (f" · в сделках {money.usdt(user.frozen)}" if user.frozen else ""),
-        f"Курс: 1 USDT = <b>{money.fmt(settings.dec('rate'))} ₽</b>",
+        quote(f"Баланс: <b>{money.usdt(user.balance)} USDT</b>"
+              + (f" · в сделках {money.usdt(user.frozen)}" if user.frozen else ""),
+              f"Курс: 1 USDT = <b>{money.fmt(settings.dec('rate'))} ₽</b>"),
     ]
-    if not active and not todo and user.balance == 0 and user.frozen == 0:
-        lines += ["",
-                  "<b>RUB ⇄ USDT</b> — купить USDT за рубли: перевод продавцу по его реквизитам.",
-                  "<b>USDT ⇄ RUB</b> — продать USDT: свои карты, смена, доход с каждой сделки.",
-                  "<b>Ордерные реквизиты</b> — реквизиты под вашу сумму, если готовых нет.",
-                  f"Как всё устроено — в {manual('инструкции')}."]
+    if not active and not todo and user.balance == 0 and user.frozen == 0:  # a newcomer: one line per section
+        lines += [f"{pe('info')} <b>RUB ⇄ USDT</b> — купить за рубли · <b>USDT ⇄ RUB</b> — продавать на свою "
+                  f"карту. Подробно — в {manual('инструкции')}."]
     await show(bot, user, "\n".join(lines) + note, kb(
         btn(f"Сделка #{active.id}: {deal_hint(active)}", f"dl:{active.id}", "fire", style="primary") if active else None,
         btn(f"Проверить оплату ({len(need_check)})", f"dl:{need_check[0].id}", "bell", style="danger")
         if need_check else None,
         btn(f"Кошелёк · {money.usdt(user.balance)} USDT", "w", style="primary"),
         [btn("RUB ⇄ USDT", "buy:0", style="success"), btn("USDT ⇄ RUB", "sl", style="danger")],
-        btn("Ордерные реквизиты", "om", style="primary"),
+        btn("Ордерный кабинет" if om and om.status in ("approved", "suspended", "pending") else "Ордерные реквизиты",
+            "om", wide=True),
         [btn("Мои сделки", inline="сделки "), btn("Помощь", "info")],
-        [btn(f"{BRAND} API", "api"), btn("Админ-панель", "a") if is_admin else None],
+        [btn(f"{BRAND} API", "api"), btn("Чат", "chat") if settings.get("chat_id") else None],
+        btn("Админ-панель", "a", wide=True) if is_admin else None,
     ), src)
 
 
@@ -86,27 +84,21 @@ async def info_screen(bot: Bot, user: User, src=None):
     url = support_url()
     text = "\n".join([
         title(pe("info"), f"Помощь · {BRAND}"),
-        "",
-        title(pe("edu"), "Как это работает"),
+        "<b>Как это работает</b>",
         quote(settings.get("tutorial")),
-        "",
-        title(pe("percent"), "Условия"),
-        quote(
-            f"{pe('swap')} Курс: <b>{money.fmt(settings.dec('rate'))} ₽</b> за 1 USDT",
-            f"{pe('percent')} Комиссия покупателя: <b>{settings.get('platform_pct')}%</b>",
-            f"{pe('up')} Доход мерчанта: <b>{settings.get('seller_pct')}%</b> по статичной карте, "
-            f"ордерные реквизиты — фиксированный курс <b>{money.fmt(settings.dec('order_rate'))} ₽</b> за USDT",
-            f"{pe('clock')} На оплату сделки: <b>{settings.get('deal_minutes')} мин</b>; "
-            f"спор, если продавец молчит: через <b>{settings.get('confirm_minutes')} мин</b>",
-            f"{pe('wallet')} Пополнение: USDT в сети TON — без комиссии, xRocket — <b>{settings.get('deposit_fee')}%</b>",
-            f"{pe('up')} Вывод на кошелёк TON: <b>{settings.human('ton_withdraw_fee')}</b>, чеком xRocket: "
-            f"<b>{settings.human('withdraw_fee')}</b>",
-        ),
-        "",
-        f"Как продавать USDT, работать с картами и ордерными реквизитами — в {manual('инструкции')}."
+        "<b>Условия</b>",
+        quote(f"Курс: <b>{money.fmt(settings.dec('rate'))} ₽</b> · комиссия покупателя "
+              f"<b>{settings.get('platform_pct')}%</b>",
+              f"Мерчант: <b>{settings.get('seller_pct')}%</b> по карте · ордера по курсу "
+              f"<b>{money.fmt(settings.dec('order_rate'))} ₽</b>",
+              f"Оплата сделки: <b>{settings.get('deal_minutes')} мин</b> · спор через "
+              f"<b>{settings.get('confirm_minutes')} мин</b> без ответа продавца",
+              f"Пополнение: <b>{settings.get('deposit_fee')}%</b> · вывод чеком {settings.human('withdraw_fee')}, "
+              f"на кошелёк {settings.human('chain_withdraw_fee')} + сеть"),
+        f"{pe('info')} Как продавать и работать с ордерами — в {manual('инструкции')}."
         if settings.get("manual_url") else "",
-        (f"Проблема со сделкой или деньгами? Напишите оператору — укажите номер сделки и ваш ID: <code>{user.id}</code>."
-         if url else f"Оператор скоро будет назначен. Ваш ID: <code>{user.id}</code>."),
+        f"Проблема? Напишите оператору: номер сделки и ваш ID <code>{user.id}</code>." if url
+        else f"Ваш ID: <code>{user.id}</code>.",
     ])
     await show(bot, user, text, kb(
         btn("Написать оператору", url=url, style="primary") if url else None,

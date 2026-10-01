@@ -71,10 +71,12 @@ async def create_request(s: AsyncSession, buyer: User, amount_rub: Decimal, send
         qt = money.quote_fixed(amount_rub, rate, mr, pp)
     except ValueError:
         raise DealError("Покупки временно недоступны: некорректные настройки курса. Напишите в поддержку.")
+    qt, brate, cpct = deals.client_quote(qt, amount_rub, rate, client)
     if expect_credit is not None and qt.buyer_credit != expect_credit:
         raise DealError("Курс или комиссия изменились. Проверьте новую сумму.", "terms")
     d = Deal(buyer_id=buyer.id, seller_id=None, card_id=None, amount_rub=amount_rub, rate=rate, seller_pct=Decimal(0),
-             merchant_rate=mr, platform_pct=pp, seller_debit=qt.seller_debit, buyer_credit=qt.buyer_credit,
+             merchant_rate=mr, platform_pct=cpct if cpct is not None else pp, buyer_rate=brate,
+             seller_debit=qt.seller_debit, buyer_credit=qt.buyer_credit,
              platform_fee=qt.platform_fee,
              status="searching", is_order=True, sender_bank=(sender_bank or None) and sender_bank[:40],
              expires_at=now() + timedelta(minutes=settings.num("order_search_minutes")),

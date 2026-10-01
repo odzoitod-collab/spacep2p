@@ -41,9 +41,24 @@ def sellers(d: Deal) -> list[int]:
 
 def requote(d: Deal, amount_rub: Decimal) -> money.Quote:
     """The deal's own terms applied to another amount (a dispute settled by the amount actually received)."""
-    if d.merchant_rate is not None:
-        return money.quote_fixed(amount_rub, d.rate, d.merchant_rate, d.platform_pct)
-    return money.quote(amount_rub, d.rate, d.seller_pct, d.platform_pct)
+    debit = ((amount_rub / d.merchant_rate).quantize(money.Q, "ROUND_UP") if d.merchant_rate is not None
+             else money.seller_debit(amount_rub, d.rate, d.seller_pct))
+    return money.split(amount_rub, debit, d.buyer_rate or d.rate, d.platform_pct)
+
+
+def client_quote(qt: money.Quote, amount_rub: Decimal, rate: Decimal, client) -> tuple[money.Quote, Decimal | None,
+                                                                                       Decimal | None]:
+    """An API order: the merchant side as usual, the client priced by his own terms.
+    Returns (quote, buyer_rate or None if it equals `rate`, platform percent or None = unchanged)."""
+    if client is None:
+        return qt, None, None
+    brate, pct = settings.client_terms(client)
+    try:
+        q = money.split(amount_rub, qt.seller_debit, brate, pct)
+    except ValueError:
+        raise DealError("Условия API-клиента выгоднее условий мерчанта — площадка ушла бы в минус. "
+                        "Напишите в поддержку.", "terms_loss")
+    return q, (brate if brate != rate else None), pct
 
 
 def card_busy():
@@ -253,13 +268,14 @@ async def create(s: AsyncSession, buyer: User, card_id: int, amount_rub: Decimal
         qt = money.quote(amount_rub, rate, sp, pp)
     except ValueError:
         raise DealError("Покупки временно недоступны: некорректные настройки комиссий. Напишите в поддержку.")
+    qt, brate, cpct = client_quote(qt, amount_rub, rate, client)
     if expect_credit is not None and qt.buyer_credit != expect_credit:
         raise DealError("Курс или комиссия изменились. Проверьте новую сумму.", "terms")
     if seller.balance < qt.seller_debit:  # seller row is locked, so freeze below cannot fail
         raise DealError("У продавца недостаточно средств")
     deal = Deal(
-        buyer_id=buyer.id, seller_id=seller.id, card_id=card.id, amount_rub=amount_rub,
-        rate=rate, seller_pct=sp, platform_pct=pp, seller_debit=qt.seller_debit,
+        buyer_id=buyer.id, seller_id=seller.id, card_id=card.id, amount_rub=amount_rub, buyer_rate=brate,
+        rate=rate, seller_pct=sp, platform_pct=cpct if cpct is not None else pp, seller_debit=qt.seller_debit,
         buyer_credit=qt.buyer_credit, platform_fee=qt.platform_fee,
         expires_at=now() + timedelta(minutes=settings.num("deal_minutes")),
         api_client_id=client.id if client is not None else None, external_id=external_id,

@@ -50,7 +50,7 @@ def test_only_answers_to_bot_questions_are_deleted(go):
         amount = msg(BUYER, "50")
         await b.run(amount)
         assert amount.message.message_id in deleted(b, BUYER)  # the bot asked for the amount: tidy up
-        assert "Счёт на пополнение" in plain(b.session.last(BUYER))
+        assert "Счёт #1 · xRocket" in plain(b.session.last(BUYER))
     go(fn)
 
 
@@ -255,7 +255,7 @@ def test_withdrawals_wait_for_xrocket_funds_and_go_out_in_order(go):
         b.rocket.balances = balances
         await b.run(cb(BUYER, "w:wd"), msg(BUYER, "10"), cb(BUYER, "w:go"))
         assert (await user(BUYER)).balance == D(40) and not b.rocket.cheques  # debited, waiting — not refused
-        assert "в обработке" in plain(b.session.last(BUYER)) and "w:qc:1" in b.session.buttons(BUYER)
+        assert "в очереди" in plain(b.session.last(BUYER)) and "w:qc:1" in b.session.buttons(BUYER)
         await b.run(cb(SELLER, "w:wd"), msg(SELLER, "20"), cb(SELLER, "w:go"))
         await b.run(cb(BUYER, "w:wd"), msg(BUYER, "5"), cb(BUYER, "w:go"))
         await tasks.payout_queue(b.bot)  # still nothing on xRocket: all three wait, admins are told

@@ -34,28 +34,32 @@ def seller_debit(amount_rub: Decimal, rate: Decimal, seller_pct: Decimal) -> Dec
     return (amount_rub / rate * (1 - seller_pct / HUNDRED)).quantize(Q, ROUND_UP)
 
 
+def split(amount_rub: Decimal, debit: Decimal, rate: Decimal, platform_pct: Decimal) -> Quote:
+    """The buyer's side of a deal whose merchant gives `debit` USDT: amount / rate minus the platform's percent.
+    An API client with its own terms gets the same merchant side with his rate and percent here."""
+    if rate <= 0:
+        raise ValueError("rate must be > 0")
+    usdt = amount_rub / rate
+    credit = (usdt * (1 - platform_pct / HUNDRED)).quantize(Q, ROUND_DOWN)
+    if credit > debit:  # the platform would pay the difference out of its own pocket
+        raise ValueError("the buyer would get more than the merchant gives")
+    return Quote(usdt.quantize(Q, ROUND_DOWN), debit, credit, debit - credit)
+
+
 def quote(amount_rub: Decimal, rate: Decimal, seller_pct: Decimal, platform_pct: Decimal) -> Quote:
     """10000 RUB, rate 100, 5% / 6% -> usdt 100, seller pays 95, buyer gets 94, platform keeps 1."""
     if platform_pct < seller_pct or rate <= 0:
         # the platform would pay the difference out of its own pocket on every deal
         raise ValueError("platform_pct must be >= seller_pct and rate > 0")
-    usdt = amount_rub / rate
-    debit = seller_debit(amount_rub, rate, seller_pct)
-    credit = (usdt * (1 - platform_pct / HUNDRED)).quantize(Q, ROUND_DOWN)
-    return Quote(usdt.quantize(Q, ROUND_DOWN), debit, credit, debit - credit)
+    return split(amount_rub, seller_debit(amount_rub, rate, seller_pct), rate, platform_pct)
 
 
 def quote_fixed(amount_rub: Decimal, rate: Decimal, merchant_rate: Decimal, platform_pct: Decimal) -> Quote:
     """Order requisites: the merchant sells at a fixed rate. 10000 RUB, rate 100, merchant 104, 6% ->
     merchant gives 96.153847, buyer gets 94, platform keeps 2.153847."""
-    if rate <= 0 or merchant_rate <= 0:
+    if merchant_rate <= 0:
         raise ValueError("rates must be > 0")
-    usdt = amount_rub / rate
-    debit = (amount_rub / merchant_rate).quantize(Q, ROUND_UP)
-    credit = (usdt * (1 - platform_pct / HUNDRED)).quantize(Q, ROUND_DOWN)
-    if credit > debit:  # the platform would pay the difference out of its own pocket
-        raise ValueError("merchant_rate is above rate / (1 - platform_pct)")
-    return Quote(usdt.quantize(Q, ROUND_DOWN), debit, credit, debit - credit)
+    return split(amount_rub, (amount_rub / merchant_rate).quantize(Q, ROUND_UP), rate, platform_pct)
 
 
 def max_rub_fixed(balance: Decimal, merchant_rate: Decimal) -> Decimal:

@@ -15,7 +15,7 @@ def test_numbers_add_up_and_stats_message_is_edited(go, monkeypatch):
         await b.run(cb(BUYER, f"dl:rc:{d.id}"), msg(BUYER, document=PDF), cb(SELLER, f"dl:ok2:{d.id}"))
         async with models.Session() as s:
             sn = await finance.snapshot(s)
-        assert sn.xrocket == D(1000) and sn.wallet_kind == "none"
+        assert sn.xrocket == D(1000)
         assert (sn.users_available, sn.users_frozen) == (D(105) + D(94), D(0))  # seller 105, buyer 94
         assert sn.profit["all"] == D(1) and sn.profit["24h"] == D(1)  # 95 − 94 stays with the platform
         assert sn.liabilities == D(199) and sn.free == D(801)
@@ -23,7 +23,7 @@ def test_numbers_add_up_and_stats_message_is_edited(go, monkeypatch):
 
         await b.run(cb(ADMIN, "a"), cb(ADMIN, "afin"))
         text = plain(b.session.last(ADMIN))
-        assert "Можно забрать: 801 USDT" in text and "всего +1 USDT" in text and "xRocket (из него платятся выводы): 1 000" in text
+        assert "Можно забрать: 801 USDT" in text and "всего +1 USDT" in text and "отсюда выводы: 1 000" in text
 
         forum = -100555
         monkeypatch.setattr(config, "log_chat_id", forum)

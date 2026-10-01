@@ -59,13 +59,18 @@ def pe(name: str) -> str:
     return fb if config.emoji_mode == "plain" else ""
 
 
+class WideButton(InlineKeyboardButton):
+    """Always takes the whole row: a toggle keeps its place whatever its current label."""
+
+
 def btn(text: str, cb: str | None = None, icon: str | None = None, url: str | None = None,
-        style: str | None = None, copy: str | None = None, inline: str | None = None) -> InlineKeyboardButton:
+        style: str | None = None, copy: str | None = None, inline: str | None = None,
+        wide: bool = False) -> InlineKeyboardButton:
     """style: 'success' | 'danger' | 'primary' (Bot API 9.4). copy: text copied to the clipboard on tap.
-    inline: opens inline search in this chat with the query prefilled (e.g. "сделки ")."""
+    inline: opens inline search in this chat with the query prefilled (e.g. "сделки "). wide: a full row."""
     if len(text) > 64:  # Telegram shows long buttons cut anyway; keep the start readable
         text = text[:63] + "…"
-    return InlineKeyboardButton(
+    return (WideButton if wide else InlineKeyboardButton)(
         text=text, callback_data=cb if url is None and copy is None and inline is None else None, url=url,
         copy_text=CopyTextButton(text=copy) if copy else None, switch_inline_query_current_chat=inline,
         # icons only on the highlighted (coloured) buttons: the main action of a screen stands out, the rest is text
@@ -81,7 +86,7 @@ SMALL = 20  # a label up to this length fits half the width; longer ones keep th
 
 
 def _small(b: InlineKeyboardButton) -> bool:
-    return b.style is None and len(b.text) <= SMALL
+    return b.style is None and len(b.text) <= SMALL and not isinstance(b, WideButton)
 
 
 def kb(*rows: list[InlineKeyboardButton] | InlineKeyboardButton | None) -> InlineKeyboardMarkup:
