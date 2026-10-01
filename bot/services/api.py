@@ -29,7 +29,8 @@ TOKEN_PREFIX = "sp_live_"
 # deal status -> API status (the vocabulary clients see; docs/API.md describes every one)
 STATUS = {
     "searching": "searching_requisites",  # no static card fits: order merchants are asked for requisites
-    "assigned": "searching_requisites",  # a merchant took the request and is entering requisites
+    "assigned": "merchant_assigned",  # a merchant took the request and prepares requisites (or a Bybit order)
+    "checking": "requisites_check",  # Strait Pay checks the merchant's Bybit order before giving its requisites
     "waiting_payment": "awaiting_payment",  # show the requisites to the payer, wait for the receipt
     "paid": "verifying",  # receipt uploaded, the merchant checks the bank
     "dispute": "dispute",  # Strait Pay support decides
@@ -39,6 +40,11 @@ STATUS = {
     "expired": "expired",  # not paid in time; a late receipt may still be accepted
 }
 FINAL = {"success", "cancelled"}
+# API status -> (step, title): a progress bar for the client's UI; finals have no step
+STAGE = {"searching_requisites": (1, "Подбор реквизитов"), "merchant_assigned": (1, "Подбор реквизитов"),
+         "requisites_check": (1, "Проверка реквизитов"), "awaiting_payment": (2, "Оплата"),
+         "verifying": (3, "Проверка платежа"), "dispute": (3, "Спор")}
+STAGES = 4
 MAX_ATTEMPTS = 20  # ~1 day with the backoff below
 TIMEOUT = 10
 
@@ -67,8 +73,22 @@ def iso(dt: datetime | None) -> str | None:
     return deals.aware(dt).astimezone(timezone.utc).isoformat().replace("+00:00", "Z") if dt else None
 
 
+def next_action(d: Deal, status: str) -> str | None:
+    """What the client should do now (docs/API.md §4)."""
+    if status == "awaiting_payment":
+        return "pay_and_upload_receipt"
+    if status == "verifying":
+        at = deals.buyer_dispute_at(d)
+        return "dispute_available" if at and now() >= at else "wait"
+    if status == "expired":
+        until = deals.late_deadline(d)
+        return "upload_late_receipt" if until and now() < until else None
+    return None if status in FINAL else "wait"
+
+
 def order_json(d: Deal, card: Card | None) -> dict:
     status = STATUS[d.status]
+    step = STAGE.get(status)
     out = {
         "id": d.id,
         "external_id": d.external_id,
@@ -84,8 +104,13 @@ def order_json(d: Deal, card: Card | None) -> dict:
         "close_reason": d.close_reason,
         "requisites": None,
         "order_requisites": d.is_order,
+        "next_action": next_action(d, status),
+        "stage": {"step": step[0] if step else STAGES, "of": STAGES, "title": step[1] if step else
+                  {"success": "Готово", "cancelled": "Отменён", "expired": "Время вышло"}[status]},
+        "stage_deadline": iso(d.expires_at) if status in ("searching_requisites", "merchant_assigned",
+                                                          "requisites_check", "awaiting_payment") else None,
     }
-    if status == "searching_requisites":
+    if d.status in ("searching", "assigned", "checking"):
         out["search_expires_at"] = iso(d.expires_at)
     if card is not None and status in ("awaiting_payment", "verifying", "dispute"):
         out["requisites"] = {"bank": card.bank, "type": card.kind, "number": card.requisites, "holder": card.holder}
@@ -93,6 +118,17 @@ def order_json(d: Deal, card: Card | None) -> dict:
         out["dispute_available_at"] = iso(at)
     if status == "expired" and (until := deals.late_deadline(d)) and now() < until:
         out["late_receipt_until"] = iso(until)
+    return out
+
+
+async def history(s: AsyncSession, d: Deal) -> list[dict]:
+    """Status changes of an API order, oldest first: the status it was created in, then every webhook queued."""
+    rows = (await s.execute(select(ApiEvent.status, ApiEvent.created_at).where(ApiEvent.deal_id == d.id)
+                            .order_by(ApiEvent.id))).all()
+    out = [{"status": "searching_requisites" if d.is_order else "awaiting_payment", "at": iso(d.created_at)}]
+    for st, at in rows:
+        if STATUS[st] != out[-1]["status"]:  # assigned -> checking etc. may map to the same public status
+            out.append({"status": STATUS[st], "at": iso(at)})
     return out
 
 

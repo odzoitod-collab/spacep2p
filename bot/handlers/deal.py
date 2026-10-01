@@ -14,7 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from bot.emoji import back, btn, kb, pe
 from bot.models import Card, Deal, User, now
 from bot.handlers.seller import mask, parse_rub
-from bot.services import deals, events, money, settings
+from bot.services import audit, deals, events, money, settings
 from bot.ui import at, clean, esc, notify, ok, quote, show, title, warn
 
 router = Router()
@@ -23,6 +23,7 @@ router = Router()
 STATUS = {
     "searching": ("search", "Ищем реквизиты"),
     "assigned": ("clock", "Мерчант выдаёт реквизиты"),
+    "checking": ("search", "Проверка ордера"),
     "waiting_payment": ("clock", "Ждём перевод"),
     "paid": ("doc", "Чек у продавца"),
     "dispute": ("flag", "Спор"),
@@ -49,6 +50,7 @@ REASONS = {
     "buyer_no_confirm": "покупатель: продавец не подтверждает",
     "seller_banned": "продавец заблокирован",
 }
+OPERATOR_REASONS = {"not_received": "оплата не поступила", "wrong_amount": "пришла другая сумма"}
 HOW_PDF = ("В приложении банка откройте этот перевод → «Чек» или «Поделиться» → «PDF» "
            "и отправьте файл сюда.")
 MAX_FILE = 20 * 1024 * 1024
@@ -63,6 +65,7 @@ class Dispute(StatesGroup):
     amount = State()
     video = State()
     statement = State()
+    proof = State()  # operator of a Bybit order: one proof settles the dispute
 
 
 class Evidence(StatesGroup):
@@ -95,22 +98,40 @@ def _money_block(d: Deal, buyer: bool) -> str:
             "" if back_ else f"{pe('dollar')} {'Получено' if done else 'Вы получите'}: "
                              f"<b>{money.usdt(d.buyer_credit)} USDT</b>",
         )
+    if d.via_bybit:  # nothing is frozen: the USDT go through the Bybit order
+        return quote(
+            f"{pe('ruble')} Сумма перевода: <b>{money.fmt(d.amount_rub)} ₽</b>",
+            f"{pe('shop')} Bybit-ордер: <b>{money.usdt(d.seller_debit)} USDT</b> по {money.fmt(d.merchant_rate)} ₽"
+            + (f" · {_link(d)}" if d.bybit_url else ""),
+        )
+    frozen = (f"{pe('lock')} {'Списано с вас' if done else 'Возвращено из заморозки' if back_ else 'Удерживается' if d.funds_held else 'Заморожено у вас'}: "
+              f"<b>{money.usdt(d.seller_debit)} USDT</b>")
+    if d.merchant_rate is not None:  # order requisites: a fixed rate, no percent
+        return quote(f"{pe('ruble')} Сумма перевода: <b>{money.fmt(d.amount_rub)} ₽</b>", frozen,
+                     f"{pe('swap')} Ваш курс: <b>{money.fmt(d.merchant_rate)} ₽</b> за USDT")
     return quote(
         f"{pe('ruble')} Сумма перевода: <b>{money.fmt(d.amount_rub)} ₽</b>",
-        f"{pe('lock')} {'Списано с вас' if done else 'Возвращено из заморозки' if back_ else 'Удерживается' if d.funds_held else 'Заморожено у вас'}: "
-        f"<b>{money.usdt(d.seller_debit)} USDT</b>",
+        frozen,
         f"{pe('up')} Ваш доход: <b>+{money.usdt(d.amount_rub / d.rate - d.seller_debit)} USDT</b>" if not back_ else "",
     )
 
 
+def _link(d: Deal) -> str:
+    return f'<a href="{esc(d.bybit_url)}">ордер</a>'
+
+
 STAGES = {"searching": (1, "подбор реквизитов"), "assigned": (1, "подбор реквизитов"),
-          "waiting_payment": (1, "перевод и чек"), "paid": (2, "проверка поступления")}
+          "checking": (1, "проверка реквизитов"), "waiting_payment": (1, "перевод и чек"),
+          "paid": (2, "проверка поступления")}
 
 
 def deal_text(d: Deal, card: Card, viewer_id: int, note: str = "") -> str:
     icon, label = STATUS[d.status]
     buyer = viewer_id == d.buyer_id
-    if d.status == "paid" and not buyer:
+    operator = not buyer and d.via_bybit and viewer_id == d.operator_id
+    merchant = not buyer and not operator  # the seller; in a Bybit order he only watches after giving the link
+    checks = not buyer and viewer_id == deals.checker(d)
+    if d.status == "paid" and checks:
         label = "Ждёт вашей проверки"
     stage = STAGES.get(d.status)
     lines = [
@@ -129,6 +150,20 @@ def deal_text(d: Deal, card: Card, viewer_id: int, note: str = "") -> str:
     elif st == "assigned" and buyer:
         lines += [f"{pe('clock')} Мерчант взял заявку и выдаёт реквизиты (до {at(d.expires_at)}). Ничего не "
                   "переводите, пока реквизиты не появятся здесь."]
+    elif st == "assigned" and d.via_bybit:
+        lines += [f"{pe('fire')} <b>Вы взяли заявку.</b> Пришлите ссылку на ордер Bybit P2P до <b>{at(d.expires_at)}</b>"
+                  " — иначе заявка уйдёт другим мерчантам.",
+                  f"{pe('dollar')} Ордер: <b>{money.fmt(d.amount_rub)} ₽</b> = <b>{money.usdt(d.seller_debit)} USDT</b> "
+                  f"по {money.fmt(d.merchant_rate)} ₽. Баланс в боте не нужен."]
+    elif st == "checking" and buyer:
+        lines += [f"{pe('search')} Ордер под вашу сумму найден — оператор проверяет его и выдаст реквизиты "
+                  f"(до {at(d.expires_at)}). Ничего не переводите, пока реквизиты не появятся здесь."]
+    elif st == "checking" and operator:
+        lines += [f"{pe('shop')} Ордер {_link(d)}: зайдите на <b>{money.usdt(d.seller_debit)} USDT</b> и выдайте "
+                  f"покупателю реквизиты до <b>{at(d.expires_at)}</b>."]
+    elif st == "checking":
+        lines += [f"{pe('clock')} Ссылка на ордер у оператора: он проверит ордер и выдаст покупателю реквизиты "
+                  f"до {at(d.expires_at)}. От вас пока ничего не нужно."]
     elif st == "assigned":
         lines += [f"{pe('fire')} <b>Вы взяли заявку.</b> Выдайте реквизиты до <b>{at(d.expires_at)}</b> — иначе "
                   "заявка уйдёт другим мерчантам, а заморозка снимется.",
@@ -152,8 +187,11 @@ def deal_text(d: Deal, card: Card, viewer_id: int, note: str = "") -> str:
         ]
     elif st == "waiting_payment":
         lines += [f"{pe('clock')} Покупатель переводит на {esc(card.bank)} {mask(card)} до <b>{at(d.expires_at)}</b>.",
+                  ("Чек получит оператор и проверит оплату в ордере — от вас ничего не нужно." if merchant
+                   else "Пока ничего делать не нужно: когда покупатель пришлёт чек, придёт уведомление с кнопками.")
+                  if d.via_bybit else
                   "Пока ничего делать не нужно: когда покупатель пришлёт чек, придёт уведомление с кнопками.",
-                  f"{pe('lock')} {money.usdt(d.seller_debit)} USDT заморожены под эту сделку."]
+                  "" if d.via_bybit else f"{pe('lock')} {money.usdt(d.seller_debit)} USDT заморожены под эту сделку."]
     elif st == "paid" and buyer:
         lines.append(f"{pe('doc')} Чек отправлен продавцу {at(d.paid_at)}. Он проверяет поступление в банке — "
                      "после подтверждения USDT сразу придут на баланс, мы сообщим.")
@@ -162,6 +200,18 @@ def deal_text(d: Deal, card: Card, viewer_id: int, note: str = "") -> str:
             lines.append(f"Если продавец не ответит до <b>{at(open_at)}</b>, вы сможете открыть спор.")
         else:
             lines.append("Продавец долго не отвечает — можно открыть спор, решит администрация.")
+    elif st == "paid" and not checks:
+        lines.append(f"{pe('doc')} Чек у оператора {at(d.paid_at)}: он проверяет оплату в ордере Bybit и подтвердит "
+                     "сделку. От вас ничего не нужно.")
+    elif st == "paid" and operator:
+        lines += [
+            f"{pe('warn')} <b>Проверьте оплату в ордере Bybit</b> {_link(d)} — не по чеку:",
+            f"1. Покупатель перевёл <b>{money.fmt(d.amount_rub)} ₽</b> на {esc(card.bank)} {mask(card)} после "
+            f"{at(d.created_at)}. Отметьте оплату в ордере и дождитесь, пока продавец отпустит "
+            f"<b>{money.usdt(d.seller_debit)} USDT</b>.",
+            f"2. USDT пришли — «Подтвердить», покупатель получит {money.usdt(d.buyer_credit)} USDT.",
+            "3. Оплаты нет или сумма другая — «Спор»: пришлите видео из ЛК или выписку, спор решится сразу.",
+        ]
     elif st == "paid":
         lines += [
             f"{pe('warn')} <b>Проверьте поступление в приложении банка</b> — не по чеку, а по истории операций:",
@@ -181,6 +231,7 @@ def deal_text(d: Deal, card: Card, viewer_id: int, note: str = "") -> str:
         lines += [
             f"{pe('flag')} Причина: {REASONS.get(d.dispute_reason, '—')}"
             + (f", пришло {money.fmt(d.dispute_amount_rub)} ₽" if d.dispute_amount_rub else ""),
+            "" if d.via_bybit else
             f"{pe('lock')} {money.usdt(d.seller_debit)} USDT продавца заморожены до решения администрации.",
             f"Материалов в споре: <b>{n}</b>. "
             + ("Помогут видео из банка со списанием и выписка." if buyer
@@ -191,6 +242,7 @@ def deal_text(d: Deal, card: Card, viewer_id: int, note: str = "") -> str:
         ]
     elif st == "completed":
         lines.append(f"{pe('ok')} {money.usdt(d.buyer_credit)} USDT зачислены на ваш баланс." if buyer else
+                     f"{pe('ok')} Сделка проведена: {money.usdt(d.seller_debit)} USDT по Bybit-ордеру." if d.via_bybit else
                      f"{pe('ok')} {money.usdt(d.seller_debit)} USDT списаны из заморозки, доход начислен.")
     elif st == "cancelled":
         lines.append("С вас ничего не списано." if buyer else "Сделка отменена, средства снова доступны.")
@@ -227,12 +279,17 @@ def deal_brief(d: Deal, card: Card, viewer_id: int, head: str) -> str:
 def deal_kb(d: Deal, viewer_id: int, card: Card | None = None):
     rows = []
     buyer = viewer_id == d.buyer_id
-    if d.status in ("searching", "assigned") and buyer:
+    checks = not buyer and viewer_id == deals.checker(d)
+    if d.status in ("searching", "assigned", "checking") and buyer:
         rows += [[btn("Обновить", f"dl:{d.id}", "refresh"), btn("Отменить заявку", f"orb:cn:{d.id}", "cross",
                                                                    style="danger")]]
     elif d.status == "assigned":
-        rows += [btn("Выдать реквизиты", f"orq:give:{d.id}", "key", style="success"),
+        rows += [btn("Прислать ссылку на ордер" if d.via_bybit else "Выдать реквизиты", f"orq:give:{d.id}",
+                     "shop" if d.via_bybit else "key", style="success"),
                  btn("Отказаться", f"orq:drop:{d.id}", "cross")]
+    elif d.status == "checking":
+        rows.append(btn("Выдать реквизиты", f"orq:give:{d.id}", "key", style="success") if checks
+                    else btn("Обновить", f"dl:{d.id}", "refresh"))
     elif buyer and d.status == "waiting_payment":
         rows += [[btn("Скопировать " + ("телефон" if card.kind == "sbp" else "номер"), icon="key",
                       copy=card.requisites) if card else None,
@@ -246,10 +303,12 @@ def deal_kb(d: Deal, viewer_id: int, card: Card | None = None):
             rows.append(btn("Открыть спор", f"dl:bd:{d.id}", "flag", style="danger"))
     elif buyer and d.status == "expired" and (until := deals.late_deadline(d)) and now() < until:
         rows.append(btn("Я перевёл — чек", f"dl:late:{d.id}", "clip", style="primary"))
-    elif not buyer and d.status == "paid":
+    elif checks and d.status == "paid":
         rows += [btn("Показать чек", f"dl:pdf:{d.id}", "doc"),
-                 btn("Деньги пришли", f"dl:ok:{d.id}", "ok", style="success"),
-                 btn("Не пришли", f"dl:ds:{d.id}", "flag", style="danger")]
+                 btn("Подтвердить" if d.via_bybit else "Деньги пришли", f"dl:ok:{d.id}", "ok", style="success"),
+                 btn("Спор" if d.via_bybit else "Не пришли", f"dl:ds:{d.id}", "flag", style="danger")]
+    elif d.status == "paid":
+        rows += [btn("Показать чек", f"dl:pdf:{d.id}", "doc"), btn("Обновить", f"dl:{d.id}", "refresh")]
     elif d.status == "dispute":
         rows.append(btn("Добавить файл", f"dl:ev:{d.id}", "clip", style="primary"))
         if d.receipt_file_id:
@@ -293,7 +352,7 @@ async def on_deal_created(bot: Bot, s: AsyncSession, d: Deal):
 
 async def _deal(s: AsyncSession, user: User, deal_id: str | int) -> Deal | None:
     d = await s.get(Deal, int(deal_id), populate_existing=True)
-    return d if d and user.id in (d.buyer_id, d.seller_id) else None
+    return d if d and user.id in (d.buyer_id, d.seller_id, d.operator_id) else None
 
 
 @router.callback_query(F.data.regexp(r"^deals(?::(\d+))?$"))
@@ -482,16 +541,24 @@ async def accept_receipt(s: AsyncSession, d: Deal, buyer: User, fid: str, unique
 
 
 async def send_to_seller(bot: Bot, s: AsyncSession, paid: Deal, late: bool, reused: int | None) -> None:
+    """The receipt goes to whoever checks the payment, with the buttons. In a Bybit order that is the operator;
+    the merchant gets a plain copy without buttons."""
     card = await card_of(s, paid)
     head = ("Покупатель прислал чек" + (" после окончания срока" if late else "") + " — проверьте поступление"
             + (f". ВНИМАНИЕ: этот файл уже присылали по сделке #{reused}, сверяйте только выписку банка" if reused else ""))
-    seller = await s.get(User, paid.seller_id)
-    try:
-        await send_receipt(bot, paid.seller_id, paid.receipt_file_id, clean(deal_brief(paid, card, paid.seller_id, head)),
-                           deal_kb(paid, paid.seller_id), silent=bool(seller and seller.quiet))
-    except TelegramAPIError:
-        log(s, paid, "notify_failed", f"Продавец {paid.seller_id} не получил чек (бот заблокирован или ошибка Telegram)",
-            alert=True)
+    for uid in deals.sellers(paid):
+        checks = uid == deals.checker(paid)
+        who = await s.get(User, uid)
+        try:
+            await send_receipt(bot, uid, paid.receipt_file_id,
+                               clean(deal_brief(paid, card, uid, head if checks else
+                                                "Покупатель прислал чек — оплату проверяет оператор")),
+                               deal_kb(paid, uid) if checks else kb(back("x", "Скрыть", "cross")),
+                               silent=bool(who and who.quiet))
+        except TelegramAPIError:
+            if checks:
+                log(s, paid, "notify_failed", f"{'Оператор' if paid.via_bybit else 'Продавец'} {uid} не получил чек "
+                    "(бот заблокирован или ошибка Telegram)", alert=True)
 
 
 # ---------- buyer: cancel / dispute ----------
@@ -523,7 +590,8 @@ async def cb_cancel2(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User):
     log(s, d, "cancelled", f"Покупатель отменил сделку на {money.fmt(d.amount_rub)} ₽", notice=True)
     await s.commit()
     await deal_screen(bot, s, user, d, c, note=ok("Сделка отменена"))
-    await push(bot, s, d.seller_id, d, f"Покупатель отменил сделку #{d.id}")
+    for uid in deals.sellers(d):
+        await push(bot, s, uid, d, f"Покупатель отменил сделку #{d.id}")
 
 
 @router.callback_query(F.data.regexp(r"^dl:bd:(\d+)$"))
@@ -554,7 +622,8 @@ async def cb_buyer_dispute2(c: CallbackQuery, bot: Bot, s: AsyncSession, user: U
     await show(bot, user, _evidence_text(d, ok("Спор открыт. Пришлите видео или выписку из банка о списании "
                                                "и коротко опишите, когда и откуда переводили.")),
                kb(back(f"dl:{d.id}", "Готово")), c)
-    await push(bot, s, d.seller_id, d, f"Покупатель открыл спор по сделке #{d.id}")
+    for uid in deals.sellers(d):
+        await push(bot, s, uid, d, f"Покупатель открыл спор по сделке #{d.id}")
 
 
 # ---------- seller ----------
@@ -572,18 +641,22 @@ async def cb_pdf(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User):
 @router.callback_query(F.data.regexp(r"^dl:ok:(\d+)$"))
 async def cb_confirm(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User):
     d = await _deal(s, user, c.data.split(":")[2])
-    if not d or d.seller_id != user.id or d.status != "paid":
+    if not d or deals.checker(d) != user.id or d.status != "paid":
         return await c.answer("Действие недоступно: статус сделки изменился", show_alert=True)
     card = await s.get(Card, d.card_id)
     await show(bot, user, "\n".join([
         f"{pe('warn')} <b>Подтвердить сделку #{d.id}?</b>",
         "",
+        quote(f"{pe('ruble')} Покупатель оплатил ордер <b>{money.fmt(d.amount_rub)} ₽</b>, продавец на Bybit отпустил "
+              f"вам <b>{money.usdt(d.seller_debit)} USDT</b>.",
+              f"{pe('dollar')} Покупателю уйдёт <b>{money.usdt(d.buyer_credit)} USDT</b> с баланса площадки.")
+        if d.via_bybit else
         quote(f"{pe('ruble')} На {esc(card.bank)} {mask(card)} поступило <b>{money.fmt(d.amount_rub)} ₽</b> — "
               "вы видите это в истории операций банка.",
               f"{pe('dollar')} Покупателю уйдёт <b>{money.usdt(d.buyer_credit)} USDT</b>, с вас — "
               f"{money.usdt(d.seller_debit)} USDT из заморозки."),
         f"{pe('lock')} <b>Отменить подтверждение будет нельзя.</b> Если денег нет или сумма другая — "
-        "вернитесь и нажмите «Не пришли».",
+        f"вернитесь и нажмите «{'Спор' if d.via_bybit else 'Не пришли'}».",
     ]), kb(btn("Показать чек", f"dl:pdf:{d.id}", "doc"),
            [btn("Да, деньги пришли", f"dl:ok2:{d.id}", "ok", style="success"), back(f"dl:{d.id}", "Назад", "back")]), c)
 
@@ -591,29 +664,34 @@ async def cb_confirm(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User):
 @router.callback_query(F.data.regexp(r"^dl:ok2:(\d+)$"))
 async def cb_confirm2(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User):
     d = await _deal(s, user, c.data.split(":")[2])
-    if not d or d.seller_id != user.id:
+    if not d or deals.checker(d) != user.id:
         return await c.answer("Действие недоступно", show_alert=True)
     d = await deals.complete(s, d.id, frm=("paid",))
     if not d:
         return await c.answer("Сделка уже изменена", show_alert=True)
-    log(s, d, "completed", f"Завершена: {money.fmt(d.amount_rub)} ₽, покупателю {money.usdt(d.buyer_credit)} USDT, "
-                           f"площадке {money.usdt(d.platform_fee)} USDT", notice=True)
+    log(s, d, "completed", f"Завершена{f' оператором {user.id}' if d.via_bybit else ''}: {money.fmt(d.amount_rub)} ₽, "
+                           f"покупателю {money.usdt(d.buyer_credit)} USDT, площадке {money.usdt(d.platform_fee)} USDT",
+        notice=True)
     await s.commit()
     await deal_screen(bot, s, user, d, c, note=ok("Сделка завершена"))
     await push(bot, s, d.buyer_id, d, f"Сделка #{d.id} завершена — {money.usdt(d.buyer_credit)} USDT на балансе")
+    if d.via_bybit:
+        await push(bot, s, d.seller_id, d, f"Оператор подтвердил оплату по вашему ордеру, сделка #{d.id} завершена")
 
 
 @router.callback_query(F.data.regexp(r"^dl:ds:(\d+)$"))
 async def cb_dispute(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User):
     d = await _deal(s, user, c.data.split(":")[2])
-    if not d or d.seller_id != user.id or d.status != "paid":
+    if not d or deals.checker(d) != user.id or d.status != "paid":
         return await c.answer("Действие недоступно: статус сделки изменился", show_alert=True)
     await show(bot, user, "\n".join([
         title(pe("flag"), f"Спор по сделке #{d.id}"),
         "",
+        "Что случилось? Дальше пришлите доказательство: видео из личного кабинета банка или Bybit, или выписку. "
+        "Вы оператор этой сделки — спор решится сразу в вашу пользу." if d.via_bybit else
         "Что случилось? Дальше попросим доказательства из банка: видео из приложения "
         "и (если деньги не пришли) выписку.",
-        f"До решения администрации {money.usdt(d.seller_debit)} USDT останутся заморожены.",
+        "" if d.via_bybit else f"До решения администрации {money.usdt(d.seller_debit)} USDT останутся заморожены.",
     ]), kb(
         btn("Деньги не пришли", f"dl:dr:{d.id}:not_received", "cross"),
         btn("Другая сумма", f"dl:dr:{d.id}:wrong_amount", "ruble"),
@@ -625,12 +703,17 @@ async def cb_dispute(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User):
 async def cb_dispute_reason(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User, state: FSMContext):
     _, _, deal_id, reason = c.data.split(":")
     d = await _deal(s, user, deal_id)
-    if not d or d.seller_id != user.id or d.status != "paid":
+    if not d or deals.checker(d) != user.id or d.status != "paid":
         return await c.answer("Действие недоступно", show_alert=True)
-    await state.update_data(deal_id=d.id, reason=reason, files=[], amount=None)
+    op = d.via_bybit
+    await state.update_data(deal_id=d.id, reason=reason, files=[], amount=None, op=op)
     if reason == "wrong_amount":
         await state.set_state(Dispute.amount)
         ask = "Шаг 1/2. Отправьте сумму в ₽, которая <b>фактически</b> пришла:"
+    elif op:
+        await state.set_state(Dispute.proof)
+        ask = (f"{pe('video')} Отправьте доказательство, что оплаты нет: <b>видео из личного кабинета</b> банка или "
+               "Bybit либо <b>выписку</b> (PDF или фото). Спор решится сразу.")
     else:
         await state.set_state(Dispute.video)
         ask = f"Шаг 1/2. {pe('video')} Отправьте <b>видео из приложения банка</b> — запись экрана с историей операций за время сделки."
@@ -645,9 +728,10 @@ async def msg_dispute_amount(m: Message, bot: Bot, user: User, state: FSMContext
         return await show(bot, user, f"{title(pe('flag'), 'Спор')}\n\nОтправьте фактически полученную сумму в ₽."
                           + warn("Нужно число, например 4500"), kb(back(f"dl:{data['deal_id']}", "Отмена")))
     await state.update_data(amount=str(v))
-    await state.set_state(Dispute.video)
+    await state.set_state(Dispute.proof if data.get("op") else Dispute.video)
     await show(bot, user, f"{title(pe('flag'), 'Спор')}\n\nПолучено: <b>{money.fmt(v)} ₽</b>\n\n"
-                          f"Шаг 2/2. {pe('video')} Отправьте <b>видео из банка</b>, где видно это поступление:",
+                          f"Шаг 2/2. {pe('video')} Отправьте <b>видео из банка</b>"
+                          + (" или выписку" if data.get("op") else "") + ", где видно это поступление:",
                kb(back(f"dl:{data['deal_id']}", "Отмена")))
 
 
@@ -690,6 +774,22 @@ async def msg_dispute_statement(m: Message, bot: Bot, s: AsyncSession, user: Use
     await submit_dispute(bot, s, user, state)
 
 
+@router.message(Dispute.proof)
+async def msg_dispute_proof(m: Message, bot: Bot, s: AsyncSession, user: User, state: FSMContext):
+    data = await state.get_data()
+    if fid := _video_id(m):
+        item = ["video", fid, "seller"]
+    elif m.document:
+        item = ["document", m.document.file_id, "seller"]
+    elif m.photo:
+        item = ["photo", m.photo[-1].file_id, "seller"]
+    else:
+        return await show(bot, user, f"{title(pe('flag'), 'Спор')}\n\nОтправьте видео из личного кабинета или выписку."
+                          + warn("Нужен видеофайл, PDF или фото"), kb(back(f"dl:{data['deal_id']}", "Отмена")))
+    await state.update_data(files=data["files"] + [item])
+    await submit_dispute(bot, s, user, state)
+
+
 async def submit_dispute(bot: Bot, s: AsyncSession, user: User, state: FSMContext):
     data = await state.get_data()
     await state.set_state(None)
@@ -698,11 +798,41 @@ async def submit_dispute(bot: Bot, s: AsyncSession, user: User, state: FSMContex
     if not d:
         d = await _deal(s, user, data["deal_id"])
         return await deal_screen(bot, s, user, d, note=warn("Статус сделки уже изменился, спор не открыт."))
-    log(s, d, "dispute", f"Спор: {REASONS[d.dispute_reason]}"
+    log(s, d, "dispute", f"Спор{' оператора' if d.via_bybit else ''}: {REASONS[d.dispute_reason]}"
         + (f", пришло {money.fmt(d.dispute_amount_rub)} ₽" if d.dispute_amount_rub else ""), alert=True)
     await s.commit()
+    if d.via_bybit:
+        return await operator_verdict(bot, s, user, d)
     await deal_screen(bot, s, user, d, note=ok("Спор открыт. Администрация рассмотрит его."))
     await push(bot, s, d.buyer_id, d, f"Продавец открыл спор по сделке #{d.id}. Добавьте доказательства оплаты")
+
+
+async def operator_verdict(bot: Bot, s: AsyncSession, user: User, d: Deal):
+    """The operator of a Bybit order acts as an admin: his proof from the bank settles the dispute at once —
+    no payment: cancelled; another amount: completed by the amount actually received."""
+    what = OPERATOR_REASONS[d.dispute_reason]
+    try:
+        if d.dispute_reason == "wrong_amount":
+            res = await deals.complete(s, d.id, frm=("dispute",), actual_rub=d.dispute_amount_rub,
+                                       reason="dispute_actual")
+            what += f": проведено по {money.fmt(d.dispute_amount_rub)} ₽"
+        else:
+            res = await deals.cancel(s, d.id, ("dispute",), "cancelled", "dispute_seller")
+    except deals.DealError as e:
+        await s.rollback()
+        await s.refresh(user)
+        res, what = None, str(e)
+    if res is None:
+        d = await s.get(Deal, d.id, populate_existing=True)
+        return await deal_screen(bot, s, user, d, note=warn(f"Спор передан администрации: {what}"))
+    res.resolution = f"Оператор подтвердил доказательствами из банка: {what}."
+    audit.log(s, user.id, "resolve", f"deal:{res.id}", f"оператор: {what}")
+    log(s, res, "resolved", f"Спор решён оператором {user.id} автоматически: {what}", alert=True)
+    await s.commit()
+    await deal_screen(bot, s, user, res, note=ok(f"Спор решён в вашу пользу: {what}."))
+    head = f"Спор по сделке #{res.id} решён: {what}"
+    await push(bot, s, res.buyer_id, res, head)
+    await push(bot, s, res.seller_id, res, head)
 
 
 # ---------- evidence (both sides, while in dispute) ----------
@@ -747,7 +877,7 @@ async def msg_evidence(m: Message, bot: Bot, s: AsyncSession, user: User, state:
         await state.set_state(None)
         d = await _deal(s, user, did)
         return await deal_screen(bot, s, user, d, note=warn(str(e)))
-    role = "покупатель" if user.id == d.buyer_id else "продавец"
+    role = "покупатель" if user.id == d.buyer_id else "оператор" if user.id == d.operator_id else "продавец"
     log(s, d, "evidence", f"Новое доказательство ({role}): {item[0]}", notice=True)
     await s.commit()
     await show(bot, user, _evidence_text(d, ok("Добавлено. Можно отправить ещё")), kb(back(f"dl:{did}", "Готово")))
@@ -784,13 +914,19 @@ async def send_files(bot: Bot, chat: int, d: Deal):
 
 def verdict_effects(d: Deal, verdict: str) -> list[str]:
     """What each admin decision does with money, in plain words."""
-    if verdict == "c" and d.status == "searching":
-        return ["Заявка на реквизиты закрывается. Мерчант ещё не назначен, заморозки нет."]
+    if verdict == "c" and (d.status == "searching" or (d.via_bybit and d.status != "waiting_payment")):
+        return ["Заявка на реквизиты закрывается. Заморозки нет."]
     if verdict in ("s", "c"):
-        return [f"Сделка отменяется, продавцу возвращаются {money.usdt(d.seller_debit)} USDT из заморозки.",
+        return ["Сделка отменяется, заморозки нет (Bybit-ордер)." if d.via_bybit else
+                f"Сделка отменяется, продавцу возвращаются {money.usdt(d.seller_debit)} USDT из заморозки.",
                 "Покупатель USDT не получает."]
     amount = d.dispute_amount_rub if verdict == "a" else d.amount_rub
-    q = money.quote(amount, d.rate, d.seller_pct, d.platform_pct)
+    q = deals.requote(d, amount)
+    if d.via_bybit:
+        return [f"Сделка проводится на <b>{money.fmt(amount)} ₽</b>.",
+                f"Покупателю +{money.usdt(q.buyer_credit)} USDT с баланса площадки: {money.usdt(q.seller_debit)} USDT "
+                "по ордеру получены оператором на Bybit.",
+                f"Площадке +{money.usdt(q.platform_fee)} USDT."]
     return [f"Сделка проводится на <b>{money.fmt(amount)} ₽</b>.",
             f"Покупателю +{money.usdt(q.buyer_credit)} USDT, у продавца списывается {money.usdt(q.seller_debit)} USDT"
             + (f" (заморожено {money.usdt(d.seller_debit)})" if q.seller_debit != d.seller_debit else " из заморозки") + ".",
@@ -828,7 +964,11 @@ async def dispute_text(s: AsyncSession, d: Deal) -> str:
             + (" · ордерные реквизиты" if d.is_order else "") if card else
             f"{pe('card')} Реквизиты ещё не выданы" + (f" · перевод из {esc(d.sender_bank)}" if d.sender_bank else ""),
             f"{pe('ruble')} Сумма: <b>{money.fmt(d.amount_rub)} ₽</b> · курс {money.fmt(d.rate)}",
-            f"{pe('lock')} Заморожено у продавца: <b>{money.usdt(d.seller_debit)} USDT</b>",
+            f"{pe('shop')} Bybit-ордер: {_link(d) if d.bybit_url else 'ссылки ещё нет'} · "
+            f"{money.usdt(d.seller_debit)} USDT по {money.fmt(d.merchant_rate)} ₽ · оператор "
+            + (f"<code>{d.operator_id}</code>" if d.operator_id else "не назначен") if d.via_bybit else
+            f"{pe('lock')} Заморожено у продавца: <b>{money.usdt(d.seller_debit)} USDT</b>"
+            + (f" · курс {money.fmt(d.merchant_rate)} ₽" if d.merchant_rate else ""),
             f"{pe('dollar')} Покупателю к выдаче: <b>{money.usdt(d.buyer_credit)} USDT</b>",
             f"{pe('clock')} " + " · ".join(times),
             f"{pe('clip')} Чек: {'есть' if d.receipt_file_id else 'нет'} · материалов: покупатель {by['buyer']}, продавец {by['seller']}",
@@ -849,7 +989,7 @@ def dispute_kb(d: Deal, *extra):
               [btn("Написать покупателю", f"amsg:{d.buyer_id}", "support"),
                btn("Написать продавцу", f"amsg:{d.seller_id}", "support") if seller else None]]
     files = btn("Чек и файлы", f"af:{d.id}", "clip")
-    if d.status in ("searching", "assigned", "waiting_payment"):
+    if d.status in deals.UNPAID:
         return kb(btn("Отменить сделку", f"ar:{d.id}:c", "cross", style="danger"), *people, *extra)
     if d.status not in ("paid", "dispute"):
         return kb(files, *people, *extra)

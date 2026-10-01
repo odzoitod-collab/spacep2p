@@ -68,7 +68,7 @@ async def admin_screen(bot: Bot, s: AsyncSession, user: User, src=None):
     approvals = await count(Adjustment.status == "pending")
     api_apps = await count(ApiApplication.status == "pending")
     om_apps = await count(OrderMerchant.status == "pending")
-    searching = await count(Deal.status.in_(("searching", "assigned")))
+    searching = await count(Deal.status.in_(orders.REQUEST))
     backlog = await count(Event.alert, Event.sent_at.is_(None))
     income24 = await s.scalar(select(func.coalesce(func.sum(Ledger.delta), 0))
                               .where(Ledger.user_id.is_(None), Ledger.created_at > day))
@@ -130,15 +130,15 @@ async def admin_screen(bot: Bot, s: AsyncSession, user: User, src=None):
 async def settings_screen(bot: Bot, user: User, src=None, note: str = ""):
     rate, sp, pp = settings.dec("rate"), settings.dec("seller_pct"), settings.dec("platform_pct")
     q = money.quote(Decimal(10000), rate, sp, pp)
-    qo = money.quote(Decimal(10000), rate, settings.dec("order_seller_pct"), pp)
+    qo = money.quote_fixed(Decimal(10000), rate, settings.dec("order_rate"), pp)
     lines = [
         title(pe("settings"), "Настройки"),
         "",
         quote(f"{pe('swap')} Сделка на 10 000 ₽, покупатель получает {money.usdt(q.buyer_credit)} USDT:",
               f"{pe('card')} статичная карта: мерчант отдаёт {money.usdt(q.seller_debit)}, площадке "
               f"{money.usdt(q.platform_fee)} USDT",
-              f"{pe('key')} ордерные реквизиты: мерчант отдаёт {money.usdt(qo.seller_debit)}, площадке "
-              f"{money.usdt(qo.platform_fee)} USDT"),
+              f"{pe('key')} ордерные реквизиты (курс {money.fmt(settings.dec('order_rate'))} ₽): мерчант отдаёт "
+              f"{money.usdt(qo.seller_debit)}, площадке {money.usdt(qo.platform_fee)} USDT"),
     ]
     for name, keys in settings.GROUPS:
         lines += [f"<b>{name}</b>", quote(*[f"{settings.SPEC[k][2]}: <b>{esc(settings.human(k))}</b>" for k in keys])]
@@ -238,10 +238,9 @@ async def cb_commissions(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User
 
 async def commissions_screen(bot: Bot, s: AsyncSession, admin: User, src=None, note: str = ""):
     rate, pp = settings.dec("rate"), settings.dec("platform_pct")
-    sp, op = settings.dec("seller_pct"), settings.dec("order_seller_pct")
-    q, qo = money.quote(Decimal(10000), rate, sp, pp), money.quote(Decimal(10000), rate, op, pp)
-    personal = (await s.scalars(select(User).where(or_(User.pct_static.is_not(None), User.pct_order.is_not(None)))
-                                .order_by(User.id).limit(20))).all()
+    sp, orate = settings.dec("seller_pct"), settings.dec("order_rate")
+    q, qo = money.quote(Decimal(10000), rate, sp, pp), money.quote_fixed(Decimal(10000), rate, orate, pp)
+    personal = (await s.scalars(select(User).where(User.pct_static.is_not(None)).order_by(User.id).limit(20))).all()
     pct = lambda v: f"{money.fmt(v, 3)}%"  # noqa: E731
     await show(bot, admin, "\n".join([
         title(pe("percent"), "Комиссии и проценты"),
@@ -249,22 +248,21 @@ async def commissions_screen(bot: Bot, s: AsyncSession, admin: User, src=None, n
         title(pe("swap"), "Сделки"),
         quote(f"{pe('dollar')} Покупатель платит: <b>{pct(pp)}</b> · курс {money.fmt(rate)} ₽",
               f"{pe('card')} Мерчант, статичная карта: <b>{pct(sp)}</b> → площадке <b>{pct(pp - sp)}</b>",
-              f"{pe('key')} Мерчант, ордерные реквизиты: <b>{pct(op)}</b> → площадке <b>{pct(pp - op)}</b>"),
+              f"{pe('key')} Ордерный мерчант: фиксированный курс <b>{money.fmt(orate)} ₽</b> за USDT, без процента "
+              f"(не выше {money.fmt(settings.order_rate_cap(rate, pp))} ₽)"),
         f"На 10 000 ₽ покупатель получает {money.usdt(q.buyer_credit)} USDT; площадке {money.usdt(q.platform_fee)} "
-        f"(карта) или {money.usdt(qo.platform_fee)} USDT (ордер). Правило: ордер ≤ карта ≤ покупатель.",
+        f"(карта) или {money.usdt(qo.platform_fee)} USDT (ордер: мерчант отдаёт {money.usdt(qo.seller_debit)}).",
         title(pe("wallet"), "Кошелёк"),
         quote(f"{pe('down')} Пополнение xRocket: {settings.get('deposit_fee')}% · USDT TON: без комиссии",
               f"{pe('up')} Вывод чеком xRocket: {settings.human('withdraw_fee')} · на TON: "
               f"{settings.human('ton_withdraw_fee')}"),
         title(pe("star"), f"Личные ставки мерчантов ({len(personal)})"),
-        quote(*[f"<code>{u.id}</code> {esc((u.name or '—')[:20])}: карта "
-                f"{pct(u.pct_static) if u.pct_static is not None else 'общая'}, ордер "
-                f"{pct(u.pct_order) if u.pct_order is not None else 'общая'}" for u in personal])
+        quote(*[f"<code>{u.id}</code> {esc((u.name or '—')[:20])}: карта {pct(u.pct_static)}" for u in personal])
         if personal else "Нет — все работают по общим ставкам. Задать: профиль пользователя → «Проценты мерчанта».",
         "Ставка фиксируется в сделке при её создании: изменения не трогают открытые сделки.",
     ]) + note, kb(
         [btn("Покупатель", "acs:platform_pct", "dollar"), btn("Курс", "acs:rate", "swap")],
-        [btn("Мерчант: карта", "acs:seller_pct", "card"), btn("Мерчант: ордер", "acs:order_seller_pct", "key")],
+        [btn("Мерчант: карта", "acs:seller_pct", "card"), btn("Курс ордерного", "acs:order_rate", "key")],
         [btn("Пополнение", "acs:deposit_fee", "down"), btn("Вывод чеком", "acs:withdraw_fee", "up")],
         btn("Вывод на TON", "acs:ton_withdraw_fee", "up"),
         *[btn(f"Личная ставка · {u.id} {(u.name or '')[:16]}", f"aup:{u.id}", "star") for u in personal],
@@ -278,10 +276,10 @@ def _pct_text(u: User, err: str = "") -> str:
         title(pe("star"), f"Проценты мерчанта · {u.id}"),
         f"{esc(u.name or '—')} @{esc(u.username or '—')}",
         "",
-        quote(f"{pe('card')} Статичная карта: <b>{pct(settings.merchant_pct(u, False))}</b>"
+        quote(f"{pe('card')} Статичная карта: <b>{pct(settings.merchant_pct(u))}</b>"
               + (" (личная)" if u.pct_static is not None else " (общая)"),
-              f"{pe('key')} Ордерные реквизиты: <b>{pct(settings.merchant_pct(u, True))}</b>"
-              + (" (личная)" if u.pct_order is not None else " (общая)"),
+              f"{pe('key')} Ордерные реквизиты: фиксированный курс {money.fmt(settings.dec('order_rate'))} ₽, "
+              "без процента",
               f"{pe('dollar')} Покупатель платит: {pct(settings.dec('platform_pct'))} — личная ставка выше не действует"),
         "Личная ставка — для надёжных мерчантов с большим объёмом. Применяется к новым сделкам.",
     ]) + (warn(err) if err else "")
@@ -297,20 +295,19 @@ async def cb_user_pct(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User, s
 
 
 def _pct_kb(u: User):
-    return kb([btn("Ставка по карте", f"aup:set:{u.id}:s", "card"), btn("Ставка по ордеру", f"aup:set:{u.id}:o", "key")],
-              btn("Сбросить на общие", f"aup:rs:{u.id}", "refresh") if u.pct_static is not None
-              or u.pct_order is not None else None,
+    return kb(btn("Ставка по карте", f"aup:set:{u.id}:s", "card"),
+              btn("Сбросить на общую", f"aup:rs:{u.id}", "refresh") if u.pct_static is not None else None,
               btn("Все ставки", "acm", "percent"),
               back(f"auv:{u.id}", "Профиль"))
 
 
-@router.callback_query(F.data.regexp(r"^aup:set:(\d+):([so])$"))
+@router.callback_query(F.data.regexp(r"^aup:set:(\d+):(s)$"))
 async def cb_user_pct_ask(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User, state: FSMContext):
     _, _, uid, which = c.data.split(":")
     u = await s.get(User, int(uid))
     await state.set_state(Adm.pct)
     await state.set_data({"uid": u.id, "which": which})
-    await show(bot, user, _pct_text(u) + f"\n\nОтправьте личный процент {'по статичной карте' if which == 's' else 'по ордерам'}"
+    await show(bot, user, _pct_text(u) + "\n\nОтправьте личный процент по статичной карте"
                                          " (например, <code>5.5</code>) или «-», чтобы вернуть общий.",
                kb(back(f"aup:{u.id}", "Отмена")), c)
 
@@ -331,14 +328,11 @@ async def msg_user_pct(m: Message, bot: Bot, s: AsyncSession, user: User, state:
                                                       "(меньше процента покупателя), до 3 знаков"),
                               kb(back(f"aup:{u.id}", "Отмена")))
     await state.clear()
-    attr = "pct_static" if data["which"] == "s" else "pct_order"
-    old = getattr(u, attr)
-    setattr(u, attr, value)
-    what = "по статичной карте" if data["which"] == "s" else "по ордерам"
-    audit.log(s, user.id, "merchant_pct", f"user:{u.id}", f"{attr}: {old} → {value}")
-    events.add(s, f"user:{u.id}", "pct", f"Личная ставка {what}: {old if old is not None else 'общая'} → "
+    old, u.pct_static = u.pct_static, value
+    audit.log(s, user.id, "merchant_pct", f"user:{u.id}", f"pct_static: {old} → {value}")
+    events.add(s, f"user:{u.id}", "pct", f"Личная ставка по статичной карте: {old if old is not None else 'общая'} → "
                f"{value if value is not None else 'общая'} ({user.name})", u.id, alert=True)
-    await notify(bot, u.id, f"{pe('star')} <b>Ваш процент {what}: {money.fmt(settings.merchant_pct(u, data['which'] == 'o'), 3)}%</b>"
+    await notify(bot, u.id, f"{pe('star')} <b>Ваш процент по статичной карте: {money.fmt(settings.merchant_pct(u), 3)}%</b>"
                             " — действует для новых сделок.")
     await show(bot, user, _pct_text(u) + ok("Сохранено"), _pct_kb(u))
 
@@ -346,12 +340,12 @@ async def msg_user_pct(m: Message, bot: Bot, s: AsyncSession, user: User, state:
 @router.callback_query(F.data.regexp(r"^aup:rs:(\d+)$"))
 async def cb_user_pct_reset(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User):
     u = await s.get(User, int(c.data.split(":")[2]))
-    u.pct_static = u.pct_order = None
+    u.pct_static = None
     audit.log(s, user.id, "merchant_pct", f"user:{u.id}", "reset")
-    events.add(s, f"user:{u.id}", "pct", f"Личные ставки сброшены на общие ({user.name})", u.id, alert=True)
-    await notify(bot, u.id, f"{pe('star')} Ваши проценты вернулись к общим: карта "
-                            f"{money.fmt(settings.merchant_pct(u, False), 3)}%, ордер {money.fmt(settings.merchant_pct(u, True), 3)}%.")
-    await show(bot, user, _pct_text(u) + ok("Сброшено на общие"), _pct_kb(u), c)
+    events.add(s, f"user:{u.id}", "pct", f"Личная ставка сброшена на общую ({user.name})", u.id, alert=True)
+    await notify(bot, u.id, f"{pe('star')} Ваш процент по статичной карте вернулся к общему: "
+                            f"{money.fmt(settings.merchant_pct(u), 3)}%.")
+    await show(bot, user, _pct_text(u) + ok("Сброшено на общую"), _pct_kb(u), c)
 
 
 # ---------- search & profile ----------
@@ -491,7 +485,7 @@ async def user_screen(bot: Bot, s: AsyncSession, admin: User, u: User, src=None,
         [btn("Карты", f"auc:{u.id}", "card"), btn("Споры", f"aus:{u.id}", "flag")],
         [btn("Ввод и вывод", f"auw:{u.id}", "wallet"), btn("Написать", f"amsg:{u.id}", "support")],
         btn("Изменить баланс", f"aadj:{u.id}", "dollar", style="primary"),
-        btn("Проценты мерчанта" + (" · личные" if u.pct_static is not None or u.pct_order is not None else ""),
+        btn("Процент мерчанта" + (" · личный" if u.pct_static is not None else ""),
             f"aup:{u.id}", "star"),
         [btn("Снять со смены", f"auo:{u.id}", "pause") if u.is_online else None,
          btn("Разблокировать", f"aub:{u.id}:0", "ok", style="success") if u.is_banned
@@ -985,7 +979,7 @@ async def cb_deal_list(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User):
     elif kind == "open":
         q = q.where(Deal.status.in_(deals.OPEN))
     elif kind == "search":
-        q = select(Deal).where(Deal.status.in_(("searching", "assigned"))).order_by(Deal.id).limit(20)
+        q = select(Deal).where(Deal.status.in_(orders.REQUEST)).order_by(Deal.id).limit(20)
     elif kind == "slow":
         q = select(Deal).where(Deal.status == "paid", Deal.paid_at < now() - timedelta(
             minutes=settings.num("confirm_minutes"))).order_by(Deal.paid_at).limit(20)
@@ -1036,7 +1030,7 @@ async def cb_resolve_ask(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User
     await state.set_state(None)
     _, did, verdict = c.data.split(":")
     d = await s.get(Deal, int(did), populate_existing=True)
-    allowed = ("searching", "assigned", "waiting_payment") if verdict == "c" else ("paid", "dispute")
+    allowed = deals.UNPAID if verdict == "c" else ("paid", "dispute")
     if not d or d.status not in allowed or (verdict == "a" and d.dispute_amount_rub is None):
         return await c.answer("Сделка уже закрыта или решение недоступно", show_alert=True)
     await show(bot, user, "\n".join([
@@ -1084,7 +1078,7 @@ async def resolve(bot: Bot, s: AsyncSession, user: User, did: int, verdict: str,
         return await admin_screen(bot, s, user, src)
     error = ""
     try:
-        if verdict == "c" and d.status in ("searching", "assigned"):
+        if verdict == "c" and d.status in orders.REQUEST:
             res = await orders.cancel(s, d.id, "void", "admin_void")
         elif verdict in ("s", "c"):
             res = (await deals.cancel(s, d.id, ("waiting_payment",), "void", "admin_void") if verdict == "c"
@@ -1108,4 +1102,5 @@ async def resolve(bot: Bot, s: AsyncSession, user: User, did: int, verdict: str,
     head = (f"Сделка #{res.id} отменена администрацией. Не переводите по ней деньги" if verdict == "c"
             else f"Спор по сделке #{res.id} решён {VERDICTS[verdict]}")
     await push(bot, s, res.buyer_id, res, head)
-    await push(bot, s, res.seller_id, res, head)
+    for uid in deals.sellers(res):
+        await push(bot, s, uid, res, head)

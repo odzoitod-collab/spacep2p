@@ -35,7 +35,8 @@ async def expire_deals(bot: Bot) -> None:
             await s.commit()
             if d:
                 await push(bot, s, d.buyer_id, d, f"Сделка #{d.id}: время на оплату вышло")
-                await push(bot, s, d.seller_id, d, f"Сделка #{d.id} отменена: покупатель не оплатил вовремя")
+                for uid in deals.sellers(d):
+                    await push(bot, s, uid, d, f"Сделка #{d.id} отменена: покупатель не оплатил вовремя")
 
 
 async def release_holds(bot: Bot) -> None:
@@ -75,8 +76,9 @@ async def remind_sellers(bot: Bot) -> None:
         await s.commit()
         for did in ids:
             d = await s.get(Deal, did)
-            if not await push(bot, s, d.seller_id, d, f"Покупатель ждёт подтверждения по сделке #{d.id}"):
-                events.add(s, f"deal:{d.id}", "notify_failed", f"Продавец {d.seller_id} недоступен, сделка ждёт "
+            if not await push(bot, s, deals.checker(d), d, f"Покупатель ждёт подтверждения по сделке #{d.id}"):
+                events.add(s, f"deal:{d.id}", "notify_failed", f"{'Оператор' if d.via_bybit else 'Продавец'} "
+                                                               f"{deals.checker(d)} недоступен, сделка ждёт "
                                                                "подтверждения", alert=True)
                 await s.commit()
             await push(bot, s, d.buyer_id, d, f"Продавец пока не подтвердил сделку #{d.id} — можно открыть спор")
@@ -94,7 +96,7 @@ async def escalate_unanswered_deals(bot: Bot) -> None:
             await s.commit()
             if d:
                 await push(bot, s, d.buyer_id, d, f"Сделка #{d.id} передана администрации: продавец не ответил")
-                await push(bot, s, d.seller_id, d, f"Сделка #{d.id} передана администрации: вы не ответили вовремя")
+                await push(bot, s, deals.checker(d), d, f"Сделка #{d.id} передана администрации: вы не ответили вовремя")
 
 
 async def poll_deposits(bot: Bot) -> None:
@@ -160,10 +162,22 @@ async def ton_cycle(bot: Bot) -> None:
 
 
 async def order_timeouts(bot: Bot) -> None:
-    """Order requisites: nobody took a request in time -> closed; a merchant did not give requisites in time ->
-    his funds are unfrozen and the request goes to the other merchants."""
+    """Order requisites: nobody took a request in time -> closed; a merchant did not give requisites (or a Bybit
+    link) in time -> his funds are unfrozen and the request goes to the other merchants; no operator gave the
+    requisites of a Bybit order in time -> closed, admins alerted."""
     async with Session() as s:
-        searching, assigned = await orders.stale(s)
+        searching, assigned, checking = await orders.stale(s)
+        for did in checking:
+            d = await orders.cancel(s, did, "cancelled", "no_merchant")
+            if d is None:
+                continue
+            events.add(s, f"deal:{d.id}", "check_timeout", f"Оператор не выдал реквизиты Bybit-ордера на "
+                       f"{money.fmt(d.amount_rub)} ₽ вовремя — заявка закрыта", alert=True)
+            await s.commit()
+            await push(bot, s, d.buyer_id, d, f"Реквизиты под {money.fmt(d.amount_rub)} ₽ не успели выдать. "
+                                              "Попробуйте ещё раз")
+            await notify(bot, d.seller_id, f"{pe('warn')} Заявка #{d.id} закрыта: оператор не успел обработать ваш "
+                                           "ордер. Отмените ордер на Bybit.")
         for did in searching:
             d = await orders.cancel(s, did, "cancelled", "no_merchant")
             if d is None:
@@ -175,7 +189,8 @@ async def order_timeouts(bot: Bot) -> None:
             await push(bot, s, d.buyer_id, d, f"Реквизиты под {money.fmt(d.amount_rub)} ₽ не нашлись. "
                                               "Попробуйте другую сумму или повторите позже")
         for did in assigned:
-            merchant = (await s.get(Deal, did)).seller_id
+            before = await s.get(Deal, did)
+            merchant, bybit = before.seller_id, before.via_bybit
             d = await orders.release(s, did)
             if d is None:
                 continue
@@ -183,7 +198,9 @@ async def order_timeouts(bot: Bot) -> None:
                        "передана другим", alert=True)
             await s.commit()
             await notify(bot, merchant, f"{pe('warn')} Время на выдачу реквизитов по заявке #{d.id} вышло — она "
-                                        f"передана другим мерчантам, заморозка {money.usdt(d.seller_debit)} USDT снята.")
+                                        "передана другим мерчантам" + ("." if bybit else
+                                                                      f", заморозка {money.usdt(d.seller_debit)} USDT "
+                                                                      "снята."))
             await order_handlers.broadcast(bot, s, d)
         # requests still searching reach merchants who switched on or freed their limits since the last send
         for d in (await s.scalars(select(Deal).where(Deal.status == "searching", Deal.expires_at >= now()))).all():

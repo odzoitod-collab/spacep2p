@@ -45,6 +45,29 @@ def quote(amount_rub: Decimal, rate: Decimal, seller_pct: Decimal, platform_pct:
     return Quote(usdt.quantize(Q, ROUND_DOWN), debit, credit, debit - credit)
 
 
+def quote_fixed(amount_rub: Decimal, rate: Decimal, merchant_rate: Decimal, platform_pct: Decimal) -> Quote:
+    """Order requisites: the merchant sells at a fixed rate. 10000 RUB, rate 100, merchant 104, 6% ->
+    merchant gives 96.153847, buyer gets 94, platform keeps 2.153847."""
+    if rate <= 0 or merchant_rate <= 0:
+        raise ValueError("rates must be > 0")
+    usdt = amount_rub / rate
+    debit = (amount_rub / merchant_rate).quantize(Q, ROUND_UP)
+    credit = (usdt * (1 - platform_pct / HUNDRED)).quantize(Q, ROUND_DOWN)
+    if credit > debit:  # the platform would pay the difference out of its own pocket
+        raise ValueError("merchant_rate is above rate / (1 - platform_pct)")
+    return Quote(usdt.quantize(Q, ROUND_DOWN), debit, credit, debit - credit)
+
+
+def max_rub_fixed(balance: Decimal, merchant_rate: Decimal) -> Decimal:
+    """Largest RUB amount whose fixed-rate debit fits in balance."""
+    if balance <= 0 or merchant_rate <= 0:
+        return Decimal(0)
+    rub = (balance * merchant_rate).quantize(KOP, ROUND_DOWN)
+    while rub > 0 and (rub / merchant_rate).quantize(Q, ROUND_UP) > balance:
+        rub -= KOP
+    return rub
+
+
 def max_rub(balance: Decimal, rate: Decimal, seller_pct: Decimal) -> Decimal:
     """Largest RUB amount whose seller debit fits in balance."""
     k = 1 - seller_pct / HUNDRED

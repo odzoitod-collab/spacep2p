@@ -58,7 +58,8 @@ async def main_menu(bot: Bot, s: AsyncSession, user: User, is_admin: bool, src=N
 
 
 def deal_hint(d) -> str:
-    return {"searching": "ищем реквизиты", "assigned": "мерчант выдаёт реквизиты", "waiting_payment": "ждём ваш перевод",
+    return {"searching": "ищем реквизиты", "assigned": "мерчант выдаёт реквизиты",
+            "checking": "проверяем реквизиты", "waiting_payment": "ждём ваш перевод",
             "paid": "чек у продавца", "dispute": "спор"}[d.status]
 
 
@@ -94,7 +95,7 @@ async def info_screen(bot: Bot, user: User, src=None):
             f"{pe('swap')} Курс: <b>{money.fmt(settings.dec('rate'))} ₽</b> за 1 USDT",
             f"{pe('percent')} Комиссия покупателя: <b>{settings.get('platform_pct')}%</b>",
             f"{pe('up')} Доход мерчанта: <b>{settings.get('seller_pct')}%</b> по статичной карте, "
-            f"<b>{settings.get('order_seller_pct')}%</b> по ордерным реквизитам",
+            f"ордерные реквизиты — фиксированный курс <b>{money.fmt(settings.dec('order_rate'))} ₽</b> за USDT",
             f"{pe('clock')} На оплату сделки: <b>{settings.get('deal_minutes')} мин</b>; "
             f"спор, если продавец молчит: через <b>{settings.get('confirm_minutes')} мин</b>",
             f"{pe('wallet')} Пополнение: USDT в сети TON — без комиссии, xRocket — <b>{settings.get('deposit_fee')}%</b>",

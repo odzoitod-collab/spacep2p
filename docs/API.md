@@ -40,7 +40,8 @@ Strait Pay API позволяет вашему сервису принимать
 ```
 
 * Реквизиты выдаёт продавец: карта или номер телефона для СБП, банк и ФИО получателя.
-* Под каждый заказ продавец замораживает свои USDT, поэтому зачисление после подтверждения гарантировано.
+* Под каждый заказ продавец замораживает свои USDT (или реквизиты выдаёт оператор Strait Pay из Bybit-ордера
+  мерчанта), поэтому зачисление после подтверждения гарантировано.
 * Если продавец не подтверждает оплату, вы открываете спор. Решение принимает администрация Strait Pay.
 
 ## 2. Получение доступа
@@ -78,7 +79,9 @@ curl https://api.<домен>/v1/me -H "Authorization: Bearer sp_live_XXXXXXXX"
 
 | Статус | Что происходит | Что делать |
 |---|---|---|
-| `searching_requisites` | Готовой карты под сумму не было — ордерный мерчант выдаёт реквизиты под этот заказ (до `search_expires_at`) | Ждать вебхук `awaiting_payment`; покупателю — «подбираем реквизиты» |
+| `searching_requisites` | Готовой карты под сумму не было — заявку получили ордерные мерчанты (до `search_expires_at`) | Ждать; покупателю — «подбираем реквизиты» |
+| `merchant_assigned` | Мерчант взял заявку и готовит реквизиты (или ссылку на свой Bybit-ордер) | Ждать |
+| `requisites_check` | Strait Pay проверяет Bybit-ордер мерчанта и выдаёт его реквизиты | Ждать вебхук `awaiting_payment` |
 | `awaiting_payment` | Заказ создан, в `requisites` реквизиты продавца, до `expires_at` ждём перевод | Показать покупателю реквизиты и **точную** сумму, затем загрузить чек |
 | `verifying` | Чек у продавца, он проверяет поступление в банке | Ждать. После `dispute_available_at` можно открыть спор |
 | `dispute` | Спор, решает администрация Strait Pay | Ждать решения; при необходимости написать в поддержку |
@@ -87,8 +90,10 @@ curl https://api.<домен>/v1/me -H "Authorization: Bearer sp_live_XXXXXXXX"
 | `expired` | Время на оплату вышло без чека | Если покупатель всё же оплатил, загрузите чек до `late_receipt_until` |
 
 ```
-searching_requisites ──мерчант выдал реквизиты──▶ awaiting_payment
-      └─никто не взял / cancel──▶ cancelled (close_reason no_merchant / buyer_cancel)
+searching_requisites ──взял──▶ merchant_assigned ──реквизиты──────────────────────────▶ awaiting_payment
+      │                           │  └─Bybit-ордер──▶ requisites_check ──реквизиты──▶ awaiting_payment
+      │                           └─отказался / не успел──▶ searching_requisites    (ссылка отклонена ──▶ merchant_assigned)
+      └─никто не взял / не проверили вовремя / cancel──▶ cancelled (close_reason no_merchant / buyer_cancel)
 
 awaiting_payment ──receipt──▶ verifying ──продавец подтвердил──▶ success
       │  │                        │
@@ -96,10 +101,21 @@ awaiting_payment ──receipt──▶ verifying ──продавец под�
       └─время вышло──▶ expired ──поздний чек──▶ verifying
 ```
 
+Статусы до реквизитов (`searching_requisites`, `merchant_assigned`, `requisites_check`) могут сменять друг друга
+несколько раз: мерчант отказался — заявка снова в поиске. Показывайте покупателю «подбираем реквизиты» во всех трёх.
+
 Итоговые статусы — `success` и `cancelled`. `expired` может смениться на `verifying`, если прислать чек до
 `late_receipt_until`. Если продавец молчит слишком долго, спор открывается автоматически.
 
-`close_reason` уточняет итог: `no_merchant` (ордерные реквизиты не нашлись), `confirmed`, `buyer_cancel`, `expired`, `admin_void`, `ban_void`, `dispute_buyer`,
+Каждый заказ также содержит подсказки для интерфейса:
+
+| Поле | Значения |
+|---|---|
+| `next_action` | `wait` — ничего не делать; `pay_and_upload_receipt` — показать реквизиты, затем загрузить чек; `dispute_available` — продавец молчит, можно открыть спор; `upload_late_receipt` — время вышло, но чек ещё примут; `null` — заказ закрыт |
+| `stage` | `{"step": 1–4, "of": 4, "title": "Подбор реквизитов" \| "Проверка реквизитов" \| "Оплата" \| "Проверка платежа" \| "Спор" \| "Готово" \| "Отменён" \| "Время вышло"}` — прогресс-бар |
+| `stage_deadline` | до какого момента длится текущий этап (поиск, проверка, оплата) или `null` |
+
+`close_reason` уточняет итог: `no_merchant` (ордерные реквизиты не нашлись или не были выданы вовремя), `confirmed`, `buyer_cancel`, `expired`, `admin_void`, `ban_void`, `dispute_buyer`,
 `dispute_actual` (зачислено по фактической сумме), `dispute_seller`.
 
 ## 5. Деньги: курс, комиссия, зачисление
@@ -148,8 +164,12 @@ awaiting_payment ──receipt──▶ verifying ──продавец под�
 
 ```json
 {"available": true, "offers": 3, "min_rub": "1000.00", "max_rub": "50000.00",
- "ranges": [{"min_rub": "1000.00", "max_rub": "21052.63", "bank": "Сбербанк", "type": "card"}]}
+ "ranges": [{"min_rub": "1000.00", "max_rub": "21052.63", "bank": "Сбербанк", "type": "card"}],
+ "order_requisites": {"available": true, "merchants": 4, "min_rub": "5000.00", "max_rub": "300000.00"}}
 ```
+
+`order_requisites` — ордерные мерчанты, которые сейчас принимают заявки: в этом диапазоне заказ без готовой карты,
+скорее всего, получит реквизиты (ответ 202).
 
 ### POST /v1/orders — открыть заказ
 
@@ -184,7 +204,11 @@ curl -X POST https://api.<домен>/v1/orders \
   "receipt_uploaded_at": null,
   "closed_at": null,
   "close_reason": null,
-  "requisites": {"bank": "Сбербанк", "type": "card", "number": "4111111111111111", "holder": "Иванов Иван"}
+  "requisites": {"bank": "Сбербанк", "type": "card", "number": "4111111111111111", "holder": "Иванов Иван"},
+  "order_requisites": false,
+  "next_action": "pay_and_upload_receipt",
+  "stage": {"step": 2, "of": 4, "title": "Оплата"},
+  "stage_deadline": "2026-09-27T18:30:00Z"
 }
 ```
 
@@ -198,10 +222,12 @@ curl -X POST https://api.<домен>/v1/orders \
 
 **202 Accepted — ордерные реквизиты.** Если готовой карты под сумму нет, заказ создаётся в статусе
 `searching_requisites`: заявку получают ордерные мерчанты Strait Pay, первый взявший выдаёт реквизиты специально под
-этот заказ. `requisites` пока `null`, `order_requisites: true`, `search_expires_at` — до какого момента ищем. Когда
-реквизиты выданы, придёт вебхук `awaiting_payment` (или опросите `GET /v1/orders/{id}`); время на оплату — от 15
-минут, точный срок в `expires_at`. Если никто не взял — `cancelled` с `close_reason: "no_merchant"`. Отменить
-поиск — `POST /v1/orders/{id}/cancel`.
+этот заказ — сам (`merchant_assigned`) или через свой Bybit-ордер, который проверяет оператор Strait Pay
+(`requisites_check`). `requisites` пока `null`, `order_requisites: true`, `search_expires_at` — срок текущего
+этапа. Когда реквизиты выданы, придёт вебхук `awaiting_payment` (или опросите `GET /v1/orders/{id}`); время на
+оплату — от 15 минут, точный срок в `expires_at`. Если никто не взял или реквизиты не выдали вовремя — `cancelled`
+с `close_reason: "no_merchant"`. Отменить поиск — `POST /v1/orders/{id}/cancel`. Для вас все три статуса поиска
+работают одинаково: курс и сумма в USDT уже зафиксированы.
 
 Ошибки: `invalid_amount`, `invalid_external_id`, `invalid_type`, `invalid_field` (422), `amount_limit`, `daily_limit`,
 `order_range` (422 — сумма вне диапазона ордерных реквизитов), `open_limit` (409), `no_liquidity` (409 — подходящих
@@ -212,6 +238,18 @@ curl -X POST https://api.<домен>/v1/orders \
 Ответ в том же формате, что и при создании. Дополнительные поля:
 `dispute_available_at` — в статусе `verifying`, с какого момента можно открыть спор;
 `late_receipt_until` — в статусе `expired`, до какого момента принимается поздний чек.
+
+### GET /v1/orders/{id}/history — история статусов
+
+Все смены статуса заказа по порядку — для поддержки и разбора спорных случаев.
+
+```json
+{"id": 1533, "status": "awaiting_payment",
+ "history": [{"status": "searching_requisites", "at": "2026-09-27T18:00:00Z"},
+             {"status": "merchant_assigned", "at": "2026-09-27T18:00:40Z"},
+             {"status": "requisites_check", "at": "2026-09-27T18:02:10Z"},
+             {"status": "awaiting_payment", "at": "2026-09-27T18:04:05Z"}]}
+```
 
 ### GET /v1/orders — список
 
@@ -242,7 +280,8 @@ curl -X POST https://api.<домен>/v1/orders/1532/receipt \
 
 ### POST /v1/orders/{id}/cancel — отменить
 
-В статусах `searching_requisites` и `awaiting_payment`, то есть **до** перевода денег. Продавец получает уведомление, его средства
+В статусах `searching_requisites`, `merchant_assigned`, `requisites_check` и `awaiting_payment`, то есть **до**
+перевода денег. Продавец получает уведомление, его средства
 размораживаются. Ошибка: `invalid_state` (409).
 
 ### POST /v1/orders/{id}/dispute — открыть спор
@@ -407,6 +446,10 @@ api.<домен> {
 
 ### История изменений
 
+* **v1.2** — статусы `merchant_assigned` и `requisites_check` (раньше оба показывались как `searching_requisites`;
+  если вы сравниваете статус строго, добавьте их в «ищем реквизиты»), поля `next_action`, `stage`,
+  `stage_deadline`, метод `GET /v1/orders/{id}/history`, блок `order_requisites` в `GET /v1/liquidity`, отмена
+  в любом статусе поиска.
 * **v1.1** — ордерные реквизиты: статус `searching_requisites`, ответ 202, поля `order_requisites`, `sender_bank`,
   `search_expires_at`.
 * **v1** — заказы, чеки, отмена, спор, баланс, курс, ликвидность, подписанные вебхуки с повторами.

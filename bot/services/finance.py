@@ -3,6 +3,8 @@
 Assets:       xRocket app balance (pays every withdrawal) + USDT on the auto-transfer wallet (read on chain) +
               TON deposits credited but not transferred yet.
 Liabilities:  users' available balances + USDT frozen in deals + withdrawals debited but not paid yet.
+Bybit:        USDT of Bybit-order deals arrive on the operators' Bybit accounts, outside the assets above, while the
+              buyers are credited in the bot: move them to xRocket (shown separately, not counted).
 Free:         assets − liabilities. This is what the owner can take out without touching users' money; it already
               contains the profit. If the auto-transfer wallet also holds personal money, it is counted too.
 """
@@ -35,6 +37,7 @@ class Snapshot:
     volume: dict[str, tuple[int, Decimal]]  # 24h / 7d: completed deals, RUB
     users: int
     online: int
+    bybit: dict[str, Decimal]  # 24h / 7d / all: USDT received through Bybit orders of completed deals
 
     @property
     def assets(self) -> Decimal:
@@ -81,6 +84,10 @@ async def snapshot(s: AsyncSession) -> Snapshot:
         n, rub = (await s.execute(select(func.count(Deal.id), func.coalesce(func.sum(Deal.amount_rub), 0)).where(
             Deal.status == "completed", Deal.closed_at >= since))).one()
         volume[key] = (n, Decimal(rub))
+    bybit = {}
+    for key, since in (("24h", t - timedelta(hours=24)), ("7d", t - timedelta(days=7)), ("all", None)):
+        bybit[key] = await _sum(s, Deal.seller_debit, Deal.via_bybit, Deal.status == "completed",
+                                *([Deal.closed_at >= since] if since else []))
     unpaid_n, unpaid = (await s.execute(select(func.count(Withdrawal.id), func.coalesce(
         func.sum(Withdrawal.amount - Withdrawal.fee), 0)).where(Withdrawal.status.in_(UNPAID)))).one()
     queued_n, queued = (await s.execute(select(func.count(Withdrawal.id), func.coalesce(
@@ -90,4 +97,4 @@ async def snapshot(s: AsyncSession) -> Snapshot:
         users_available=await _sum(s, User.balance), users_frozen=await _sum(s, User.frozen),
         unpaid=Decimal(unpaid), unpaid_n=unpaid_n, queued=Decimal(queued), queued_n=queued_n,
         profit=profit, volume=volume, users=await s.scalar(select(func.count(User.id))),
-        online=await s.scalar(select(func.count(User.id)).where(User.is_online)))
+        online=await s.scalar(select(func.count(User.id)).where(User.is_online)), bybit=bybit)

@@ -9,6 +9,9 @@ class Config(BaseSettings):
 
     bot_token: str
     admin_ids: list[int] = []
+    # operators of Bybit-order deals: they get the merchant's order link, give its requisites to the buyer and
+    # confirm the payment (acting as an admin in that deal). Empty = the admins.
+    operator_ids: list[int] = []
     database_url: str = "postgresql+asyncpg://p2p:p2p@localhost:5432/p2p"
     xrocket_token: str = ""
     xrocket_base_url: str = "https://pay.api.xrocket.exchange"
@@ -44,6 +47,10 @@ class Config(BaseSettings):
         if v and (len(v) != 64 or any(c not in "0123456789abcdefABCDEF" for c in v)):
             raise ValueError("TON_SEED must be 64 hex characters: python -c \"import secrets; print(secrets.token_hex(32))\"")
         return v
+
+    @property
+    def operators(self) -> list[int]:
+        return self.operator_ids or self.admin_ids
 
     @property
     def log_targets(self) -> list[int]:

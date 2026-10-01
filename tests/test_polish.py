@@ -71,6 +71,6 @@ def test_settings_are_grouped_and_readable(go):
         assert "Курс и комиссии" in plain(b.session.last(ADMIN))
         await b.run(cb(ADMIN, "asg:0"), cb(ADMIN, "as:rate"))
         assert "По умолчанию: 100 ₽" in plain(b.session.last(ADMIN))
-        await b.run(msg(ADMIN, "95"))
-        assert "Сохранено: 100 ₽ → 95 ₽" in plain(b.session.last(ADMIN))
+        await b.run(msg(ADMIN, "98"))
+        assert "Сохранено: 100 ₽ → 98 ₽" in plain(b.session.last(ADMIN))
     go(fn)

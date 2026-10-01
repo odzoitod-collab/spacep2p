@@ -1,5 +1,6 @@
 """Order requisites in the bot: the buyer's request, order merchants (application, console, taking a request,
-giving requisites) and the broadcast of requests. Money and state transitions live in services/orders.py."""
+giving requisites or a Bybit order link), operators (checking a Bybit order and giving its requisites) and the
+broadcast of requests. Money and state transitions live in services/orders.py."""
 from contextlib import suppress
 from datetime import timedelta
 from decimal import Decimal
@@ -27,16 +28,19 @@ SPEED = ["до 5 минут", "5–10 минут", "10–15 минут"]
 
 # ---------- broadcast to merchants ----------
 
-def offer_text(d: Deal, u: User) -> str:
-    pct, debit = orders.debit_for(d, u)
+def offer_text(d: Deal, m: OrderMerchant) -> str:
+    bybit = m.mode == "bybit"
     return "\n".join([
         f"{pe('bell')} <b>Ордерная заявка #{d.id} · {money.fmt(d.amount_rub)} ₽</b>",
         "",
         quote(f"{pe('bank')} Перевод из: <b>{esc(d.sender_bank or 'банк не указан')}</b>",
-              f"{pe('lock')} Заморозится у вас: <b>{money.usdt(debit)} USDT</b>",
-              f"{pe('up')} Ваш доход: <b>+{money.usdt(d.amount_rub / d.rate - debit)} USDT</b> ({money.fmt(pct, 3)}%)",
-              f"{pe('clock')} Взять до {at(d.expires_at)}, на реквизиты — {settings.get('order_take_minutes')} мин"),
-        "Кто первым нажмёт «Взять», тот и выдаёт реквизиты.",
+              f"{pe('swap')} Ваш курс: <b>{money.fmt(d.merchant_rate)} ₽</b> → ордер на <b>{money.usdt(d.seller_debit)} "
+              "USDT</b>",
+              f"{pe('shop')} Через Bybit-ордер: пришлёте ссылку, баланс не нужен" if bybit else
+              f"{pe('lock')} Заморозится у вас: <b>{money.usdt(d.seller_debit)} USDT</b>",
+              f"{pe('clock')} Взять до {at(d.expires_at)}, на {'ссылку' if bybit else 'реквизиты'} — "
+              f"{settings.get('order_take_minutes')} мин"),
+        "Кто первым нажмёт «Взять», тот и выдаёт " + ("ордер." if bybit else "реквизиты."),
     ])
 
 
@@ -45,8 +49,8 @@ async def broadcast(bot: Bot, s: AsyncSession, d: Deal, first: bool = True) -> i
     first=False: a periodic re-send to merchants who became available later — quiet if nobody new."""
     merchants = await orders.eligible(s, d)
     sent = 0
-    for u in merchants:
-        m = await notify(bot, u.id, offer_text(d, u), kb(btn("Взять заявку", f"orq:take:{d.id}", "fire", style="success"),
+    for om, u in merchants:
+        m = await notify(bot, u.id, offer_text(d, om), kb(btn("Взять заявку", f"orq:take:{d.id}", "fire", style="success"),
                                                      back("x", "Скрыть", "cross")), silent=u.quiet)
         if m is not None:
             s.add(OrderOffer(deal_id=d.id, user_id=u.id, msg_id=m.message_id))
@@ -137,7 +141,7 @@ async def msg_request_bank(m: Message, bot: Bot, user: User, state: FSMContext):
 async def _confirm(bot, user, state: FSMContext, bank: str, src=None):
     data = await state.get_data()
     amount = Decimal(data["o_amount"])
-    q = money.quote(amount, settings.dec("rate"), settings.dec("order_seller_pct"), settings.dec("platform_pct"))
+    q = money.quote_fixed(amount, settings.dec("rate"), settings.dec("order_rate"), settings.dec("platform_pct"))
     await state.set_state(None)
     await state.update_data(o_bank=bank, o_credit=str(q.buyer_credit))
     await show(bot, user, "\n".join([
@@ -176,17 +180,25 @@ async def cb_request_cancel(c: CallbackQuery, bot: Bot, s: AsyncSession, user: U
     d = await s.get(Deal, did)
     if not d or d.buyer_id != user.id:
         return await c.answer("Заявка не найдена", show_alert=True)
-    merchant = d.seller_id
     res = await orders.cancel(s, did)
     if res is None:
         return await c.answer("Реквизиты уже выданы — отмена доступна на экране сделки", show_alert=True)
     deal_log(s, res, "cancelled", "Покупатель отменил заявку на реквизиты", notice=True)
     await s.commit()
-    await close_offers(bot, s, res, f"Заявка #{res.id} отменена покупателем")
     await deal_screen(bot, s, user, res, c, ok("Заявка отменена"))
-    if merchant:
-        await notify(bot, merchant, f"{pe('warn')} Покупатель отменил заявку #{res.id}. Заморозка "
-                                    f"{money.usdt(res.seller_debit)} USDT снята.")
+    await request_cancelled(bot, s, res)
+
+
+async def request_cancelled(bot: Bot, s: AsyncSession, d: Deal) -> None:
+    """The buyer cancelled a request before requisites: offers are closed, whoever worked on it is told."""
+    await close_offers(bot, s, d, f"Заявка #{d.id} отменена покупателем")
+    if d.seller_id:
+        await notify(bot, d.seller_id, f"{pe('warn')} Покупатель отменил заявку #{d.id}." + (
+            " Отмените ордер на Bybit, если уже создали." if d.via_bybit else
+            f" Заморозка {money.usdt(d.seller_debit)} USDT снята."))
+    if d.via_bybit and d.operator_id:
+        await notify(bot, d.operator_id, f"{pe('warn')} Заявка #{d.id} отменена покупателем — не выдавайте "
+                                         "реквизиты, отмените ордер на Bybit.")
 
 
 # ---------- merchant: take a request and give requisites ----------
@@ -195,17 +207,31 @@ class OrderGive(StatesGroup):
     bank = State()
     number = State()
     holder = State()
+    link = State()
+
+
+def link_line(d: Deal) -> str:
+    return f'<a href="{esc(d.bybit_url)}">{esc(d.bybit_url[:60])}</a>' if d.bybit_url else "—"
 
 
 def _give_head(d: Deal) -> str:
+    bybit = (f"{pe('shop')} Bybit-ордер: {link_line(d)} · зайти на <b>{money.usdt(d.seller_debit)} USDT</b> по "
+             f"{money.fmt(d.merchant_rate)} ₽\n") if d.status == "checking" else ""
     return (f"{title(pe('key'), f'Реквизиты для заявки #{d.id}')}\n"
             f"<b>{money.fmt(d.amount_rub)} ₽</b> · перевод из {esc(d.sender_bank or 'банк не указан')} · "
-            f"выдать до {at(d.expires_at)}\n\n")
+            f"выдать до {at(d.expires_at)}\n{bybit}\n")
 
 
 async def _assigned(s: AsyncSession, user: User, did: int) -> Deal | None:
+    """The request this merchant took and has not answered yet (requisites or a Bybit link)."""
     d = await s.get(Deal, did, populate_existing=True)
     return d if d and d.status == "assigned" and d.seller_id == user.id else None
+
+
+async def _mine(s: AsyncSession, user: User, did: int) -> Deal | None:
+    """The request whose requisites this user gives now: his own (balance mode) or a Bybit order he checks."""
+    d = await s.get(Deal, did, populate_existing=True)
+    return d if orders.giver(d, user.id) else None
 
 
 @router.callback_query(F.data.regexp(r"^orq:take:(\d+)$"))
@@ -221,37 +247,166 @@ async def cb_take(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User, state
             with suppress(TelegramAPIError):
                 await c.message.edit_text(f"Заявка #{did} уже взята или закрыта", reply_markup=close_kb())
         return
-    deal_log(s, d, "taken", f"Мерчант {user.id} взял заявку, заморожено {money.usdt(d.seller_debit)} USDT", notice=True)
+    deal_log(s, d, "taken", f"Мерчант {user.id} взял заявку, " + (
+        "работает через Bybit-ордер" if d.via_bybit else f"заморожено {money.usdt(d.seller_debit)} USDT"), notice=True)
     await s.commit()
     await close_offers(bot, s, d, f"Заявку #{d.id} взял другой мерчант", keep=user.id)
-    await push(bot, s, d.buyer_id, d, f"Мерчант взял заявку #{d.id} и выдаёт реквизиты")
-    await give_screen(bot, s, user, d, state, c)
+    await push(bot, s, d.buyer_id, d, f"Мерчант взял заявку #{d.id} и готовит реквизиты")
+    await (link_screen if d.via_bybit else give_screen)(bot, s, user, d, state, c)
 
 
 async def give_screen(bot: Bot, s: AsyncSession, user: User, d: Deal, state: FSMContext, src=None, note: str = ""):
     await state.set_state(None)
     await state.update_data(g_deal=d.id)
     templates = await orders.last_requisites(s, user.id)
-    await show(bot, user, _give_head(d) + "Выдайте реквизиты, на которые покупатель переведёт рубли:" + note, kb(
+    operator = d.status == "checking"
+    await show(bot, user, _give_head(d) + ("Откройте ордер, зайдите на указанную сумму и выдайте покупателю "
+                                           "реквизиты из ордера:" if operator else
+                                           "Выдайте реквизиты, на которые покупатель переведёт рубли:") + note, kb(
         *[btn(f"{t.bank} {mask(t)} · {t.holder[:18]}", f"orq:tpl:{d.id}:{t.id}", "refresh", style="primary")
           for t in templates],
         [btn("Новая карта", f"orq:k:{d.id}:card", "card"), btn("Новый СБП", f"orq:k:{d.id}:sbp", "sbp")],
-        btn("Отказаться", f"orq:drop:{d.id}", "cross"),
+        btn("Отклонить ссылку", f"opq:rj:{d.id}", "cross") if operator else btn("Отказаться", f"orq:drop:{d.id}", "cross"),
     ), src)
+
+
+async def link_screen(bot: Bot, s: AsyncSession, user: User, d: Deal, state: FSMContext, src=None, note: str = ""):
+    """Bybit mode: the merchant sends the link to his Bybit P2P order instead of requisites."""
+    await state.set_state(OrderGive.link)
+    await state.update_data(g_deal=d.id)
+    await show(bot, user, "\n".join([
+        title(pe("shop"), f"Bybit-ордер для заявки #{d.id}"),
+        f"<b>{money.fmt(d.amount_rub)} ₽</b> · перевод из {esc(d.sender_bank or 'банк не указан')} · "
+        f"ссылка до {at(d.expires_at)}",
+        "",
+        quote(f"{pe('ruble')} Сумма ордера: <b>{money.fmt(d.amount_rub)} ₽</b>",
+              f"{pe('swap')} Курс: <b>{money.fmt(d.merchant_rate)} ₽</b> за USDT",
+              f"{pe('dollar')} Оператор зайдёт на: <b>{money.usdt(d.seller_debit)} USDT</b>"),
+        "Пришлите сюда ссылку на ордер Bybit P2P под эту сумму. Оператор Strait Pay проверит ордер, зайдёт в него "
+        "и выдаст покупателю реквизиты. Баланс в боте не нужен — USDT уходят через Bybit.",
+    ]) + note, kb(btn("Отказаться", f"orq:drop:{d.id}", "cross")), src)
 
 
 @router.callback_query(F.data.regexp(r"^orq:give:(\d+)$"))
 async def cb_give(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User, state: FSMContext):
-    d = await _assigned(s, user, int(c.data.split(":")[2]))
+    did = int(c.data.split(":")[2])
+    if (d := await _assigned(s, user, did)) and d.via_bybit:
+        return await link_screen(bot, s, user, d, state, c)
+    d = await _mine(s, user, did)
     if not d:
         return await c.answer("Заявка уже не у вас", show_alert=True)
     await give_screen(bot, s, user, d, state, c)
 
 
+@router.message(OrderGive.link, F.text)
+async def msg_link(m: Message, bot: Bot, s: AsyncSession, user: User, state: FSMContext):
+    d = await _assigned(s, user, (await state.get_data()).get("g_deal", 0))
+    if not d or not d.via_bybit:
+        await state.clear()
+        return await show(bot, user, warn("Заявка уже не у вас"), close_kb())
+    url = orders.bybit_link(m.text)
+    if not url:
+        return await link_screen(bot, s, user, d, state, note=warn(
+            "Нужна ссылка на ордер Bybit: https://www.bybit.com/… (скопируйте из приложения Bybit)"))
+    did = d.id
+    try:
+        d = await orders.give_link(s, did, user, url)
+    except deals.DealError as e:
+        await s.rollback()
+        await s.refresh(user)
+        d = await _assigned(s, user, did)
+        if e.code == "link_used" and d:
+            return await link_screen(bot, s, user, d, state, note=warn(str(e)))
+        await state.clear()
+        return await show(bot, user, warn(str(e)), close_kb())
+    await state.clear()
+    deal_log(s, d, "link", f"Мерчант {user.id} прислал Bybit-ордер: {url}", notice=True)
+    await s.commit()
+    await deal_screen(bot, s, user, d, note=ok("Ссылка у оператора. Он проверит ордер и выдаст покупателю реквизиты."))
+    await push(bot, s, d.buyer_id, d, f"Ордер по заявке #{d.id} найден — оператор проверяет его и выдаёт реквизиты")
+    await notify_operators(bot, s, d, user)
+
+
+# ---------- operator: check a Bybit order and give its requisites ----------
+
+def operator_text(d: Deal, merchant: User | None, head: str = "Bybit-ордер на проверку") -> str:
+    return "\n".join([
+        f"{pe('bell')} <b>{head} · заявка #{d.id}</b>",
+        "",
+        quote(f"{pe('shop')} Ордер: {link_line(d)}",
+              f"{pe('ruble')} Сумма ордера: <b>{money.fmt(d.amount_rub)} ₽</b>",
+              f"{pe('swap')} Курс ордерного мерчанта: <b>{money.fmt(d.merchant_rate)} ₽</b> за USDT",
+              f"{pe('dollar')} Зайти на: <b>{money.usdt(d.seller_debit)} USDT</b> "
+              f"({money.fmt(d.amount_rub)} ₽ / {money.fmt(d.merchant_rate)})",
+              f"{pe('bank')} Покупатель переводит из: {esc(d.sender_bank or 'банк не указан')}",
+              f"{pe('profile')} Мерчант: {esc(merchant.name or '—') if merchant else '—'} "
+              f"(<code>{d.seller_id}</code>)",
+              f"{pe('clock')} Выдать реквизиты до {at(d.expires_at)}"),
+        "Сверьте сумму и курс в ордере, зайдите на указанную сумму и выдайте покупателю реквизиты из ордера. "
+        "Неверный ордер — «Отклонить ссылку», мерчант пришлёт другую.",
+    ])
+
+
+def operator_kb(d: Deal):
+    return kb(btn("Выдать реквизиты", f"opq:go:{d.id}", "key", style="success"),
+              btn("Отклонить ссылку", f"opq:rj:{d.id}", "cross", style="danger"),
+              back("x", "Скрыть", "cross"))
+
+
+async def notify_operators(bot: Bot, s: AsyncSession, d: Deal, merchant: User | None) -> None:
+    """Every operator gets the order; the first one who presses «Выдать реквизиты» owns it. Commits."""
+    got = 0
+    for oid in config.operators:
+        who = await s.get(User, oid)
+        if await notify(bot, oid, operator_text(d, merchant), operator_kb(d), silent=bool(who and who.quiet)):
+            got += 1
+    if not got:
+        deal_log(s, d, "notify_failed", f"Ни один оператор не получил Bybit-ордер по заявке #{d.id}", alert=True)
+        await s.commit()
+
+
+def _operator(c: CallbackQuery) -> bool:
+    return c.from_user.id in config.operators
+
+
+@router.callback_query(F.data.regexp(r"^opq:go:(\d+)$"))
+async def cb_operator_take(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User, state: FSMContext):
+    if not _operator(c):
+        return await c.answer("Только для операторов", show_alert=True)
+    try:
+        d = await orders.claim(s, int(c.data.split(":")[2]), user)
+    except deals.DealError as e:
+        await s.rollback()
+        await s.refresh(user)
+        return await c.answer(str(e), show_alert=True)
+    deal_log(s, d, "operator", f"Оператор {user.id} проверяет Bybit-ордер", notice=True)
+    await s.commit()
+    await give_screen(bot, s, user, d, state, c)
+
+
+@router.callback_query(F.data.regexp(r"^opq:rj:(\d+)$"))
+async def cb_operator_reject(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User, state: FSMContext):
+    if not _operator(c):
+        return await c.answer("Только для операторов", show_alert=True)
+    d = await orders.reject_link(s, int(c.data.split(":")[2]), user)
+    if d is None:
+        return await c.answer("Ордер уже обработан другим оператором или заявка закрыта", show_alert=True)
+    await state.clear()
+    deal_log(s, d, "link_rejected", f"Оператор {user.id} отклонил Bybit-ордер, мерчант пришлёт другой", notice=True)
+    await s.commit()
+    await show(bot, user, f"{pe('ok')} Ссылка по заявке #{d.id} отклонена — мерчант пришлёт другую до {at(d.expires_at)}.",
+               close_kb(), c)
+    await notify(bot, d.seller_id, f"{pe('warn')} <b>Оператор отклонил ссылку на ордер по заявке #{d.id}.</b> "
+                                   f"Проверьте сумму ({money.fmt(d.amount_rub)} ₽ = {money.usdt(d.seller_debit)} USDT "
+                                   f"по {money.fmt(d.merchant_rate)} ₽) и пришлите другую до {at(d.expires_at)}.",
+                 kb(btn("Прислать ссылку", f"orq:give:{d.id}", "shop", style="success"),
+                    btn("Отказаться", f"orq:drop:{d.id}", "cross")))
+
+
 @router.callback_query(F.data.regexp(r"^orq:tpl:(\d+):(\d+)$"))
 async def cb_template(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User, state: FSMContext):
     _, _, did, cid = c.data.split(":")
-    d = await _assigned(s, user, int(did))
+    d = await _mine(s, user, int(did))
     t = await s.get(Card, int(cid))
     if not d or not t or t.user_id != user.id:
         return await c.answer("Заявка уже не у вас", show_alert=True)
@@ -262,7 +417,7 @@ async def cb_template(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User, s
 @router.callback_query(F.data.regexp(r"^orq:k:(\d+):(card|sbp)$"))
 async def cb_kind(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User, state: FSMContext):
     _, _, did, kind = c.data.split(":")
-    d = await _assigned(s, user, int(did))
+    d = await _mine(s, user, int(did))
     if not d:
         return await c.answer("Заявка уже не у вас", show_alert=True)
     await state.update_data(g_kind=kind)
@@ -285,14 +440,14 @@ async def _ask_number(bot, user, state: FSMContext, d: Deal, bank: str, src=None
 @router.callback_query(OrderGive.bank, F.data.regexp(r"^orq:b:(\d+):(\d+)$"))
 async def cb_bank(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User, state: FSMContext):
     _, _, did, i = c.data.split(":")
-    d = await _assigned(s, user, int(did))
+    d = await _mine(s, user, int(did))
     if not d or int(i) >= len(BANKS):
         return await c.answer("Заявка уже не у вас", show_alert=True)
     await _ask_number(bot, user, state, d, BANKS[int(i)], c)
 
 
 async def _deal_from_state(s, user, state) -> Deal | None:
-    return await _assigned(s, user, (await state.get_data()).get("g_deal", 0))
+    return await _mine(s, user, (await state.get_data()).get("g_deal", 0))
 
 
 @router.message(OrderGive.bank, F.text)
@@ -341,7 +496,7 @@ async def msg_holder(m: Message, bot: Bot, s: AsyncSession, user: User, state: F
 
 
 async def _default_minutes(s: AsyncSession, user: User) -> int:
-    m = await s.get(OrderMerchant, user.id)
+    m = await s.get(OrderMerchant, user.id)  # an operator has none: the shortest allowed window
     choices = orders.pay_choices()
     return m.pay_minutes if m and m.pay_minutes in choices else choices[0]
 
@@ -355,7 +510,7 @@ async def _ask_minutes(bot, user, d: Deal, src=None):
 
 @router.callback_query(F.data.regexp(r"^orq:tm:(\d+)$"))
 async def cb_other_time(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User):
-    d = await _assigned(s, user, int(c.data.split(":")[2]))
+    d = await _mine(s, user, int(c.data.split(":")[2]))
     if not d:
         return await c.answer("Заявка уже не у вас", show_alert=True)
     await _ask_minutes(bot, user, d, c)
@@ -364,7 +519,7 @@ async def cb_other_time(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User)
 @router.callback_query(F.data.regexp(r"^orq:t:(\d+):(\d+)$"))
 async def cb_minutes(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User, state: FSMContext):
     _, _, did, mnt = c.data.split(":")
-    d = await _assigned(s, user, int(did))
+    d = await _mine(s, user, int(did))
     if not d or not (await state.get_data()).get("g_number"):
         return await c.answer("Заявка уже не у вас", show_alert=True)
     await _confirm_give(bot, s, user, d, state, int(mnt), c)
@@ -381,7 +536,8 @@ async def _confirm_give(bot, s: AsyncSession, user: User, d: Deal, state: FSMCon
               f"{pe('clock')} На оплату: <b>{minutes} мин</b>"),
     ]), kb(btn("Выдать реквизиты", f"orq:ok:{d.id}", "ok", style="success"),
            [btn("Другое время", f"orq:tm:{d.id}", "clock"), btn("Другие реквизиты", f"orq:give:{d.id}", "pencil")],
-           btn("Отказаться", f"orq:drop:{d.id}", "cross")), src)
+           btn("Отклонить ссылку", f"opq:rj:{d.id}", "cross") if d.status == "checking"
+           else btn("Отказаться", f"orq:drop:{d.id}", "cross")), src)
 
 
 @router.callback_query(F.data.regexp(r"^orq:ok:(\d+)$"))
@@ -398,11 +554,13 @@ async def cb_give_ok(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User, st
         await s.refresh(user)
         return await c.answer(str(e), show_alert=True)
     await state.clear()
-    deal_log(s, d, "requisites", f"Мерчант {user.id} выдал реквизиты {data['g_bank']}, оплата {data['g_minutes']} мин",
-             notice=True)
+    who = f"Оператор {user.id} выдал реквизиты Bybit-ордера" if d.via_bybit else f"Мерчант {user.id} выдал реквизиты"
+    deal_log(s, d, "requisites", f"{who} {data['g_bank']}, оплата {data['g_minutes']} мин", notice=True)
     await s.commit()
     await deal_screen(bot, s, user, d, c, ok("Реквизиты выданы покупателю. Ждите чек — придёт уведомлением."))
     await push(bot, s, d.buyer_id, d, f"Реквизиты по заявке #{d.id} готовы — переведите {money.fmt(d.amount_rub)} ₽")
+    if d.via_bybit:
+        await push(bot, s, d.seller_id, d, f"Оператор выдал покупателю реквизиты вашего ордера по заявке #{d.id}")
 
 
 @router.callback_query(F.data.regexp(r"^orq:drop:(\d+)$"))
@@ -411,10 +569,13 @@ async def cb_drop(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User, state
     if not d:
         return await c.answer("Заявка уже не у вас", show_alert=True)
     await state.clear()
+    bybit = d.via_bybit
     d = await orders.release(s, d.id)
-    deal_log(s, d, "released", f"Мерчант {user.id} отказался от заявки, заморозка снята", notice=True)
+    deal_log(s, d, "released", f"Мерчант {user.id} отказался от заявки" + ("" if bybit else ", заморозка снята"),
+             notice=True)
     await s.commit()
-    await merchant_screen(bot, s, user, c, ok(f"Вы отказались от заявки #{d.id}, заморозка снята."))
+    await merchant_screen(bot, s, user, c, ok(f"Вы отказались от заявки #{d.id}" + ("." if bybit else
+                                                                                  ", заморозка снята.")))
     await push(bot, s, d.buyer_id, d, f"Ищем другого мерчанта для заявки #{d.id}")
     await broadcast(bot, s, d)
 
@@ -455,10 +616,10 @@ async def merchant_screen(bot: Bot, s: AsyncSession, user: User, src=None, note:
                   "Если в «RUB ⇄ USDT» нет карты на нужную сумму, мерчант выдаст реквизиты специально под ваш перевод.",
                   ""]
     about = ["<b>Хотите выдавать реквизиты?</b>",
-             f"Берёте заявку → выдаёте карту или СБП → проверяете поступление. Доход — "
-             f"{money.fmt(settings.merchant_pct(user, True), 3)}% от суммы. Под заявку замораживаются ваши USDT; "
-             f"на реквизиты — {settings.get('order_take_minutes')} мин, покупателю на оплату — от "
-             f"{settings.get('order_pay_minutes')} мин. Как брать заявки и выдавать реквизиты — в {manual('инструкции')}."]
+             f"Работаете по фиксированному курсу <b>{money.fmt(settings.dec('order_rate'))} ₽</b> за USDT, без процентов. "
+             "Берёте заявку → присылаете ссылку на свой ордер Bybit P2P (баланс в боте не нужен, реквизиты из ордера "
+             "покупателю выдаёт оператор) или работаете с баланса: под заявку замораживаются ваши USDT, реквизиты "
+             f"выдаёте сами. На ответ — {settings.get('order_take_minutes')} мин. Подробно — в {manual('инструкции')}."]
     request_btn = btn("Запросить реквизиты", "orb:new", style="primary")
     if m is None or m.status == "rejected":
         wait = m is not None and now() - deals.aware(m.decided_at) < REAPPLY_AFTER
@@ -475,8 +636,10 @@ async def merchant_screen(bot: Bot, s: AsyncSession, user: User, src=None, note:
                                                 f"{at(m.created_at, 'dt')}. Ответ придёт в этот чат."]) + note,
                           kb(request_btn, back("menu", "В меню")), src)
     busy = await orders.open_rub(s, user.id)
-    cap = min(m.max_rub, m.max_open_rub - busy, money.max_rub(user.balance, settings.dec("rate"),
-                                                                settings.merchant_pct(user, True)))
+    bybit = m.mode == "bybit"
+    cap = min(m.max_rub, m.max_open_rub - busy)
+    if not bybit:
+        cap = min(cap, money.max_rub_fixed(user.balance, settings.dec("order_rate")))
     today = await deals.seller_stats(s, user.id, deals.day_start(), order=True)
     week = await deals.seller_stats(s, user.id, now() - timedelta(days=7), order=True)
     total = await deals.seller_stats(s, user.id, None, order=True)
@@ -489,11 +652,15 @@ async def merchant_screen(bot: Bot, s: AsyncSession, user: User, src=None, note:
         title(pe("key"), "Ордерные реквизиты · кабинет мерчанта"),
         status,
         "",
-        quote(f"{pe('ruble')} Заявка: от {money.fmt(m.min_rub)} до {money.fmt(m.max_rub)} ₽",
+        quote(f"{pe('shop')} Режим: <b>Bybit-ордер</b> — присылаете ссылку на ордер, баланс не нужен" if bybit else
+              f"{pe('lock')} Режим: <b>баланс</b> — под заявку замораживаются ваши USDT, реквизиты выдаёте сами",
+              f"{pe('swap')} Ваш курс: <b>{money.fmt(settings.dec('order_rate'))} ₽</b> за USDT",
+              f"{pe('ruble')} Заявка: от {money.fmt(m.min_rub)} до {money.fmt(m.max_rub)} ₽",
               f"{pe('fire')} В работе: {money.fmt(busy)} из {money.fmt(m.max_open_rub)} ₽",
-              f"{pe('wallet')} Свободно: {money.usdt(user.balance)} USDT",
+              "" if bybit else f"{pe('wallet')} Свободно: {money.usdt(user.balance)} USDT",
               f"{pe('ok')} Сейчас можете взять заявку до <b>{money.fmt(max(cap, Decimal(0)))} ₽</b>"
-              if cap >= m.min_rub else f"{pe('warn')} Сейчас заявки не придут: мало баланса или лимит занят",
+              if cap >= m.min_rub else f"{pe('warn')} Сейчас заявки не придут: "
+              + ("лимит «в работе» занят" if bybit else "мало баланса или лимит занят"),
               f"{pe('clock')} На оплату даёте по умолчанию: {m.pay_minutes} мин"),
         title(pe("stats"), "Ордера: результаты"),
         quote(f"Сегодня: <b>{today['n']}</b> на {money.fmt(today['rub'])} ₽ · <b>+{money.usdt(today['income'])} USDT</b>",
@@ -504,10 +671,14 @@ async def merchant_screen(bot: Bot, s: AsyncSession, user: User, src=None, note:
         "Лимит «в работе» — чтобы учитывать ваш внешний баланс (например, на бирже): больше него заявок не придёт. "
         f"Подробно — в {manual('инструкции')}.",
     ]) + note, kb(
-        *[btn(f"#{d.id} · {money.fmt(d.amount_rub)} ₽ · {'выдать реквизиты' if d.status == 'assigned' else 'открыть'}",
+        *[btn(f"#{d.id} · {money.fmt(d.amount_rub)} ₽ · "
+              + ({'assigned': 'прислать ссылку' if d.via_bybit else 'выдать реквизиты', 'checking': 'у оператора'}
+                 .get(d.status, 'открыть')),
               f"dl:{d.id}", "fire", style="primary" if d.status == "assigned" else None) for d in working],
         (btn("Не принимать заявки", "om:acc:0", "pause") if m.accepting
          else btn("Принимать заявки", "om:acc:1", "live", style="success")) if active else None,
+        btn("Работать с баланса" if bybit else "Работать через Bybit-ордер", "om:mode",
+            "lock" if bybit else "shop") if active else None,
         [btn("Мин. заявка", "om:set:min", "down"), btn("Макс. заявка", "om:set:max", "up")],
         [btn("В работе", "om:set:open", "filter"), btn(f"Оплата {m.pay_minutes} мин", "om:pay", "clock")],
         [btn("Статистика", "sl:st", "stats"), btn("Пополнить", "w", "wallet")],
@@ -524,6 +695,18 @@ async def cb_accepting(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User):
     m.accepting = c.data.endswith("1")
     await merchant_screen(bot, s, user, c, ok("Заявки будут приходить в этот чат" if m.accepting
                                                else "Новые заявки приходить не будут. Взятые — завершите."))
+
+
+@router.callback_query(F.data == "om:mode")
+async def cb_mode(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User):
+    m = await s.get(OrderMerchant, user.id)
+    if not m or m.status != "approved":
+        return await c.answer("Кабинет недоступен", show_alert=True)
+    m.mode = "balance" if m.mode == "bybit" else "bybit"
+    events.add(s, f"om:{user.id}", "mode", f"Режим ордерного мерчанта: {orders.MODES[m.mode]}", user.id, notice=True)
+    await merchant_screen(bot, s, user, c, ok(
+        "Новые заявки — через Bybit-ордер: баланс не нужен." if m.mode == "bybit" else
+        "Новые заявки — с баланса: под каждую замораживаются ваши USDT. Взятые заявки доработают как начаты."))
 
 
 @router.callback_query(F.data == "om:pay")

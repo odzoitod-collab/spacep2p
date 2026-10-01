@@ -41,8 +41,13 @@ def test_fmt():
 
 
 def test_settings_validate():
-    assert settings.validate("rate", "95,50") == "95.5"
     assert settings.validate("rate", "100") == "100"
+    assert settings.validate("rate", "98,50") == "98.5"
+    with pytest.raises(ValueError, match="101.59"):
+        settings.validate("rate", "95,50")  # the order rate 104 would cost the platform money at 95.5 and 6%
+    assert settings.validate("order_rate", "101,5") == "101.5"
+    with pytest.raises(ValueError, match="106.38"):
+        settings.validate("order_rate", "107")
     with pytest.raises(ValueError):
         settings.validate("platform_pct", "3")  # below seller 5
 

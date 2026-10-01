@@ -9,7 +9,7 @@ from bot.models import Setting
 SPEC: dict[str, tuple[str, str, str]] = {
     "rate": ("100", "dec", "Курс сервиса за 1 USDT"),
     "seller_pct": ("5", "pct", "Процент мерчанта со статичной картой"),
-    "order_seller_pct": ("4", "pct", "Процент ордерного мерчанта"),
+    "order_rate": ("104", "dec", "Курс ордерного мерчанта за 1 USDT"),
     "platform_pct": ("6", "pct", "Процент площадки"),
     "deposit_fee": ("1.5", "pct", "Комиссия пополнения xRocket"),
     "deposit_min": ("1", "dec", "Минимальное пополнение"),
@@ -32,6 +32,7 @@ SPEC: dict[str, tuple[str, str, str]] = {
     "order_search_minutes": ("15", "int", "Ордер: поиск мерчанта"),
     "order_take_minutes": ("10", "int", "Ордер: мерчанту на выдачу реквизитов"),
     "order_pay_minutes": ("15", "int", "Ордер: минимальное время на оплату"),
+    "order_check_minutes": ("15", "int", "Ордер: оператору на Bybit-ордер"),
     "ton_sweep_address": ("", "ton", "Адрес для автоперевода USDT TON"),
     "ton_sweep_min": ("1", "dec", "Автоперевод USDT TON от"),
     "ton_withdraw_min": ("3", "dec", "Минимальный вывод на TON"),
@@ -49,14 +50,14 @@ SPEC: dict[str, tuple[str, str, str]] = {
 
 # admin panel sections: (title, keys); every SPEC key is in exactly one section
 GROUPS: list[tuple[str, list[str]]] = [
-    ("Курс и комиссии", ["rate", "seller_pct", "order_seller_pct", "platform_pct", "deposit_fee", "withdraw_fee"]),
+    ("Курс и комиссии", ["rate", "order_rate", "seller_pct", "platform_pct", "deposit_fee", "withdraw_fee"]),
     ("Сроки сделок", ["deal_minutes", "confirm_minutes", "escalate_minutes", "late_hold_minutes", "late_minutes",
                       "online_minutes"]),
     ("Кошелёк и лимиты", ["deposit_min", "withdraw_min", "buyer_fail_limit", "adjust_approval_usdt"]),
     ("Правила и лог-чат", ["receipt_images", "log_all"]),
     ("Тексты и поддержка", ["support", "tutorial", "manual_url"]),
     ("Ордерные реквизиты", ["order_min_rub", "order_max_rub", "order_search_minutes", "order_take_minutes",
-                            "order_pay_minutes"]),
+                            "order_pay_minutes", "order_check_minutes"]),
     ("USDT в сети TON", ["ton_sweep_address", "ton_sweep_min", "ton_withdraw_min", "ton_withdraw_fee"]),
 ]
 HINTS = {
@@ -68,8 +69,9 @@ HINTS = {
     "html": "Текст до 3000 символов, можно с форматированием Telegram.",
     "receipt_images": "1 — принимать PDF и фото/скриншоты, 0 — только PDF.",
     "log_all": "1 — в лог-чат идут все шаги сделок, 0 — только проблемы.",
-    "order_seller_pct": "Процент от суммы ордерной сделки, который получает ордерный мерчант. Не больше процента "
-                        "статичного мерчанта; разница остаётся площадке. Покупатель платит ту же комиссию.",
+    "order_rate": "Сколько рублей ордерный мерчант получает за 1 USDT: он отдаёт сумму заявки / этот курс USDT "
+                  "(через Bybit-ордер или из баланса). Процента у ордерных мерчантов нет. Не выше курса сервиса / "
+                  "(1 − процент площадки), иначе площадка доплачивала бы покупателю из своих.",
     "seller_pct": "Процент от суммы сделки по статичной карте, который получает мерчант. Не больше процента площадки.",
     "ton": "Адрес вашего кошелька в сети TON (UQ… или EQ…), куда бот будет пересылать поступившие USDT, или "
            "<code>xrocket</code> — пересылать на баланс приложения xRocket. «-» — убрать (автоперевод остановится).",
@@ -80,6 +82,7 @@ HINTS = {
     "buyer_fail_limit": "Целое число: сколько отмен/просрочек за сутки допускается до блокировки покупок.",
 }
 FLAGS = ("receipt_images", "log_all")
+RATES = ("rate", "order_rate")  # RUB per 1 USDT
 
 _cache: dict[str, str] = {}
 
@@ -93,12 +96,15 @@ async def load(s: AsyncSession) -> None:
     _cache.update(fresh)
 
 
-def merchant_pct(user, order: bool) -> Decimal:
-    """The merchant's percent: personal if an admin set one, the general one otherwise; never above the platform's,
-    so a later cut of platform_pct can never make the platform pay out of pocket."""
-    personal = user.pct_order if order else user.pct_static
-    general = dec("order_seller_pct" if order else "seller_pct")
-    return min(personal if personal is not None else general, dec("platform_pct"))
+def merchant_pct(user) -> Decimal:
+    """A static-card merchant's percent: personal if an admin set one, the general one otherwise; never above the
+    platform's, so a later cut of platform_pct can never make the platform pay out of pocket."""
+    return min(user.pct_static if user.pct_static is not None else dec("seller_pct"), dec("platform_pct"))
+
+
+def order_rate_cap(rate: Decimal, platform_pct: Decimal) -> Decimal:
+    """Highest order_rate at which the platform still covers the buyer: order USDT >= buyer's USDT."""
+    return (rate / (1 - platform_pct / 100)).quantize(Decimal("0.01"), "ROUND_DOWN")
 
 
 def group_of(key: str) -> int:
@@ -126,7 +132,7 @@ def human(key: str, value: str | None = None) -> str:
     if kind == "int" and key.startswith("order_"):
         return f"{v} мин"
     if kind == "dec":
-        return f"{v} ₽" if key == "rate" or key.endswith("_rub") else f"{v} USDT"
+        return f"{v} ₽" if key in RATES or key.endswith("_rub") else f"{v} USDT"
     if kind == "html":
         return f"текст, {len(v)} симв."
     if kind == "url":
@@ -162,19 +168,24 @@ def validate(key: str, raw: str) -> str:
             v = Decimal(raw.replace(",", "."))
         except Exception:
             raise ValueError("Введите число")
-        if not v.is_finite() or v < 0 or (kind == "pct" and v >= 100) or (key == "rate" and v == 0):
+        if not v.is_finite() or v < 0 or (kind == "pct" and v >= 100) or (key in RATES and v == 0):
             raise ValueError("Недопустимое значение")
-        places = 3 if kind == "pct" else 2 if key == "rate" else 6
+        places = 3 if kind == "pct" else 2 if key in RATES else 6
         if v.as_tuple().exponent < -places or v >= Decimal("10000000"):
             raise ValueError(f"Слишком большая сумма или более {places} знаков после запятой")
         sp = v if key == "seller_pct" else dec("seller_pct")
-        op = v if key == "order_seller_pct" else dec("order_seller_pct")
         pp = v if key == "platform_pct" else dec("platform_pct")
-        if key in ("seller_pct", "order_seller_pct", "platform_pct"):
-            if pp < sp:
-                raise ValueError("Процент площадки должен быть ≥ проценту мерчанта со статичной картой")
-            if op > sp:  # a static card is always available to buyers: it is worth more than on-demand requisites
-                raise ValueError("Ордерный мерчант не может получать больше мерчанта со статичной картой")
+        rate = v if key == "rate" else dec("rate")
+        orate = v if key == "order_rate" else dec("order_rate")
+        if key in ("seller_pct", "platform_pct") and pp < sp:
+            raise ValueError("Процент площадки должен быть ≥ проценту мерчанта со статичной картой")
+        if key in ("rate", "platform_pct", "order_rate") and orate > order_rate_cap(rate, pp):
+            cap = order_rate_cap(rate, pp)
+            if key == "order_rate":
+                raise ValueError(f"Курс ордерного мерчанта не может быть выше {cap} ₽ при курсе {rate} ₽ и комиссии "
+                                 f"{pp}%: площадка доплачивала бы покупателю из своих")
+            raise ValueError(f"Курс ордерного мерчанта {orate} ₽ тогда не может быть выше {cap} ₽: площадка "
+                             f"доплачивала бы покупателю. Сначала снизьте «Курс ордерного мерчанта»")
         return format(v.normalize(), "f")
     if kind in ("int", "int0"):
         low = 0 if kind == "int0" else 1

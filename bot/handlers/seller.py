@@ -72,8 +72,8 @@ async def seller_menu(bot: Bot, s: AsyncSession, user: User, src=None, note: str
     busy = await deals.busy_cards(s, user.id)
     used = await deals.used_today(s, [c.id for c in cards])
     todo = await deals.seller_todo(s, user.id)
-    need_check = [d for d in todo if d.status == "paid"]
-    cap = money.max_rub(user.balance, settings.dec("rate"), settings.merchant_pct(user, False))
+    need_check = [d for d in todo if d.status == "paid" and not d.via_bybit]  # a Bybit order is the operator's
+    cap = money.max_rub(user.balance, settings.dec("rate"), settings.merchant_pct(user))
     vis = {c.id: deals.card_visibility(c, user, busy.get(c.id), used[c.id]) for c in cards}
     visible = sum(v[0] for v in vis.values())
     status = (f"{pe('live')} <b>На смене</b> · покупатели видят карт: <b>{visible} из {len(cards)}</b>" if user.is_online
@@ -88,9 +88,9 @@ async def seller_menu(bot: Bot, s: AsyncSession, user: User, src=None, note: str
             f"доход <b>+{money.usdt(today['income'])} USDT</b>" if today["n"] else "",
             f"{pe('wallet')} Доступно: <b>{money.usdt(user.balance)} USDT</b> — хватит на сделку до {money.fmt(cap)} ₽",
             f"{pe('lock')} Заморожено в сделках: <b>{money.usdt(user.frozen)} USDT</b>",
-            f"{pe('up')} Ваш доход: <b>{money.fmt(settings.merchant_pct(user, False), 3)}%</b> по картам · "
-            f"<b>{money.fmt(settings.merchant_pct(user, True), 3)}%</b> по ордерным реквизитам"
-            + (" (личная ставка)" if user.pct_static is not None or user.pct_order is not None else ""),
+            f"{pe('up')} Ваш доход: <b>{money.fmt(settings.merchant_pct(user), 3)}%</b> по картам"
+            + (" (личная ставка)" if user.pct_static is not None else "")
+            + f" · ордера — фиксированный курс <b>{money.fmt(settings.dec('order_rate'))} ₽</b>",
             f"{pe('fire')} Открытых сделок: <b>{len(todo)}</b>" + (f", ждут проверки: <b>{len(need_check)}</b>"
                                                                   if need_check else ""),
         ),
@@ -153,11 +153,12 @@ async def cb_seller_stats(c: CallbackQuery, bot: Bot, s: AsyncSession, user: Use
 @router.callback_query(F.data == "sl:work")
 async def cb_seller_work(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User):
     rows = await deals.seller_todo(s, user.id)
-    labels = {"assigned": "выдать реквизиты", "waiting_payment": "ждём перевод", "paid": "проверьте поступление",
-              "dispute": "спор"}
+    labels = {"assigned": "выдать реквизиты", "checking": "ордер у оператора", "waiting_payment": "ждём перевод",
+              "paid": "проверьте поступление", "dispute": "спор"}
     await show(bot, user, title(pe("fire"), "Сделки в работе") + "\n\n" + (
         "Сначала те, где нужно ваше действие." if rows else f"{pe('ok')} Открытых сделок нет."), kb(
-        *[btn(f"#{d.id} · {money.fmt(d.amount_rub)} ₽ · {labels.get(d.status, d.status)}"
+        *[btn(f"#{d.id} · {money.fmt(d.amount_rub)} ₽ · "
+              + ("у оператора" if d.via_bybit and d.status in ("checking", "paid") else labels.get(d.status, d.status))
               + (" · ордер" if d.is_order else ""), f"dl:{d.id}", "bell" if d.status in ("paid", "assigned") else "fire",
               style="danger" if d.status in ("paid", "assigned") else None) for d in rows],
         back("sl", "Панель мерчанта")), c)

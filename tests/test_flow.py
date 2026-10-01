@@ -157,7 +157,10 @@ async def scenario():
         assert (await s.get(User, BUYER)).balance == D("131.6") - 10 + D("98.5")
 
     # admin panel
-    await run(cb(ADMIN, "as"), cb(ADMIN, "as:rate"), msg(ADMIN, "95"), cb(ADMIN, "as:platform_pct"), msg(ADMIN, "1"),
+    await run(cb(ADMIN, "as"), cb(ADMIN, "as:rate"), msg(ADMIN, "95"))
+    assert settings.get("rate") == "100"  # refused: the order rate 104 would not fit under 95 / (1 − 6%)
+    await run(cb(ADMIN, "as:order_rate"), msg(ADMIN, "99"),
+              cb(ADMIN, "as:rate"), msg(ADMIN, "95"), cb(ADMIN, "as:platform_pct"), msg(ADMIN, "1"),
               cb(ADMIN, "as:tutorial"), msg(ADMIN, "Новый <тутор>"),
               cb(ADMIN, "au"), msg(ADMIN, "@u10"), cb(ADMIN, "aum:10:+"), msg(ADMIN, "5"),
               cb(ADMIN, "amr:compensation"), cb(ADMIN, "adj:ok:1"), cb(ADMIN, "adj:ok:1"),

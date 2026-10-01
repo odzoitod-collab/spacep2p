@@ -8,12 +8,12 @@ from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError
 from aiogram.types import BufferedInputFile
 from aiohttp import web
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 
 from bot.config import config
 from bot.handlers.deal import accept_receipt, log as deal_log, on_deal_created, push, send_to_seller
-from bot.models import Card, Deal, Session, User
+from bot.models import Card, Deal, OrderMerchant, Session, User
 from bot.services import api, deals, events, money, orders, settings
 
 log = logging.getLogger(__name__)
@@ -150,11 +150,20 @@ async def liquidity(request: web.Request) -> web.Response:
         lo, hi = max(lo, client.min_rub), min(hi, client.max_rub)
         if lo <= hi:
             ranges.append({"min_rub": str(lo), "max_rub": str(hi), "bank": card.bank, "type": card.kind})
+    # order merchants on duty: a request for any amount in their ranges is likely to be taken
+    om = (await s.execute(select(func.count(OrderMerchant.user_id), func.min(OrderMerchant.min_rub),
+                                 func.max(OrderMerchant.max_rub)).where(
+        OrderMerchant.status == "approved", OrderMerchant.accepting, OrderMerchant.user_id != owner.id))).one()
+    lo = max(Decimal(om[1] or 0), settings.dec("order_min_rub"), client.min_rub)
+    hi = min(Decimal(om[2] or 0), settings.dec("order_max_rub"), client.max_rub)
+    on = bool(om[0]) and lo <= hi
     return web.json_response({
         "available": bool(ranges), "offers": len(ranges),
         "min_rub": str(min(Decimal(r["min_rub"]) for r in ranges)) if ranges else None,
         "max_rub": str(max(Decimal(r["max_rub"]) for r in ranges)) if ranges else None,
         "ranges": ranges,
+        "order_requisites": {"available": on, "merchants": om[0], "min_rub": str(lo) if on else None,
+                             "max_rub": str(hi) if on else None},
     })
 
 
@@ -238,6 +247,12 @@ async def get_order(request: web.Request) -> web.Response:
     return await order_response(request[SESSION], await own_order(request))
 
 
+async def order_history(request: web.Request) -> web.Response:
+    s = request[SESSION]
+    d = await own_order(request)
+    return web.json_response({"id": d.id, "status": api.STATUS[d.status], "history": await api.history(s, d)})
+
+
 async def list_orders(request: web.Request) -> web.Response:
     s, client, *_ = ctx(request)
     q = select(Deal).where(Deal.api_client_id == client.id)
@@ -315,17 +330,14 @@ async def upload_receipt(request: web.Request) -> web.Response:
 async def cancel_order(request: web.Request) -> web.Response:
     s, client, owner, bot = ctx(request)
     d = await own_order(request)
-    if d.status in ("searching", "assigned"):
-        from bot.handlers.orders import close_offers
-        merchant = d.seller_id
+    if d.status in orders.REQUEST:
+        from bot.handlers.orders import request_cancelled
         res = await orders.cancel(s, d.id)
         if res is None:
             raise ApiError(409, "invalid_state", "The order changed meanwhile, retry")
         deal_log(s, res, "cancelled", f"API {client.project} отменил заявку на реквизиты", notice=True)
         await s.commit()
-        await close_offers(bot, s, res, f"Заявка #{res.id} отменена покупателем")
-        if merchant:
-            await push(bot, s, merchant, res, f"Покупатель отменил заявку #{res.id}, заморозка снята")
+        await request_cancelled(bot, s, res)
         return await order_response(s, res)
     res = await deals.cancel(s, d.id, ("waiting_payment",))
     if res is None:
@@ -333,7 +345,8 @@ async def cancel_order(request: web.Request) -> web.Response:
         raise ApiError(409, "invalid_state", "Only an order awaiting payment can be cancelled")
     deal_log(s, res, "cancelled", f"API {client.project} отменил заказ на {money.fmt(res.amount_rub)} ₽", notice=True)
     await s.commit()
-    await push(bot, s, res.seller_id, res, f"Покупатель отменил сделку #{res.id}")
+    for uid in deals.sellers(res):
+        await push(bot, s, uid, res, f"Покупатель отменил сделку #{res.id}")
     return await order_response(s, res)
 
 
@@ -347,7 +360,8 @@ async def dispute_order(request: web.Request) -> web.Response:
     deal_log(s, res, "dispute", f"API {client.project} открыл спор: продавец не подтверждает, "
                                 f"{money.fmt(res.amount_rub)} ₽", alert=True)
     await s.commit()
-    await push(bot, s, res.seller_id, res, f"Покупатель открыл спор по сделке #{res.id}")
+    for uid in deals.sellers(res):
+        await push(bot, s, uid, res, f"Покупатель открыл спор по сделке #{res.id}")
     return await order_response(s, res)
 
 
@@ -371,6 +385,7 @@ def build_app(bot: Bot) -> web.Application:
     app.router.add_post("/v1/orders", create_order)
     app.router.add_get("/v1/orders", list_orders)
     app.router.add_get("/v1/orders/{id}", get_order)
+    app.router.add_get("/v1/orders/{id}/history", order_history)
     app.router.add_post("/v1/orders/{id}/receipt", upload_receipt)
     app.router.add_post("/v1/orders/{id}/cancel", cancel_order)
     app.router.add_post("/v1/orders/{id}/dispute", dispute_order)

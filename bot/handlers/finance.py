@@ -35,6 +35,9 @@ def render(sn: finance.Snapshot) -> str:
         wallet,
         f"Ещё на адресах пополнения: <b>{money.usdt(sn.unswept)} USDT</b>" if sn.unswept else "",
         f"Итого: <b>{money.usdt(sn.assets)} USDT</b>",
+        f"Пришло на Bybit операторов по ордерам (в «есть» не входит — переведите на xRocket): 24 ч "
+        f"<b>{money.usdt(sn.bybit['24h'])}</b> · 7 д {money.usdt(sn.bybit['7d'])} · всего "
+        f"{money.usdt(sn.bybit['all'])} USDT" if sn.bybit["all"] else "",
         "",
         "<b>Что должны пользователям</b>",
         f"Балансы: <b>{money.usdt(sn.users_available)} USDT</b> · в сделках: <b>{money.usdt(sn.users_frozen)} USDT</b>",

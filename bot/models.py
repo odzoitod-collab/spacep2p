@@ -32,9 +32,9 @@ class User(Base):
     ui_msg_id: Mapped[int | None]
     created_at: Mapped[datetime] = mapped_column(default=now)
     quiet: Mapped[bool] = mapped_column(default=False, server_default=false())  # deal notifications without sound
-    # personal merchant rates set by an admin; None = the general setting (seller_pct / order_seller_pct)
+    # personal static-card merchant rate set by an admin; None = the general seller_pct.
+    # Order merchants have no percent: they work at the fixed order_rate.
     pct_static: Mapped[Decimal | None] = mapped_column(Numeric(6, 3))
-    pct_order: Mapped[Decimal | None] = mapped_column(Numeric(6, 3))
 
 
 class Card(Base):
@@ -71,8 +71,9 @@ class Deal(Base):
     seller_debit: Mapped[Decimal] = mapped_column(USDT)
     buyer_credit: Mapped[Decimal] = mapped_column(USDT)
     platform_fee: Mapped[Decimal] = mapped_column(USDT)
-    # [searching -> assigned ->] waiting_payment -> paid -> completed | dispute -> completed/cancelled ; expired ;
-    # cancelled. searching/assigned: order requisites — expires_at is the search / requisites deadline there.
+    # [searching -> assigned [-> checking] ->] waiting_payment -> paid -> completed | dispute -> completed/cancelled ;
+    # expired ; cancelled. searching/assigned/checking: order requisites — expires_at is the search / requisites /
+    # operator check deadline there (checking: a Bybit order link waits for an operator, see services/orders.py).
     status: Mapped[str] = mapped_column(String(20), index=True, default="waiting_payment")
     receipt_file_id: Mapped[str | None] = mapped_column(String(256))
     receipt_unique_id: Mapped[str | None] = mapped_column(String(64), index=True)  # same file in two deals = red flag
@@ -99,6 +100,14 @@ class Deal(Base):
     api_notified: Mapped[str | None] = mapped_column(String(20))  # last status queued as a webhook
     is_order: Mapped[bool] = mapped_column(default=False, server_default=false())  # order requisites, not a static card
     sender_bank: Mapped[str | None] = mapped_column(String(40))  # order requisites: the buyer's bank
+    # order requisites: the fixed RUB/USDT rate of the merchant side (seller_debit = amount_rub / merchant_rate);
+    # None = a static card deal priced by seller_pct
+    merchant_rate: Mapped[Decimal | None] = mapped_column(RUB)
+    # the merchant works through a Bybit P2P order: nothing of his is frozen, an operator gives the requisites of the
+    # order and checks the payment; the platform credits the buyer (USDT arrive on the operator's Bybit account)
+    via_bybit: Mapped[bool] = mapped_column(default=False, server_default=false())
+    bybit_url: Mapped[str | None] = mapped_column(String(300), index=True)
+    operator_id: Mapped[int | None] = mapped_column(BigInteger)
 
 
 class Deposit(Base):
@@ -268,6 +277,8 @@ class OrderMerchant(Base):
     max_open_rub: Mapped[Decimal] = mapped_column(RUB)  # RUB in open order deals at once (own risk / exchange balance)
     accepting: Mapped[bool] = mapped_column(default=False)  # receives new requests right now
     pay_minutes: Mapped[int] = mapped_column(default=15, server_default=text("15"))  # default payment window given
+    # bybit: gives a Bybit P2P order link, no balance needed; balance: freezes his USDT and gives requisites himself
+    mode: Mapped[str] = mapped_column(String(8), default="bybit", server_default="bybit")
     admin_id: Mapped[int | None] = mapped_column(BigInteger)
     reason: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(default=now)
@@ -486,6 +497,18 @@ MIGRATIONS: list[tuple[int, list[str]]] = [
     (11, [
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS pct_static NUMERIC(6, 3)",
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS pct_order NUMERIC(6, 3)",
+    ]),
+    (12, [
+        # order merchants work at a fixed rate (order_rate), optionally through Bybit P2P orders
+        "ALTER TABLE deals ADD COLUMN IF NOT EXISTS merchant_rate NUMERIC(14, 2)",
+        "ALTER TABLE deals ADD COLUMN IF NOT EXISTS via_bybit BOOLEAN NOT NULL DEFAULT false",
+        "ALTER TABLE deals ADD COLUMN IF NOT EXISTS bybit_url VARCHAR(300)",
+        "ALTER TABLE deals ADD COLUMN IF NOT EXISTS operator_id BIGINT",
+        "CREATE INDEX IF NOT EXISTS ix_deals_bybit_url ON deals (bybit_url)",
+        # merchants approved before keep working through their balance; new ones start with Bybit orders
+        "ALTER TABLE IF EXISTS order_merchants ADD COLUMN IF NOT EXISTS mode VARCHAR(8) NOT NULL DEFAULT 'balance'",
+        "ALTER TABLE IF EXISTS order_merchants ALTER COLUMN mode SET DEFAULT 'bybit'",
+        "ALTER TABLE users DROP COLUMN IF EXISTS pct_order",
     ]),
 ]
 

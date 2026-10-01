@@ -7,8 +7,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from bot.models import Card, Deal, User, now
 from bot.services import money, settings
 
-OPEN = ("searching", "assigned", "waiting_payment", "paid", "dispute")
-FUNDED = ("assigned", "waiting_payment", "paid", "dispute")  # the seller's USDT are frozen for the deal
+OPEN = ("searching", "assigned", "checking", "waiting_payment", "paid", "dispute")
+# a merchant works on the deal; his USDT are frozen for it unless it goes through a Bybit order (frozen(d))
+FUNDED = ("assigned", "checking", "waiting_payment", "paid", "dispute")
+UNPAID = ("searching", "assigned", "checking", "waiting_payment")  # nothing transferred yet
 MAX_EVIDENCE = 15  # per side: one party cannot use up the other's slots
 
 
@@ -20,6 +22,28 @@ class DealError(Exception):
 
 def aware(dt: datetime) -> datetime:
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def frozen(d: Deal) -> bool:
+    """The seller's USDT are frozen for this deal (not a Bybit order, where the operator receives USDT on Bybit)."""
+    return not d.via_bybit
+
+
+def checker(d: Deal) -> int | None:
+    """Who checks the payment and confirms: the operator of a Bybit order, the seller otherwise."""
+    return d.operator_id if d.via_bybit else d.seller_id
+
+
+def sellers(d: Deal) -> list[int]:
+    """Who works the deal from the selling side and hears about it: the merchant and the operator of a Bybit order."""
+    return [uid for uid in dict.fromkeys((d.seller_id, d.operator_id if d.via_bybit else None)) if uid is not None]
+
+
+def requote(d: Deal, amount_rub: Decimal) -> money.Quote:
+    """The deal's own terms applied to another amount (a dispute settled by the amount actually received)."""
+    if d.merchant_rate is not None:
+        return money.quote_fixed(amount_rub, d.rate, d.merchant_rate, d.platform_pct)
+    return money.quote(amount_rub, d.rate, d.seller_pct, d.platform_pct)
 
 
 def card_busy():
@@ -66,7 +90,7 @@ async def used_today(s: AsyncSession, card_ids: list[int]) -> dict[int, Decimal]
 
 def card_range(card: Card, seller: User, used: Decimal = Decimal(0)) -> tuple[Decimal, Decimal]:
     """Effective [min, max] RUB for a card: its limits, the seller's free balance and the daily limit."""
-    cap = money.max_rub(seller.balance, settings.dec("rate"), settings.merchant_pct(seller, False))
+    cap = money.max_rub(seller.balance, settings.dec("rate"), settings.merchant_pct(seller))
     hi = min(card.max_rub, cap)
     if card.daily_limit_rub is not None:
         hi = min(hi, card.daily_limit_rub - used)
@@ -75,7 +99,7 @@ def card_range(card: Card, seller: User, used: Decimal = Decimal(0)) -> tuple[De
 
 def need_usdt(rub: Decimal, seller: User) -> Decimal:
     """Free balance a seller needs to accept a deal of `rub` on a static card."""
-    return money.seller_debit(rub, settings.dec("rate"), settings.merchant_pct(seller, False))
+    return money.seller_debit(rub, settings.dec("rate"), settings.merchant_pct(seller))
 
 
 def card_visibility(card: Card, seller: User, busy_deal: int | None,
@@ -224,7 +248,7 @@ async def create(s: AsyncSession, buyer: User, card_id: int, amount_rub: Decimal
     lo, hi = card_range(card, seller, (await used_today(s, [card.id]))[card.id])
     if not lo <= amount_rub <= hi:
         raise DealError(f"Сумма должна быть от {money.fmt(lo)} до {money.fmt(hi)} ₽")
-    rate, sp, pp = settings.dec("rate"), settings.merchant_pct(seller, False), settings.dec("platform_pct")
+    rate, sp, pp = settings.dec("rate"), settings.merchant_pct(seller), settings.dec("platform_pct")
     try:
         qt = money.quote(amount_rub, rate, sp, pp)
     except ValueError:
@@ -267,7 +291,7 @@ async def _check_client(s: AsyncSession, client, amount_rub: Decimal) -> None:
         raise DealError(f"Сумма заказа по API: от {money.fmt(client.min_rub)} до {money.fmt(client.max_rub)} ₽",
                         "amount_limit")
     waiting = await s.scalar(select(func.count(Deal.id)).where(
-        Deal.api_client_id == client.id, Deal.status.in_(("searching", "assigned", "waiting_payment"))))
+        Deal.api_client_id == client.id, Deal.status.in_(UNPAID)))
     if waiting >= client.max_open:
         raise DealError(f"Открыто {waiting} неоплаченных заказов — это лимит. Дождитесь оплаты или отмените лишние.",
                         "open_limit")
@@ -304,11 +328,11 @@ async def mark_paid(s: AsyncSession, deal_id: int, buyer_id: int, file_id: str) 
 async def expire(s: AsyncSession, deal_id: int) -> Deal | None:
     """Payment time is over. The seller's funds stay frozen for late_hold_minutes: a buyer who paid at
     the last minute can still upload the receipt and the seller cannot withdraw that money meanwhile."""
-    await s.get(Deal, deal_id, with_for_update=True, populate_existing=True)
-    hold = settings.num("late_hold_minutes")
+    d = await s.get(Deal, deal_id, with_for_update=True, populate_existing=True)
+    hold = settings.num("late_hold_minutes") if d is not None and frozen(d) else 0
     d = await _move(s, deal_id, ("waiting_payment",), "expired", close_reason="expired", funds_held=hold > 0,
                     hold_until=now() + timedelta(minutes=hold) if hold else None)
-    if d and not hold:
+    if d and not hold and frozen(d):
         await money.unfreeze(s, d.seller_id, d.seller_debit, f"deal:{d.id}")
     return d
 
@@ -339,7 +363,7 @@ async def reopen_late(s: AsyncSession, deal_id: int, buyer_id: int, file_id: str
     deadline = late_deadline(d)
     if deadline is None or now() > deadline:
         raise DealError("Срок загрузки чека истёк. Напишите в поддержку.", "late")
-    if not d.funds_held:  # hold already released: freeze again if the seller still has the money
+    if not d.funds_held and frozen(d):  # hold already released: freeze again if the seller still has the money
         try:
             await money.freeze(s, d.seller_id, d.seller_debit, f"deal:{d.id}")
         except money.NotEnough:
@@ -352,7 +376,7 @@ async def reopen_late(s: AsyncSession, deal_id: int, buyer_id: int, file_id: str
 async def open_dispute(s: AsyncSession, deal_id: int, seller_id: int, reason: str,
                        files: list, amount_rub: Decimal | None) -> Deal | None:
     d = await s.get(Deal, deal_id)
-    if not d or d.seller_id != seller_id:
+    if not d or checker(d) != seller_id:
         return None
     return await _move(s, deal_id, ("paid",), "dispute",
                        dispute_reason=reason, dispute_files=files, dispute_amount_rub=amount_rub)
@@ -379,9 +403,9 @@ async def escalate_unanswered(s: AsyncSession, deal_id: int) -> Deal | None:
 
 async def add_evidence(s: AsyncSession, deal_id: int, uid: int, item: list) -> Deal:
     d = await s.get(Deal, deal_id, with_for_update=True, populate_existing=True)
-    if not d or uid not in (d.buyer_id, d.seller_id) or d.status != "dispute":
+    if not d or uid not in (d.buyer_id, d.seller_id, d.operator_id) or d.status != "dispute":
         raise DealError("Спор уже закрыт")
-    role = "buyer" if uid == d.buyer_id else "seller"
+    role = "buyer" if uid == d.buyer_id else "seller"  # the operator of a Bybit order speaks for the seller side
     if sum(1 for f in d.dispute_files or [] if (f[2] if len(f) > 2 else "seller") == role) >= MAX_EVIDENCE:
         raise DealError(f"Не более {MAX_EVIDENCE} материалов от одной стороны")
     d.dispute_files = list(d.dispute_files or []) + [[*item, role]]
@@ -401,8 +425,8 @@ async def complete(s: AsyncSession, deal_id: int, frm=("paid", "dispute"), actua
     if actual_rub is not None and actual_rub != d.amount_rub:
         if not actual_rub.is_finite() or actual_rub <= 0 or actual_rub.as_tuple().exponent < -2:
             raise DealError("Некорректная фактическая сумма")
-        qt = money.quote(actual_rub, d.rate, d.seller_pct, d.platform_pct)
-        diff = qt.seller_debit - old_debit
+        qt = requote(d, actual_rub)
+        diff = qt.seller_debit - old_debit if frozen(d) else Decimal(0)
         if diff > 0:
             try:
                 await money.freeze(s, d.seller_id, diff, f"deal:{d.id}")
@@ -416,7 +440,8 @@ async def complete(s: AsyncSession, deal_id: int, frm=("paid", "dispute"), actua
     if d is None:
         return None
     ref = f"deal:{d.id}"
-    await money.spend_frozen(s, d.seller_id, d.seller_debit, ref)
+    if frozen(d):  # a Bybit order: the USDT came to the operator's Bybit account, the platform credits the buyer
+        await money.spend_frozen(s, d.seller_id, d.seller_debit, ref)
     await money.add(s, d.buyer_id, d.buyer_credit, "deal_buy", ref)
     money.platform(s, d.platform_fee, "deal_fee", ref)
     return d
@@ -427,7 +452,7 @@ async def cancel(s: AsyncSession, deal_id: int, frm: tuple[str, ...], to: str = 
     # Match complete(): lock the deal before touching its seller's frozen funds.
     await s.get(Deal, deal_id, with_for_update=True, populate_existing=True)
     d = await _move(s, deal_id, frm, to, close_reason=reason)
-    if d:
+    if d and frozen(d):
         await money.unfreeze(s, d.seller_id, d.seller_debit, f"deal:{d.id}")
     return d
 
@@ -438,10 +463,11 @@ async def on_ban(s: AsyncSession, uid: int) -> tuple[list[Deal], list[Deal]]:
     from bot.services import orders  # orders builds on this module
     cancelled, disputed = [], []
     for did in (await s.scalars(select(Deal.id).where(
-            Deal.status.in_(("searching", "assigned")), Deal.buyer_id == uid))).all():
+            Deal.status.in_(orders.REQUEST), Deal.buyer_id == uid))).all():
         if d := await orders.cancel(s, did, "void", "ban_void"):
             cancelled.append(d)
-    for did in (await s.scalars(select(Deal.id).where(Deal.status == "assigned", Deal.seller_id == uid))).all():
+    for did in (await s.scalars(select(Deal.id).where(Deal.status.in_(("assigned", "checking")),
+                                                      Deal.seller_id == uid))).all():
         await orders.release(s, did)  # the request goes back to other merchants
     rows = (await s.scalars(select(Deal.id).where(
         Deal.status == "waiting_payment", (Deal.seller_id == uid) | (Deal.buyer_id == uid)))).all()
