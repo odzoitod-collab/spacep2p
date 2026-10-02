@@ -8,7 +8,7 @@ from sqlalchemy import func, select
 
 from bot import models, tasks
 from bot.models import Audit, Card, Deal, Ledger, Ticket, User, Withdrawal, now
-from bot.services import deals, money, settings, xrocket
+from bot.services import money, settings, xrocket
 from tests.harness import cb, msg, plain
 
 SELLER, BUYER, ADMIN, OTHER = 10, 20, 1, 30
@@ -151,18 +151,20 @@ def test_cancel_confirm_and_double_click(go):
     go(fn)
 
 
-def test_buyer_fail_limit_blocks_fake_buyer(go):
+def test_no_limits_on_new_deals_and_cancellations(go):
     async def fn(b):
         await ready(b)
-        async with models.Session() as s:
-            await settings.put(s, "buyer_fail_limit", "2")
-            await s.commit()
-        for _ in range(2):
+        for _ in range(6):  # more than an hour's old limit of 3 and the old cancellation limit
             d = await create_deal(b, "1000")
+            assert d is not None and d.status == "waiting_payment"
+            await b.run(cb(BUYER, f"dl:cn:{d.id}"))
+            assert "закроются" not in plain(b.session.last(BUYER))
             await b.run(cb(BUYER, f"dl:cn2:{d.id}"))
-        await b.run(cb(BUYER, "buy:0"), msg(BUYER, "1000"))
-        await b.run(cb(BUYER, next(x for x in b.session.buttons(BUYER) if x and x.startswith("bgo:"))))
-        assert any("Слишком много отменённых" in a for a in b.session.alerts())
+        async with models.Session() as s:
+            assert await s.scalar(select(func.count(Deal.id)).where(Deal.status == "cancelled")) == 6
+        d = await create_deal(b, "1000")
+        await b.run(cb(BUYER, "buy:0"))  # one open deal at a time: its screen is the buyer's current step
+        assert f"dl:{d.id}" in b.session.buttons(BUYER) and f"сделка #{d.id}" in plain(b.session.last(BUYER))
     go(fn)
 
 
@@ -339,8 +341,6 @@ def test_ban_seller_cancels_unpaid_and_disputes_paid(go):
         await b.run(cb(ADMIN, f"aub2:{SELLER}"), cb(ADMIN, f"aub2:{SELLER}"))
         assert (await get_deal(d1.id)).status == "dispute"
         assert (await get_deal(2)).status == "void"
-        async with models.Session() as s:
-            assert await deals.buyer_failures(s, OTHER) == 0  # the ban is not the buyer's fault
         assert any("Не переводите деньги" in t for t in b.session.texts(OTHER))
         s_ = await user(SELLER)
         assert s_.is_banned and s_.frozen == D(95)  # only the paid deal stays frozen

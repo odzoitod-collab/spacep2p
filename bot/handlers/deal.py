@@ -568,14 +568,11 @@ async def cb_cancel(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User):
     d = await _deal(s, user, c.data.split(":")[2])
     if not d or d.buyer_id != user.id or d.status != "waiting_payment":
         return await c.answer("Сделку уже нельзя отменить", show_alert=True)
-    left = max(0, settings.num("buyer_fail_limit") - await deals.buyer_failures(s, user.id) - 1)
     await show(bot, user, "\n".join([
         f"{pe('warn')} <b>Отменить сделку #{d.id}?</b>",
         "",
         quote(f"Уже перевели {money.fmt(d.amount_rub)} ₽? <b>Не отменяйте</b> — вернитесь и прикрепите чек.",
               "После отмены продавец не будет проверять перевод, а деньги вернуть будет сложнее."),
-        f"После этой отмены можно отменить ещё <b>{left}</b> за сутки — дальше покупки закроются на 24 ч."
-        if left else f"{pe('lock')} Это последняя допустимая отмена за сутки: после неё покупки закроются на 24 ч.",
     ]), kb([btn("Да, отменить", f"dl:cn2:{d.id}", "cross", style="danger"), back(f"dl:{d.id}", "Не отменять", "back")]), c)
 
 

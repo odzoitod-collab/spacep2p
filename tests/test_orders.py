@@ -158,8 +158,6 @@ def test_decline_and_timeouts(go):
         d = await deal(d.id)
         assert (d.status, d.close_reason) == ("cancelled", "no_merchant")
         assert "не нашлись" in plain(b.session.last(BUYER))
-        async with models.Session() as s:
-            assert await deals.buyer_failures(s, BUYER) == 0  # not the buyer's fault
     go(fn)
 
 

@@ -21,7 +21,6 @@ SPEC: dict[str, tuple[str, str, str]] = {
     "escalate_minutes": ("1440", "int", "Автоспор, если продавец молчит"),
     "late_hold_minutes": ("30", "int", "Удержание залога после истечения"),
     "late_minutes": ("720", "int", "Приём позднего чека после срока"),
-    "buyer_fail_limit": ("3", "int", "Лимит отмен покупателя за 24 ч"),
     "adjust_approval_usdt": ("0", "dec", "Второй админ для корректировок от"),
     "online_minutes": ("60", "int0", "Автоконец смены без действий"),
     "receipt_images": ("0", "int0", "Формат чеков"),
@@ -57,7 +56,7 @@ GROUPS: list[tuple[str, list[str]]] = [
                          "withdraw_fee", "chain_withdraw_fee", "team_pct"]),
     ("Сроки сделок", ["deal_minutes", "confirm_minutes", "escalate_minutes", "late_hold_minutes", "late_minutes",
                       "online_minutes"]),
-    ("Кошелёк и лимиты", ["deposit_min", "withdraw_min", "chain_withdraw_min", "buyer_fail_limit",
+    ("Кошелёк и лимиты", ["deposit_min", "withdraw_min", "chain_withdraw_min",
                           "adjust_approval_usdt"]),
     ("Правила и лог-чат", ["receipt_images", "log_all", "signup_review"]),
     ("Тексты, поддержка, чат", ["support", "tutorial", "manual_url", "docs_url", "chat_id"]),
@@ -90,7 +89,6 @@ HINTS = {
     "team_pct": "Процент от суммы сделки (в USDT по курсу сделки), который тимлид получает с каждой завершённой "
                 "сделки участника команды. Платит площадка из своего дохода по сделке, не больше него.",
     "deposit_fee": "Процент с каждого пополнения — и счётом, и по адресу. Удерживается из поступившей суммы.",
-    "buyer_fail_limit": "Целое число: сколько отмен/просрочек за сутки допускается до блокировки покупок.",
 }
 FLAGS = ("receipt_images", "log_all", "signup_review")
 RATES = ("rate", "order_rate")  # RUB per 1 USDT

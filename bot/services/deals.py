@@ -236,13 +236,6 @@ async def income_by_day(s: AsyncSession, uid: int, days: int = 7) -> list[tuple[
     return [(d, n, inc) for d, (n, inc) in sorted(out.items(), reverse=True)]
 
 
-async def buyer_failures(s: AsyncSession, uid: int) -> int:
-    return await s.scalar(select(func.count(Deal.id)).where(
-        Deal.buyer_id == uid, personal(), Deal.status.in_(("cancelled", "expired")),
-        Deal.close_reason.is_distinct_from("no_merchant"),  # nobody gave requisites: not the buyer's fault
-        Deal.created_at > now() - timedelta(hours=24)))
-
-
 async def create(s: AsyncSession, buyer: User, card_id: int, amount_rub: Decimal,
                  expect_credit: Decimal | None = None, client=None, external_id: str | None = None) -> Deal:
     """expect_credit: USDT amount the buyer saw on the confirmation screen; terms changed -> error.
@@ -293,16 +286,10 @@ async def create(s: AsyncSession, buyer: User, card_id: int, amount_rub: Decimal
 
 
 async def check_buyer(s: AsyncSession, buyer: User, amount_rub: Decimal, client=None) -> None:
-    """Who may open a deal now: API limits for a client, the per-person limits otherwise. Buyer row locked."""
+    """Who may open a deal now: API limits for a client; a person — any number of deals and cancellations, one
+    open deal at a time (its screen, receipt and timer are the buyer's current step). Buyer row locked."""
     if client is not None:
         return await _check_client(s, client, amount_rub)
-    recent = await s.scalar(select(func.count(Deal.id)).where(
-        Deal.buyer_id == buyer.id, personal(), Deal.created_at > now() - timedelta(hours=1)))
-    if recent >= 3:
-        raise DealError("Не более трёх новых сделок в час. Попробуйте позже.")
-    if await buyer_failures(s, buyer.id) >= settings.num("buyer_fail_limit"):
-        raise DealError("Слишком много отменённых сделок за сутки. Покупки временно недоступны — "
-                        "напишите в поддержку.", "fail_limit")
     if await open_deal_of(s, buyer.id):
         raise DealError("У вас уже есть открытая сделка")
 
