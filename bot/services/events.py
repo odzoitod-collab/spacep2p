@@ -35,7 +35,9 @@ async def alert_once(s: AsyncSession, ref: str, kind: str, text: str, user_id: i
 
 
 async def history(s: AsyncSession, ref: str, limit: int = 30) -> list[Event]:
-    return list((await s.scalars(select(Event).where(Event.ref == ref).order_by(Event.id).limit(limit))).all())
+    """The latest `limit` events of an operation, oldest first."""
+    rows = (await s.scalars(select(Event).where(Event.ref == ref).order_by(Event.id.desc()).limit(limit))).all()
+    return list(reversed(rows))
 
 
 async def outbox(s: AsyncSession, limit: int = 30) -> list[Event]:

@@ -85,6 +85,8 @@ def cb(uid, data):
 async def scenario():
     await models.init_db("sqlite+aiosqlite:///:memory:")
     async with models.Session() as s:
+        await settings.put(s, "signup_review", "0")  # entry by application is covered by test_signup
+        await s.commit()
         await settings.load(s)
     rocket = FakeRocket()
     xrocket.rocket = rocket
@@ -110,9 +112,8 @@ async def scenario():
 
     pdf = Document(file_id="pdf1", file_unique_id="u1", mime_type="application/pdf")
     # deal 1: happy path
-    await run(cb(BUYER, "mk"), cb(BUYER, "buy:0"), cb(BUYER, "flt"), cb(BUYER, "flt:kind"), cb(BUYER, "flt:bank"),
-              cb(BUYER, "flt:b:0"), cb(BUYER, "flt:amt"), msg(BUYER, "10000"),
-              cb(BUYER, "bc:1"), cb(BUYER, "bgo:1:10000.00"), cb(BUYER, "dl:rc:1"), msg(BUYER, document=pdf),
+    await run(cb(BUYER, "mk"), cb(BUYER, "buy:0"), msg(BUYER, "10000"),
+              cb(BUYER, "bgo:1:10000.00"), cb(BUYER, "dl:rc:1"), msg(BUYER, document=pdf),
               cb(SELLER, "dl:1"), cb(SELLER, "dl:pdf:1"), cb(SELLER, "dl:ok:1"), cb(SELLER, "dl:ok2:1"),
               cb(SELLER, "dl:ok2:1"), cb(BUYER, "deals"))
     async with models.Session() as s:
@@ -122,7 +123,7 @@ async def scenario():
 
     # deal 2: dispute "wrong amount", admin settles by actual amount
     video = Video(file_id="v1", file_unique_id="v1", width=1, height=1, duration=1)
-    await run(cb(BUYER, "flt:reset"), cb(BUYER, "bc:1"), msg(BUYER, "5000"), cb(BUYER, "bgo:1:5000.00"),
+    await run(cb(BUYER, "buy:0"), msg(BUYER, "5000"), cb(BUYER, "bgo:1:5000.00"),
               cb(BUYER, "dl:rc:2"), msg(BUYER, document=pdf),
               cb(SELLER, "dl:ds:2"), cb(SELLER, "dl:dr:2:wrong_amount"), msg(SELLER, "4000"), msg(SELLER, video=video),
               cb(ADMIN, "a"), cb(ADMIN, "adl:dispute"), cb(ADMIN, "adv:2"), cb(ADMIN, "af:2"), cb(ADMIN, "ar:2:a"), cb(ADMIN, "ar2:2:a"), cb(ADMIN, "ar2:2:a"))
@@ -133,7 +134,7 @@ async def scenario():
         assert (seller_u.balance, seller_u.frozen, buyer_u.balance) == (D(67), D(0), D("131.6"))
 
     # deal 3: expires
-    await run(cb(BUYER, "bc:1"), msg(BUYER, "1000"), cb(BUYER, "bgo:1:1000.00"))
+    await run(cb(BUYER, "buy:0"), msg(BUYER, "1000"), cb(BUYER, "bgo:1:1000.00"))
     async with models.Session() as s:
         (await s.get(Deal, 3)).expires_at = models.now() - timedelta(minutes=1)
         await s.commit()

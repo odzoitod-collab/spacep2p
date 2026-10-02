@@ -27,8 +27,8 @@ async def ready(b, balance=D(200)):
 
 
 async def create_deal(b, amount="10000", buyer=BUYER):
-    """Buyer picks the card, types an amount and presses the confirm button that the UI showed."""
-    await b.run(cb(buyer, "bc:1"), msg(buyer, amount))
+    """Buyer opens «RUB ⇄ USDT», types an amount and presses the confirm button with the card the bot picked."""
+    await b.run(cb(buyer, "buy:0"), msg(buyer, amount))
     go_btn = next(x for x in b.session.buttons(buyer) if x and x.startswith("bgo:"))
     await b.run(cb(buyer, go_btn))
     async with models.Session() as s:
@@ -60,8 +60,12 @@ def test_first_visit_and_empty_market_explain_next_step(go):
         await b.run(msg(BUYER, "/start"), cb(BUYER, "buy:0"))
         first, market = b.session.texts(BUYER)[-2:]
         assert "RUB ⇄ USDT — купить за рубли" in plain(first) and "USDT ⇄ RUB — продавать" in plain(first)
-        assert "нет продавцов" in plain(market) and "Например: 10 000 ₽ → 94 USDT" in plain(market)
-        await b.run(msg(BUYER, "привет"))  # free text outside any step is not swallowed silently
+        assert "Отправьте сумму в рублях" in plain(market) and "Например: 10 000 ₽ → 94 USDT" in plain(market)
+        await b.run(msg(BUYER, "привет"))  # the amount step: text that is not a number is explained
+        assert "Нужна сумма числом" in plain(b.session.last(BUYER))
+        await b.run(msg(BUYER, "50"))  # no card and below the order range: what to do instead
+        assert "Сейчас нет реквизитов на 50 ₽" in plain(b.session.last(BUYER))
+        await b.run(msg(BUYER, "/start"), msg(BUYER, "привет"))  # free text outside any step is not swallowed
         assert "Сообщение не распознано" in plain(b.session.last(BUYER))
         await b.run(cb(BUYER, "zz:old"))  # button from a very old message
         assert "Кнопка устарела" in b.session.alerts()[-1]
@@ -121,7 +125,7 @@ def test_receipt_after_restart_without_input_state(go):
 def test_terms_change_between_confirm_and_create(go):
     async def fn(b):
         await ready(b)
-        await b.run(cb(BUYER, "bc:1"), msg(BUYER, "10000"))
+        await b.run(cb(BUYER, "buy:0"), msg(BUYER, "10000"))
         go_btn = next(x for x in b.session.buttons(BUYER) if x and x.startswith("bgo:"))
         async with models.Session() as s:
             await settings.put(s, "rate", "90")
@@ -156,7 +160,7 @@ def test_buyer_fail_limit_blocks_fake_buyer(go):
         for _ in range(2):
             d = await create_deal(b, "1000")
             await b.run(cb(BUYER, f"dl:cn2:{d.id}"))
-        await b.run(cb(BUYER, "bc:1"), msg(BUYER, "1000"))
+        await b.run(cb(BUYER, "buy:0"), msg(BUYER, "1000"))
         await b.run(cb(BUYER, next(x for x in b.session.buttons(BUYER) if x and x.startswith("bgo:"))))
         assert any("Слишком много отменённых" in a for a in b.session.alerts())
     go(fn)
@@ -328,7 +332,7 @@ def test_ban_seller_cancels_unpaid_and_disputes_paid(go):
             await s.commit()
         d1 = await create_deal(b)
         await b.run(cb(BUYER, f"dl:rc:{d1.id}"), msg(BUYER, document=PDF))
-        await b.run(msg(OTHER, "/start"), cb(OTHER, "bc:2"), msg(OTHER, "2000"))
+        await b.run(msg(OTHER, "/start"), cb(OTHER, "buy:0"), msg(OTHER, "2000"))
         await b.run(cb(OTHER, next(x for x in b.session.buttons(OTHER) if x and x.startswith("bgo:"))))
         await b.run(cb(ADMIN, f"aub:{SELLER}:1"))
         assert "Сделок без оплаты будет отменено: 1" in plain(b.session.last(ADMIN))
@@ -412,8 +416,10 @@ def test_support_ticket_and_admin_reply(go):
         await b.run(cb(ADMIN, "atc:1"), cb(ADMIN, "atc:1"))
         async with models.Session() as s:
             assert (await s.get(Ticket, 1)).status == "closed"
-        await b.run(cb(ADMIN, f"amsg:{BUYER}"), msg(ADMIN, "Ещё один вопрос к вам"))
-        assert "Сообщение от поддержки" in plain(b.session.last(BUYER))
+        await b.run(cb(ADMIN, f"dm:0:{BUYER}"), msg(ADMIN, "Ещё один вопрос к вам"))
+        assert "От: Администрация" in plain(b.session.last(BUYER)) and f"dm:0:{ADMIN}" in b.session.buttons(BUYER)
+        await b.run(cb(BUYER, f"dm:0:{ADMIN}"), msg(BUYER, "Отвечаю: всё в порядке"))  # the answer, in the bot
+        assert "Отвечаю: всё в порядке" in plain(b.session.last(ADMIN)) and f"dm:0:{BUYER}" in b.session.buttons(ADMIN)
         for _ in range(6):
             await b.run(cb(BUYER, "sup"), msg(BUYER, "ещё вопрос по сделке"))
         assert "дождитесь ответа" in plain(b.session.last(BUYER))
@@ -450,7 +456,7 @@ def test_withdraw_http_500_keeps_funds_reserved_then_reconciles(go):
         await tasks.reconcile_withdrawals(b.bot)
         async with models.Session() as s:
             assert (await s.scalar(select(Withdrawal))).status == "done"
-        assert "Чек на 20 USDT" in plain(b.session.last(BUYER))
+        assert "Чек на 19.7 USDT" in plain(b.session.last(BUYER))  # 20 − 1.5%
     go(fn)
 
 

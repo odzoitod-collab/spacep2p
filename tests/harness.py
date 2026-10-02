@@ -290,6 +290,8 @@ async def reset_db(url: str) -> None:
         await models.engine.dispose()
     await models.init_db(url)
     async with models.Session() as s:
+        await settings.put(s, "signup_review", "0")  # scenarios start from approved users; test_signup turns it on
+        await s.commit()
         await settings.load(s)
 
 

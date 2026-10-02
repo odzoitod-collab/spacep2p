@@ -23,11 +23,11 @@ def test_parallel_updates_of_one_user_do_not_race(go):
         await ready(b)
         await b.run(cb(BUYER, "w:dep"))
         n = len(b.session.calls)
-        updates = [msg(BUYER, "/deals"), msg(BUYER, "привет"), msg(BUYER, "/wallet"), msg(BUYER, "/buy")]
+        updates = [msg(BUYER, "/deals"), msg(BUYER, "привет"), msg(BUYER, "/buy"), msg(BUYER, "/wallet")]
         await asyncio.gather(*(b.dp.feed_update(b.bot, u) for u in updates))
         screens = [plain(m.caption or m.text or "") for m in b.session.calls[n:] if getattr(m, "chat_id", None) == BUYER
                    and type(m).__name__ in ("SendAnimation", "SendMessage")]
-        assert len(screens) == 4 and "RUB ⇄ USDT" in screens[-1]  # one new screen per update, in the order sent
+        assert len(screens) == 4 and "Кошелёк" in screens[-1]  # one new screen per update, in the order sent
         assert not retired(b, BUYER)  # nothing deleted: earlier screens stay as history
         await b.run(msg(BUYER, "50"))  # the deposit prompt was cancelled by the commands: free text now
         assert "не распознано" in plain(b.session.last(BUYER))

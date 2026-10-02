@@ -14,7 +14,8 @@ SPEC: dict[str, tuple[str, str, str]] = {
     "deposit_fee": ("1.5", "pct", "Комиссия пополнения"),
     "deposit_min": ("1", "dec", "Минимальное пополнение"),
     "withdraw_min": ("1", "dec", "Минимальный вывод"),
-    "withdraw_fee": ("0", "dec", "Комиссия вывода чеком"),
+    "withdraw_pct": ("1.5", "pct", "Комиссия вывода, %"),
+    "withdraw_fee": ("0", "dec", "Фикс. комиссия вывода чеком"),
     "deal_minutes": ("30", "int", "Время на оплату сделки"),
     "confirm_minutes": ("30", "int", "Покупатель может открыть спор через"),
     "escalate_minutes": ("1440", "int", "Автоспор, если продавец молчит"),
@@ -34,11 +35,16 @@ SPEC: dict[str, tuple[str, str, str]] = {
     "order_pay_minutes": ("15", "int", "Ордер: минимальное время на оплату"),
     "order_check_minutes": ("15", "int", "Ордер: оператору на Bybit-ордер"),
     "chain_withdraw_min": ("3", "dec", "Минимальный вывод на кошелёк"),
-    "chain_withdraw_fee": ("1", "dec", "Комиссия вывода на кошелёк"),
+    "chain_withdraw_fee": ("3", "dec", "Фикс. комиссия вывода на кошелёк"),
+    "team_pct": ("1", "pct", "Тимлиду от сделок команды"),
     "chat_id": ("", "chat", "Чат сообщества"),
+    "signup_review": ("1", "int0", "Вход новых пользователей"),
+    "docs_url": ("https://straitpay.best/docs", "url", "Сайт с инструкциями"),
     "tutorial": (
-        "<b>Купить</b>: продавец → сумма → перевод по реквизитам → PDF-чек. USDT придут после подтверждения.\n"
-        "<b>Продать</b>: пополните кошелёк, добавьте карту, выйдите на смену, подтверждайте поступления.\n"
+        "<b>Купить</b>: «RUB ⇄ USDT» → сумма в рублях → перевод по реквизитам → PDF-чек. USDT придут после "
+        "подтверждения.\n"
+        "<b>Продать</b>: пополните кошелёк, добавьте карту, выйдите на смену, подтверждайте поступления — или берите "
+        "заявки под сумму как ордерный мерчант.\n"
         "<b>Кошелёк</b>: пополнение и вывод USDT через xRocket — счёт, адрес в любой сети или чек.",
         "html",
         "Текст «Как это работает»",
@@ -47,14 +53,14 @@ SPEC: dict[str, tuple[str, str, str]] = {
 
 # admin panel sections: (title, keys); every SPEC key is in exactly one section
 GROUPS: list[tuple[str, list[str]]] = [
-    ("Курс и комиссии", ["rate", "order_rate", "seller_pct", "platform_pct", "deposit_fee", "withdraw_fee",
-                         "chain_withdraw_fee"]),
+    ("Курс и комиссии", ["rate", "order_rate", "seller_pct", "platform_pct", "deposit_fee", "withdraw_pct",
+                         "withdraw_fee", "chain_withdraw_fee", "team_pct"]),
     ("Сроки сделок", ["deal_minutes", "confirm_minutes", "escalate_minutes", "late_hold_minutes", "late_minutes",
                       "online_minutes"]),
     ("Кошелёк и лимиты", ["deposit_min", "withdraw_min", "chain_withdraw_min", "buyer_fail_limit",
                           "adjust_approval_usdt"]),
-    ("Правила и лог-чат", ["receipt_images", "log_all"]),
-    ("Тексты, поддержка, чат", ["support", "tutorial", "manual_url", "chat_id"]),
+    ("Правила и лог-чат", ["receipt_images", "log_all", "signup_review"]),
+    ("Тексты, поддержка, чат", ["support", "tutorial", "manual_url", "docs_url", "chat_id"]),
     ("Ордерные реквизиты", ["order_min_rub", "order_max_rub", "order_search_minutes", "order_take_minutes",
                             "order_pay_minutes", "order_check_minutes"]),
 ]
@@ -67,6 +73,9 @@ HINTS = {
     "html": "Текст до 3000 символов, можно с форматированием Telegram.",
     "receipt_images": "1 — принимать PDF и фото/скриншоты, 0 — только PDF.",
     "log_all": "1 — в лог-чат идут все шаги сделок, 0 — только проблемы.",
+    "signup_review": "1 — новый пользователь заполняет заявку (роль, оборот, скриншот) и ждёт одобрения в лог-чате, "
+                     "0 — бот открыт всем сразу.",
+    "docs_url": "Адрес страниц с инструкциями (их отдаёт API-сервер бота: /docs/buy, /docs/sell …). «-» — без ссылок.",
     "order_rate": "Сколько рублей ордерный мерчант получает за 1 USDT: он отдаёт сумму заявки / этот курс USDT "
                   "(через Bybit-ордер или из баланса). Процента у ордерных мерчантов нет. Не выше курса сервиса / "
                   "(1 − процент площадки), иначе площадка доплачивала бы покупателю из своих.",
@@ -74,12 +83,16 @@ HINTS = {
     "chat": "ID группы, например <code>-1001234567890</code> (бот — админ с правом приглашать и закреплять). "
             "«-» — отключить чат.",
     "url": "Ссылка https://… (например, на статью в Telegraph). «-» — убрать ссылку из бота.",
-    "chain_withdraw_fee": "USDT площадке с каждого вывода на кошелёк. Комиссия сети xRocket добавляется сверху "
-                          "и зависит от сети.",
+    "chain_withdraw_fee": "USDT сверх процента с каждого вывода на кошелёк, комиссия сети xRocket уже внутри: "
+                          "если сеть берёт больше, пользователь платит комиссию сети.",
+    "withdraw_pct": "Процент от суммы вывода — и чеком, и на кошелёк. Удерживается из списываемой суммы.",
+    "withdraw_fee": "USDT сверх процента с каждого вывода чеком; 0 — только процент.",
+    "team_pct": "Процент от суммы сделки (в USDT по курсу сделки), который тимлид получает с каждой завершённой "
+                "сделки участника команды. Платит площадка из своего дохода по сделке, не больше него.",
     "deposit_fee": "Процент с каждого пополнения — и счётом, и по адресу. Удерживается из поступившей суммы.",
     "buyer_fail_limit": "Целое число: сколько отмен/просрочек за сутки допускается до блокировки покупок.",
 }
-FLAGS = ("receipt_images", "log_all")
+FLAGS = ("receipt_images", "log_all", "signup_review")
 RATES = ("rate", "order_rate")  # RUB per 1 USDT
 
 _cache: dict[str, str] = {}
@@ -107,6 +120,20 @@ def client_terms(client) -> tuple[Decimal, Decimal]:
             client.pct if client.pct is not None else dec("platform_pct"))
 
 
+def buyer_terms(user=None, client=None) -> tuple[Decimal, Decimal]:
+    """(rate, platform percent) a buyer is priced by: an API client's own terms, else the user's personal ones (an
+    admin sets them in the profile), else the general rate / platform_pct."""
+    if client is not None:
+        return client_terms(client)
+    rate = getattr(user, "buy_rate", None)
+    pct = getattr(user, "buy_pct", None)
+    return (rate if rate is not None else dec("rate"), pct if pct is not None else dec("platform_pct"))
+
+
+def has_terms(user) -> bool:
+    return user is not None and (user.buy_rate is not None or user.buy_pct is not None)
+
+
 def order_rate_cap(rate: Decimal, platform_pct: Decimal) -> Decimal:
     """Highest order_rate at which the platform still covers the buyer: order USDT >= buyer's USDT."""
     return (rate / (1 - platform_pct / 100)).quantize(Decimal("0.01"), "ROUND_DOWN")
@@ -122,7 +149,8 @@ def human(key: str, value: str | None = None) -> str:
     kind = SPEC[key][1]
     if key in FLAGS:
         return {"receipt_images": {"1": "PDF и фото", "0": "только PDF"},
-                "log_all": {"1": "все события", "0": "только проблемы"}}[key].get(v, v)
+                "log_all": {"1": "все события", "0": "только проблемы"},
+                "signup_review": {"1": "по заявке", "0": "открыт всем"}}[key].get(v, v)
     if key == "online_minutes" and v == "0":
         return "выключено"
     if key == "adjust_approval_usdt" and Decimal(v) == 0:
@@ -196,7 +224,7 @@ def validate(key: str, raw: str) -> str:
         low = 0 if kind == "int0" else 1
         if not raw.isdigit() or not low <= int(raw) <= 1440:
             raise ValueError(f"Введите целое число от {low} до 1440")
-        if key in ("receipt_images", "log_all") and int(raw) > 1:
+        if key in FLAGS and int(raw) > 1:
             raise ValueError("Введите 1 или 0")
         return str(int(raw))
     if kind == "url":

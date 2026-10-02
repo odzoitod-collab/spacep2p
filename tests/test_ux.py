@@ -76,7 +76,9 @@ def test_setup_commands_menu(go):
         calls = [m for m in b.session.calls if type(m).__name__ == "SetMyCommands"]
         default = [c.command for c in calls[0].commands]
         assert default[:2] == ["start", "buy"] and "admin" not in default
-        assert all("admin" in [c.command for c in m.commands] for m in calls[1:]) and len(calls) == 1 + len(config.admin_ids)
+        assert [c.command for c in calls[1].commands] == ["help"]  # the community and team chats
+        assert type(calls[1].scope).__name__ == "BotCommandScopeAllGroupChats"
+        assert all("admin" in [c.command for c in m.commands] for m in calls[2:]) and len(calls) == 2 + len(config.admin_ids)
     go(fn)
 
 
@@ -139,7 +141,7 @@ def test_buyer_dispute_goes_straight_to_evidence(go):
         await b.run(msg(BUYER, "Сбер, 12:03, списание 10 000"))
         assert len((await get_deal(d.id)).dispute_files) == 1
         await b.run(cb(ADMIN, f"adv:{d.id}"))
-        assert f"amsg:{BUYER}" in b.session.buttons(ADMIN) and f"amsg:{SELLER}" in b.session.buttons(ADMIN)
+        assert f"dm:{d.id}:{BUYER}" in b.session.buttons(ADMIN) and f"dm:{d.id}:{SELLER}" in b.session.buttons(ADMIN)
     go(fn)
 
 
@@ -165,7 +167,8 @@ def test_log_chat_gets_every_deal_step(go):
         d = await create_deal(b)
         await b.run(cb(BUYER, f"dl:rc:{d.id}"), msg(BUYER, document=PDF), cb(SELLER, f"dl:ok2:{d.id}"))
         log = "\n".join(await b.deliver())
-        for part in ("Открыта: 10 000 ₽ → 94 USDT", "загрузил чек", "Завершена: 10 000 ₽"):
+        for part in ("Открыта: 10 000 ₽ → 94 USDT", "создал покупатель @u20", "загрузил чек",
+                     "Подтвердил продавец @u10 · U10 (10): 10 000 ₽"):
             assert part in log, part
         async with models.Session() as s:
             await settings.put(s, "log_all", "0")
@@ -269,7 +272,7 @@ def test_withdrawals_wait_for_xrocket_funds_and_go_out_in_order(go):
         funds["v"] = "100"
         await tasks.payout_queue(b.bot)
         assert [c[1] for c in b.rocket.cheques] == ["wd-1", "wd-2", "wd-3"]
-        assert "Чек на 5 USDT" in plain(b.session.last(BUYER))
+        assert "Чек на 4.92 USDT" in plain(b.session.last(BUYER))  # 5 − 1.5% (0.075, up to whole cents)
         async with models.Session() as s:
             assert [w.status for w in (await s.scalars(select(Withdrawal).order_by(Withdrawal.id))).all()] == ["done"] * 3
     go(fn)
@@ -310,5 +313,5 @@ def test_manual_link_in_help_and_texts(go):
         assert "https://" in plain(b.session.last(ADMIN))  # only https links
         await b.run(msg(ADMIN, "-"))
         await b.run(cb(BUYER, "info"))
-        assert url not in b.session.buttons(BUYER) and "href" not in b.session.last(BUYER)  # link removed everywhere
+        assert url not in b.session.buttons(BUYER) and url not in b.session.last(BUYER)  # link removed everywhere
     go(fn)

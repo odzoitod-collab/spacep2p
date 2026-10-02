@@ -111,8 +111,7 @@ async def poll_deposits(bot: Bot) -> None:
                 log.warning("deposit %s poll: %s", dep.id, e)
                 continue
             if st == "credited":
-                await notify(bot, dep.user_id, f"{pe('ok')} <b>Баланс пополнен на {money.usdt(dep.credit)} USDT</b>"
-                                               f" · пополнение #{dep.id}")
+                await notify(bot, dep.user_id, await wallet_handlers.deposit_done_text(s, dep))
 
 
 async def reconcile_withdrawals(bot: Bot) -> None:
@@ -162,11 +161,17 @@ async def order_timeouts(bot: Bot) -> None:
             d = await orders.cancel(s, did, "cancelled", "no_merchant")
             if d is None:
                 continue
-            events.add(s, f"deal:{d.id}", "check_timeout", f"Оператор не выдал реквизиты Bybit-ордера на "
+            events.add(s, f"deal:{d.id}", "check_timeout", ("Оператор принял Bybit-ордер, но не выдал реквизиты"
+                       if d.operator_id else "Ни один оператор не принял Bybit-ордер") + f" на "
                        f"{money.fmt(d.amount_rub)} ₽ вовремя — заявка закрыта", alert=True)
             await s.commit()
+            await order_handlers.close_offers(bot, s, d, f"Ордер по заявке #{d.id} закрыт: время вышло",
+                                              kinds=("operator",))
             await push(bot, s, d.buyer_id, d, f"Реквизиты под {money.fmt(d.amount_rub)} ₽ не успели выдать. "
                                               "Попробуйте ещё раз")
+            if d.operator_id:
+                await notify(bot, d.operator_id, f"{pe('warn')} Заявка #{d.id} закрыта: реквизиты Bybit-ордера не "
+                                                 "выданы вовремя.")
             await notify(bot, d.seller_id, f"{pe('warn')} Заявка #{d.id} закрыта: оператор не успел обработать ваш "
                                            "ордер. Отмените ордер на Bybit.")
         for did in searching:
@@ -176,7 +181,7 @@ async def order_timeouts(bot: Bot) -> None:
             events.add(s, f"deal:{d.id}", "no_merchant", f"Ордерные реквизиты на {money.fmt(d.amount_rub)} ₽ не нашлись",
                        notice=True)
             await s.commit()
-            await order_handlers.close_offers(bot, s, d, f"Заявка #{d.id} закрыта: время поиска вышло")
+            await order_handlers.close_offers(bot, s, d, f"Заявка #{d.id} {order_handlers.CLOSED['expired']}")
             await push(bot, s, d.buyer_id, d, f"Реквизиты под {money.fmt(d.amount_rub)} ₽ не нашлись. "
                                               "Попробуйте другую сумму или повторите позже")
         for did in assigned:
@@ -193,7 +198,7 @@ async def order_timeouts(bot: Bot) -> None:
                                                                       f", заморозка {money.usdt(d.seller_debit)} USDT "
                                                                       "снята."))
             await order_handlers.broadcast(bot, s, d)
-        # requests still searching reach merchants who switched on or freed their limits since the last send
+        # requests still searching reach merchants approved and chats connected since the last send
         for d in (await s.scalars(select(Deal).where(Deal.status == "searching", Deal.expires_at >= now()))).all():
             await order_handlers.broadcast(bot, s, d, first=False)
 

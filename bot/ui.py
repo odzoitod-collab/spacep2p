@@ -52,6 +52,32 @@ async def paced(call):
             await asyncio.sleep(e.retry_after)
 
 
+async def deep_link(bot: Bot, payload: str) -> str:
+    """t.me link that opens the bot with /start <payload> (A–Z, a–z, 0–9, _ and -, up to 64 characters)."""
+    return f"https://t.me/{(await bot.me()).username}?start={payload}"
+
+
+def doc_url(slug: str) -> str | None:
+    """The guide page docs_url/<slug>; "" is the API reference itself. None if no docs site is set."""
+    from bot.services import settings
+    base = settings.get("docs_url").rstrip("/")
+    return (f"{base}/{slug}" if slug else base) if base else None
+
+
+def doc(slug: str, text: str) -> str:
+    """`text` with a hidden link to a guide page (plain text if no docs site is set)."""
+    url = doc_url(slug)
+    return f'<a href="{html.escape(url, quote=True)}">{text}</a>' if url else text
+
+
+def person(u) -> str:
+    """A person in event texts (the log chat escapes them): @username · name (id)."""
+    if u is None:
+        return "—"
+    parts = [f"@{u.username}" if u.username else "", u.name or ""]
+    return " · ".join(p for p in parts if p) + f" ({u.id})" if any(parts) else str(u.id)
+
+
 def manual(text: str = "инструкции") -> str:
     """`text` with the seller manual link hidden in it (settings: manual_url); plain text if no link is set."""
     from bot.services import settings
@@ -228,12 +254,19 @@ async def _render(bot: Bot, user: User, text: str, markup: InlineKeyboardMarkup 
 
 
 async def _send_banner(bot: Bot, user: User, text: str, markup: InlineKeyboardMarkup | None) -> Message:
+    return await send_banner(bot, user.id, text, markup)
+
+
+async def send_banner(bot: Bot, chat: int, text: str, markup: InlineKeyboardMarkup | None,
+                      silent: bool = True) -> Message:
+    """The banner (silent animation or picture) with `text` as its caption; uploaded once, then sent by file_id.
+    The caller holds _upload while the banner is not uploaded yet."""
     global _banner_id
     path = banner_path()
     animated = path.suffix.lower() in ANIMATION
     send = bot.send_animation if animated else bot.send_photo
-    m = await safe_text(lambda t: send(user.id, _banner_id or FSInputFile(path), caption=t, reply_markup=markup,
-                                       disable_notification=True), text)
+    m = await safe_text(lambda t: send(chat, _banner_id or FSInputFile(path), caption=t, reply_markup=markup,
+                                       disable_notification=silent), text)
     if not _banner_id:
         media = m.animation or m.video or m.document if animated else (m.photo[-1] if m.photo else None)
         _banner_id = media.file_id if media else None

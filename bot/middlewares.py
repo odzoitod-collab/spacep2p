@@ -27,6 +27,11 @@ def banned_text(user: User) -> str:
     ])
 
 
+def let_in(user: User, uid: int) -> bool:
+    """May use the bot: entry is open, he was approved, or he is an admin (handlers.signup)."""
+    return uid in config.admin_ids or user.access == "approved" or settings.get("signup_review") != "1"
+
+
 def _touch(user: User, tg) -> None:
     user.username = tg.username
     user.name = (tg.full_name or "")[:128]
@@ -61,7 +66,7 @@ class Context(BaseMiddleware):
         if event.inline_query is not None:  # inline search (deals, operations): no screen, just results
             async with Session() as s:
                 user = await s.get(User, tg.id)
-                if user is None or (user.is_banned and tg.id not in config.admin_ids):
+                if user is None or (user.is_banned and tg.id not in config.admin_ids) or not let_in(user, tg.id):
                     with suppress(TelegramAPIError):
                         await event.inline_query.answer([], cache_time=0, is_personal=True)
                     return None
@@ -70,12 +75,15 @@ class Context(BaseMiddleware):
                 await s.commit()
                 return result
         if msg is not None and msg.chat.type != "private":
-            # groups (the log chat): screens and dialogs live only in the private chat; the one exception is an
-            # admin's /setts that sets up the log chat right from the group
-            if tg.id not in config.admin_ids or not (msg.text or "").startswith("/setts"):
+            # groups (the log chat, community and team chats): screens and dialogs live only in the private chat;
+            # the exceptions are an admin's /setts (sets up the log chat), a team leader's /team (connects his chat)
+            # and /help (the guides) for anyone
+            cmd = ((msg.text or "").split() or [""])[0].lower()
+            if not ((cmd == "/setts" or cmd.startswith("/setts@")) and tg.id in config.admin_ids) \
+                    and cmd.split("@")[0] not in ("/team", "/help"):
                 return None
             async with Session() as s:
-                data.update(s=s, is_admin=True)
+                data.update(s=s, is_admin=tg.id in config.admin_ids)
                 result = await handler(event, data)
                 await s.commit()
                 return result
@@ -106,6 +114,8 @@ class Context(BaseMiddleware):
                 _touch(user, tg)
                 await s.commit()
                 return None
+            if user.access in (None, "new") and settings.get("signup_review") != "1":  # None: not flushed yet
+                user.access = "approved"  # entry is open: nobody waits (and nobody is locked out if it closes later)
             data.update(s=s, user=user, is_admin=is_admin)
             old_screen = user.ui_msg_id
             if msg and not answered_prompt:

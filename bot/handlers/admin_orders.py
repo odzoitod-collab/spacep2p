@@ -1,5 +1,5 @@
-"""Admin panel: order merchants — applications (approve / reject with a reason), suspend / resume, work mode
-(Bybit order / balance), open requests."""
+"""Admin panel: order merchants — applications (approve / reject with a reason), suspend / resume, open requests.
+Merchants have no limits and no mode: every request goes to all of them, each picks Bybit order or balance."""
 from decimal import Decimal
 
 from aiogram import Bot, F, Router
@@ -32,15 +32,14 @@ async def cb_home(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User, state
     rows = (await s.scalars(select(OrderMerchant).order_by(
         (OrderMerchant.status == "pending").desc(), OrderMerchant.created_at.desc()).limit(30))).all()
     searching = await s.scalar(select(func.count(Deal.id)).where(Deal.status.in_(orders.REQUEST)))
-    accepting = sum(1 for m in rows if m.status == "approved" and m.accepting)
+    working = sum(1 for m in rows if m.status == "approved")
     await show(bot, user, "\n".join([
         title(pe("key"), "Ордерные мерчанты"),
-        "",
-        quote(f"{pe('live')} Принимают заявки сейчас: <b>{accepting}</b>",
-              f"{pe('search')} Заявок ищут реквизиты: <b>{searching}</b>"),
+        quote(f"• Работают (получают все заявки): <b>{working}</b>",
+              f"• Заявок ищут реквизиты: <b>{searching}</b>",
+              f"• Курс ордерного мерчанта: <b>{money.fmt(settings.dec('order_rate'))} ₽</b>"),
         "Анкеты на рассмотрении — сверху.",
-    ]), kb(*[btn(f"{STATUS[m.status]} · {m.user_id} · {orders.MODES[m.mode]} · {money.fmt(m.min_rub)}–"
-                 f"{money.fmt(m.max_rub)} ₽",
+    ]), kb(*[btn(f"{STATUS[m.status]} · {m.user_id} · {m.banks[:24]}",
                  f"aom:{m.user_id}", "pencil" if m.status == "pending" else "key",
                  style="primary" if m.status == "pending" else None) for m in rows],
            btn("Заявки в поиске", "adl:search", "search") if searching else None,
@@ -53,33 +52,29 @@ async def merchant_card(bot: Bot, s: AsyncSession, admin: User, m: OrderMerchant
         Deal.seller_id == m.user_id, Deal.is_order, Deal.status == "completed"))).one()
     disputes = await s.scalar(select(func.count(Deal.id)).where(Deal.seller_id == m.user_id, Deal.is_order,
                                                                 Deal.dispute_reason.is_not(None)))
+    bybit_n = await s.scalar(select(func.count(Deal.id)).where(Deal.seller_id == m.user_id, Deal.via_bybit,
+                                                               Deal.status == "completed"))
     await show(bot, admin, "\n".join([
         title(pe("key"), f"Ордерный мерчант · {STATUS[m.status]}"),
-        "",
-        quote(f"{pe('profile')} {esc(u.name or '—')} @{esc(u.username or '—')} (<code>{u.id}</code>)"
+        "<b>Кто</b>",
+        quote(f"• {esc(u.name or '—')} @{esc(u.username or '—')} (<code>{u.id}</code>)"
               + (" · ЗАБАНЕН" if u.is_banned else ""),
-              f"{pe('search')} Источник: {esc(m.source)}",
-              f"{pe('clock')} Скорость выдачи: {esc(m.speed)}",
-              f"{pe('shop')} Режим: <b>{orders.MODES[m.mode]}</b>"
-              + (" — без баланса, ссылка на ордер → оператор" if m.mode == "bybit" else " — заморозка USDT")
-              + f" · курс {money.fmt(settings.dec('order_rate'))} ₽",
-              f"{pe('bank')} Банки: {esc(m.banks)}",
-              f"{pe('ruble')} Заявки: {money.fmt(m.min_rub)}–{money.fmt(m.max_rub)} ₽ · в работе до "
-              f"{money.fmt(m.max_open_rub)} ₽",
-              f"{pe('wallet')} Баланс: {money.usdt(u.balance)} USDT · в работе сейчас "
-              f"{money.fmt(await orders.open_rub(s, u.id))} ₽",
-              f"{pe('stats')} Выполнено {done_n} на {money.fmt(Decimal(done_rub))} ₽ · споров {disputes}",
-              f"{pe('clock')} Анкета {at(m.created_at, 'dt')}"
+              f"• Источник: {esc(m.source)}",
+              f"• Скорость выдачи: {esc(m.speed)}",
+              f"• Банки: {esc(m.banks)}"),
+        "<b>Работа</b>",
+        quote(f"• Курс: {money.fmt(settings.dec('order_rate'))} ₽ · заявки приходят все, режим выбирает при взятии",
+              f"• Баланс: {money.usdt(u.balance)} USDT · в работе сейчас {money.fmt(await orders.open_rub(s, u.id))} ₽",
+              f"• Выполнено: {done_n} на {money.fmt(Decimal(done_rub))} ₽ (Bybit-ордером {bybit_n}) · споров {disputes}",
+              f"• Анкета {at(m.created_at, 'dt')}"
               + (f" · решение {at(m.decided_at, 'dt')} (<code>{m.admin_id}</code>)" if m.decided_at else "")),
-        esc(m.about) if m.about else "",
+        f"<b>О себе</b>\n{esc(m.about)}" if m.about else "",
         f"Причина отказа: <i>{esc(m.reason)}</i>" if m.reason else "",
     ]) + note, kb(
         [btn("Одобрить", f"aom:ok:{m.user_id}", "ok", style="success"),
          btn("Отклонить", f"aom:no:{m.user_id}", "cross", style="danger")] if m.status == "pending" else None,
         btn("Приостановить", f"aom:st:{m.user_id}:0", "pause", style="danger") if m.status == "approved" else None,
         btn("Возобновить", f"aom:st:{m.user_id}:1", "ok", style="success") if m.status == "suspended" else None,
-        btn("Режим: с баланса" if m.mode == "bybit" else "Режим: Bybit-ордер", f"aom:md:{m.user_id}",
-            "lock" if m.mode == "bybit" else "shop") if m.status in ("approved", "suspended") else None,
         [btn("Профиль", f"auv:{m.user_id}", "profile"), btn("История", f"aev:om:{m.user_id}", "list")],
         back("aoml", "Ордерные мерчанты")), src)
 
@@ -97,13 +92,15 @@ async def cb_approve(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User):
     m = await s.get(OrderMerchant, int(c.data.split(":")[2]), with_for_update=True, populate_existing=True)
     if not m or m.status != "pending":
         return await c.answer("Анкета уже рассмотрена", show_alert=True)
-    m.status, m.admin_id, m.decided_at, m.accepting = "approved", user.id, now(), True
+    m.status, m.admin_id, m.decided_at = "approved", user.id, now()
     audit.log(s, user.id, "om_approve", f"om:{m.user_id}")
     events.add(s, f"om:{m.user_id}", "approved", f"Анкета одобрена ({user.name})", m.user_id, alert=True)
     await s.commit()
-    await notify(bot, m.user_id, f"{pe('ok')} <b>Вы — ордерный мерчант Strait Pay.</b> Приём заявок включён: они будут "
-                                 "приходить в этот чат с кнопкой «Взять». Режим — Bybit-ордер: баланс не нужен, на заявку "
-                                 "присылаете ссылку на ордер. Работать с баланса и лимиты — в кабинете.",
+    await notify(bot, m.user_id, "\n".join([
+        f"{pe('ok')} <b>Вы — ордерный мерчант Strait Pay</b>",
+        "• Все заявки покупателей приходят в этот чат и в чаты сообщества",
+        "• «Взять · Bybit-ордер» — баланс не нужен, присылаете ссылку на ордер",
+        "• «Взять · с баланса» — замораживаем ваши USDT, реквизиты выдаёте сами"]),
                  kb(btn("Открыть кабинет", "om", "key", style="success"), back("x", "Скрыть", "cross")))
     await merchant_card(bot, s, user, m, c, ok("Одобрена, мерчант уведомлён"))
 
@@ -136,21 +133,6 @@ async def msg_reject(m: Message, bot: Bot, s: AsyncSession, user: User, state: F
     await merchant_card(bot, s, user, om, note=ok("Отклонена, заявитель уведомлён"))
 
 
-@router.callback_query(F.data.regexp(r"^aom:md:(\d+)$"))
-async def cb_mode(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User):
-    m = await s.get(OrderMerchant, int(c.data.split(":")[2]), with_for_update=True, populate_existing=True)
-    if not m or m.status not in ("approved", "suspended"):
-        return await c.answer()
-    m.mode = "balance" if m.mode == "bybit" else "bybit"
-    audit.log(s, user.id, "om_mode", f"om:{m.user_id}", m.mode)
-    events.add(s, f"om:{m.user_id}", "mode", f"Режим ордерного мерчанта: {orders.MODES[m.mode]} ({user.name})",
-               m.user_id, alert=True)
-    await s.commit()
-    await notify(bot, m.user_id, f"{pe('key')} Администрация переключила ваш режим ордерного мерчанта: "
-                                 f"<b>{orders.MODES[m.mode]}</b>. Взятые заявки доработают как начаты.")
-    await merchant_card(bot, s, user, m, c, ok(f"Режим: {orders.MODES[m.mode]}"))
-
-
 @router.callback_query(F.data.regexp(r"^aom:st:(\d+):([01])$"))
 async def cb_status(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User):
     _, _, uid, on = c.data.split(":")
@@ -158,7 +140,6 @@ async def cb_status(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User):
     if not m or m.status not in ("approved", "suspended"):
         return await c.answer()
     m.status = "approved" if on == "1" else "suspended"
-    m.accepting = m.accepting and m.status == "approved"
     what = "возобновлён" if on == "1" else "приостановлен"
     audit.log(s, user.id, "om_status", f"om:{uid}", what)
     events.add(s, f"om:{uid}", "status", f"Ордерный мерчант {what} ({user.name})", m.user_id, alert=True)

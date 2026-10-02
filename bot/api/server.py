@@ -11,6 +11,7 @@ from aiohttp import web
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 
+from bot.api import docs as guides_site
 from bot.config import config
 from bot.handlers.deal import accept_receipt, log as deal_log, on_deal_created, push, send_to_seller
 from bot.models import Card, Deal, OrderMerchant, Session, User
@@ -113,6 +114,14 @@ async def index(request: web.Request) -> web.Response:
 
 
 async def docs(request: web.Request) -> web.Response:
+    """The API reference and the guides as HTML pages (bot/api/docs.py); /docs.md is the raw API reference."""
+    page = guides_site.guide(request.match_info.get("slug", ""))
+    if page is None:
+        raise web.HTTPNotFound(text="Нет такой инструкции. Все инструкции: /docs/help")
+    return web.Response(text=page, content_type="text/html", charset="utf-8")
+
+
+async def docs_raw(request: web.Request) -> web.Response:
     return web.Response(text=DOCS.read_text(encoding="utf-8"), content_type="text/markdown", charset="utf-8")
 
 
@@ -150,19 +159,18 @@ async def liquidity(request: web.Request) -> web.Response:
         lo, hi = max(lo, client.min_rub), min(hi, client.max_rub)
         if lo <= hi:
             ranges.append({"min_rub": str(lo), "max_rub": str(hi), "bank": card.bank, "type": card.kind})
-    # order merchants on duty: a request for any amount in their ranges is likely to be taken
-    om = (await s.execute(select(func.count(OrderMerchant.user_id), func.min(OrderMerchant.min_rub),
-                                 func.max(OrderMerchant.max_rub)).where(
-        OrderMerchant.status == "approved", OrderMerchant.accepting, OrderMerchant.user_id != owner.id))).one()
-    lo = max(Decimal(om[1] or 0), settings.dec("order_min_rub"), client.min_rub)
-    hi = min(Decimal(om[2] or 0), settings.dec("order_max_rub"), client.max_rub)
-    on = bool(om[0]) and lo <= hi
+    # order merchants get every request, whatever the amount: any amount in the order range can be requested
+    om = await s.scalar(select(func.count(OrderMerchant.user_id)).where(
+        OrderMerchant.status == "approved", OrderMerchant.user_id != owner.id))
+    lo = max(settings.dec("order_min_rub"), client.min_rub).quantize(Decimal("0.01"))
+    hi = min(settings.dec("order_max_rub"), client.max_rub).quantize(Decimal("0.01"))
+    on = bool(om) and lo <= hi
     return web.json_response({
         "available": bool(ranges), "offers": len(ranges),
         "min_rub": str(min(Decimal(r["min_rub"]) for r in ranges)) if ranges else None,
         "max_rub": str(max(Decimal(r["max_rub"]) for r in ranges)) if ranges else None,
         "ranges": ranges,
-        "order_requisites": {"available": on, "merchants": om[0], "min_rub": str(lo) if on else None,
+        "order_requisites": {"available": on, "merchants": om, "min_rub": str(lo) if on else None,
                              "max_rub": str(hi) if on else None},
     })
 
@@ -378,6 +386,8 @@ def build_app(bot: Bot) -> web.Application:
     app[BOT] = bot
     app.router.add_get("/", index)
     app.router.add_get("/docs", docs)
+    app.router.add_get("/docs.md", docs_raw)
+    app.router.add_get("/docs/{slug:[a-z]+}", docs)
     app.router.add_get("/v1/me", me)
     app.router.add_get("/v1/balance", balance)
     app.router.add_get("/v1/rates", rates)

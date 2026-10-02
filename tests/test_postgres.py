@@ -198,3 +198,35 @@ def test_migrated_schema_equals_fresh_schema():
         migrated = await columns()
         assert fresh == migrated, fresh ^ migrated
     pg(fn)
+
+
+def test_migration_14_keeps_merchants_and_drops_their_limits():
+    """A database of the previous release (order merchants with limits, an on/off switch and a mode) upgrades:
+    the rows stay, the old columns go, the new tables and columns appear."""
+    async def fn():
+        async with models.engine.begin() as conn:
+            await conn.execute(text("DELETE FROM schema_version WHERE version = 14"))
+            await conn.execute(text("ALTER TABLE order_merchants ADD COLUMN min_rub NUMERIC(14, 2) NOT NULL DEFAULT 5000, "
+                                    "ADD COLUMN max_rub NUMERIC(14, 2) NOT NULL DEFAULT 100000, "
+                                    "ADD COLUMN max_open_rub NUMERIC(14, 2) NOT NULL DEFAULT 200000, "
+                                    "ADD COLUMN accepting BOOLEAN NOT NULL DEFAULT true, "
+                                    "ADD COLUMN mode VARCHAR(8) NOT NULL DEFAULT 'bybit'"))
+            for table, column in (("order_offers", "kind"), ("users", "buy_rate"), ("users", "buy_pct"),
+                                  ("users", "team_id"), ("deals", "team_id"), ("deals", "team_fee"),
+                                  ("deposits", "purpose")):
+                await conn.execute(text(f"ALTER TABLE {table} DROP COLUMN {column}"))
+            await conn.execute(text("DROP TABLE operators, teams"))
+            await conn.execute(text("INSERT INTO users (id, name, balance, frozen, is_banned, is_online, last_seen, "
+                                    "created_at, quiet) VALUES (7, 'm', 0, 0, false, false, now(), now(), false)"))
+            await conn.execute(text("INSERT INTO order_merchants (user_id, status, source, speed, banks, about, "
+                                    "pay_minutes, created_at) VALUES (7, 'approved', 's', '5', 'Сбер', '', 15, now())"))
+        await models.engine.dispose()
+        await models.init_db(harness.PG)
+        async with models.engine.connect() as conn:
+            cols = set((await conn.execute(text("SELECT column_name FROM information_schema.columns WHERE "
+                                                "table_name = 'order_merchants'"))).scalars())
+            assert not cols & {"min_rub", "max_rub", "max_open_rub", "accepting", "mode"}
+            assert await conn.scalar(text("SELECT status FROM order_merchants WHERE user_id = 7")) == "approved"
+            assert await conn.scalar(text("SELECT to_regclass('operators')")) is not None
+            assert await conn.scalar(text("SELECT count(*) FROM schema_version WHERE version = 14")) == 1
+    pg(fn)

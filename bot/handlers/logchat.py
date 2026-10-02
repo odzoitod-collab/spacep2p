@@ -22,8 +22,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.config import config
 from bot.emoji import back, btn, kb
-from bot.models import (Adjustment, ApiApplication, ApiClient, Card, Deal, Deposit, Event, LogMessage, OrderMerchant,
-                        Setting, Ticket, User, Withdrawal, now)
+from bot.models import (Adjustment, ApiApplication, ApiClient, Card, Deal, Deposit, Event, LogMessage, Operator,
+                        OrderMerchant, Setting, Team, Ticket, User, Withdrawal, now)
 from bot.services import events, money, xrocket
 from bot.ui import at, clean, esc, paced
 
@@ -32,9 +32,13 @@ log = logging.getLogger(__name__)
 # key -> (topic title, icon colour; Telegram allows only these six)
 TOPICS = {
     "attention": ("⚠️ Требует внимания", 16478047),
+    "signups": ("📝 Заявки на вход", 16749490),
     "stats": ("📊 Статистика и финансы", 9367192),
     "deals": ("💱 Сделки", 7322096),
     "orders": ("🧾 Ордерные реквизиты", 13338331),
+    "bybit": ("🟣 Bybit-ордера", 13338331),
+    "operators": ("🧑‍💻 Операторы и долги", 16766590),
+    "teams": ("🫂 Команды и тимлиды", 9367192),
     "deposits": ("📥 Пополнения", 9367192),
     "withdrawals": ("📤 Выводы", 16766590),
     "api": ("🔑 API: заявки и клиенты", 13338331),
@@ -47,14 +51,21 @@ TOPICS = {
     "service": ("⚙️ Сервис", 16478047),
 }
 KIND_TOPIC = {"wd": "withdrawals", "dep": "deposits", "apa": "api", "apc": "api", "om": "om", "user": "users",
-              "card": "cards", "adj": "adjust", "ticket": "tickets", "app": "service"}
+              "card": "cards", "adj": "adjust", "ticket": "tickets", "app": "service", "op": "operators",
+              "team": "teams"}
 ABOUT = {
+    "signups": "Заявки новых пользователей: кто (P2P-продавец или покупатель), оборот в день, скриншот. "
+               "Одобрить или отклонить — кнопками прямо здесь.",
     "attention": "Всё, что ждёт решения администратора: споры, отказы xRocket, выводы на проверке, новые анкеты и "
                  "заявки, нехватка газа. Эту ветку стоит держать со звуком.",
     "stats": "Одно живое сообщение: сколько денег на xRocket, сколько должны пользователям, прибыль и сколько "
              "можно забрать. Обновляется каждые 10 минут.",
     "deals": "Сделки по статичным картам: одна карточка на сделку, статус меняется по ходу.",
-    "orders": "Сделки по ордерным реквизитам: поиск мерчанта, выдача реквизитов, оплата, итог.",
+    "orders": "Ордерные заявки с баланса мерчанта: поиск, выдача реквизитов, оплата, итог.",
+    "bybit": "Ордерные заявки через Bybit-ордер: ссылка мерчанта, кто из операторов принял, реквизиты, оплата.",
+    "operators": "Операторы: назначение, долг за принятые Bybit-ордера и его погашение (счёт xRocket, баланс, "
+                 "вручную).",
+    "teams": "Команды: заявки тимлидов, участники по реферальным ссылкам, процент тимлида со сделок.",
     "deposits": "Пополнения через xRocket: счета и адреса в сетях (сумма, комиссия, зачислено).",
     "withdrawals": "Выводы через xRocket: чеки и переводы на кошельки в сетях — от запроса до выполнения.",
     "api": "Заявки на Strait Pay API и API-клиенты: одобрение, токены, приостановка.",
@@ -131,11 +142,17 @@ def _thread_gone(e: Exception) -> bool:
     return isinstance(e, TelegramBadRequest) and ("thread" in text or "topic" in text)
 
 
-async def post(bot: Bot, s: AsyncSession, chat: int, key: str, text: str, markup, silent: bool):
-    """Send into a topic; if an admin deleted the topic, create it again once."""
+async def post(bot: Bot, s: AsyncSession, chat: int, key: str, text: str, markup, silent: bool,
+               media: str | None = None):
+    """Send into a topic; if an admin deleted the topic, create it again once. media: a file to send with `text` as
+    its caption — "photo:<file_id>" or a document's file_id."""
     for attempt in range(2):
         tid = await thread(bot, s, chat, key)
         try:
+            if media:
+                send = bot.send_photo if media.startswith("photo:") else bot.send_document
+                return await paced(lambda: send(chat, media.removeprefix("photo:"), caption=text, reply_markup=markup,
+                                                message_thread_id=tid, disable_notification=silent))
             return await paced(lambda: bot.send_message(chat, text, reply_markup=markup, message_thread_id=tid,
                                                         disable_notification=silent, disable_web_page_preview=True))
         except TelegramBadRequest as e:
@@ -184,11 +201,13 @@ async def describe(s: AsyncSession, ref: str) -> tuple[str, str, str, list[str]]
     if kind == "app":
         return ("chat" if oid in ("chat", "broadcast") else "service"), "attention", "сервис", []
     model = {"deal": Deal, "wd": Withdrawal, "dep": Deposit, "apa": ApiApplication, "apc": ApiClient,
-             "om": OrderMerchant, "ticket": Ticket, "adj": Adjustment, "user": User, "card": Card}.get(kind)
+             "om": OrderMerchant, "ticket": Ticket, "adj": Adjustment, "user": User, "card": Card, "op": Operator,
+             "team": Team}.get(kind)
     obj = await s.get(model, int(oid)) if model and oid.isdigit() else None
     if obj is None:
         return topic, "unknown", "", []
-    uids = {getattr(obj, a, None) for a in ("buyer_id", "seller_id", "operator_id", "user_id", "admin_id")}
+    uids = {getattr(obj, a, None) for a in ("buyer_id", "seller_id", "operator_id", "user_id", "admin_id",
+                                            "leader_id", "added_by")}
     names = {uid: await who(s, uid) for uid in uids if uid}
     u = lambda label, uid: f"{label}: {names.get(uid, '—')}"  # noqa: E731
     if kind == "deal":
@@ -202,16 +221,20 @@ async def describe(s: AsyncSession, ref: str) -> tuple[str, str, str, list[str]]
                  f"Мерчант отдаёт: {money.usdt(obj.seller_debit)} USDT" + (
                      f" по {money.fmt(obj.merchant_rate)} ₽" if obj.merchant_rate else f" · {money.fmt(obj.seller_pct, 3)}%"),
                  f"Доход площадки: {money.usdt(obj.platform_fee)} USDT",
-                 u("Покупатель", obj.buyer_id)]
-        if obj.seller_id:
-            facts.append(u("Мерчант", obj.seller_id))
-        if obj.via_bybit and obj.operator_id:
-            facts.append(u("Оператор", obj.operator_id))
+                 u("Создал (покупатель)", obj.buyer_id),
+                 u("Принял (мерчант)", obj.seller_id) if obj.seller_id else "Принял (мерчант): ещё никто"]
+        if obj.via_bybit:
+            facts.append(u("Оператор", obj.operator_id) if obj.operator_id else "Оператор: не назначен")
         if card:
             facts.append(f"Реквизиты: {_mask(card)}")
         if obj.sender_bank:
             facts.append(f"Банк покупателя: {esc(obj.sender_bank)}")
-        return ("orders" if obj.is_order else "deals"), obj.status, DEAL_STATUS[obj.status][1], facts
+        if obj.bybit_url:
+            facts.append(f'Ордер Bybit: <a href="{esc(obj.bybit_url)}">{esc(obj.bybit_url[:50])}</a>')
+        if obj.team_fee:
+            facts.append(f"Тимлиду: {money.usdt(obj.team_fee)} USDT (команда #{obj.team_id})")
+        topic = "bybit" if obj.via_bybit else "orders" if obj.is_order else "deals"
+        return topic, obj.status, DEAL_STATUS[obj.status][1], facts
     if kind == "wd":
         where = (f"{xrocket.net_name(obj.network)} · <code>{esc(obj.address or '—')}</code>" if obj.method == "chain"
                  else "чек xRocket")
@@ -219,6 +242,10 @@ async def describe(s: AsyncSession, ref: str) -> tuple[str, str, str, list[str]]
             u("Пользователь", obj.user_id), f"Способ: {where}",
             f"Списано: <b>{money.usdt(obj.amount)} USDT</b> · комиссия {money.usdt(obj.fee)}",
             f"К получению: <b>{money.usdt(obj.amount - obj.fee)} USDT</b>"]
+    if kind == "dep" and obj.purpose == "debt":
+        return "operators", obj.status, DEP_LABEL.get(obj.status, obj.status), [
+            u("Оператор", obj.user_id), "Назначение: погашение долга за Bybit-ордера",
+            f"Счёт: <b>{money.usdt(obj.amount)} USDT</b>" + (" · оплачен" if obj.status == "paid" else "")]
     if kind == "dep":
         how = f"адрес {xrocket.net_name(obj.network)}" if obj.address else "счёт xRocket"
         return topic, obj.status, DEP_LABEL.get(obj.status, obj.status), [
@@ -236,8 +263,7 @@ async def describe(s: AsyncSession, ref: str) -> tuple[str, str, str, list[str]]
             f"{money.fmt(obj.pct, 3) + '%' if obj.pct is not None else 'общий %'}"]
     if kind == "om":
         return topic, obj.status, OM_STATUS[obj.status], [
-            u("Мерчант", obj.user_id), f"Режим: {'Bybit-ордер' if obj.mode == 'bybit' else 'баланс'}",
-            f"Заявки: {money.fmt(obj.min_rub)}–{money.fmt(obj.max_rub)} ₽ · в работе до {money.fmt(obj.max_open_rub)} ₽",
+            u("Мерчант", obj.user_id), f"Источник: {esc(obj.source)}", f"Скорость: {esc(obj.speed)}",
             f"Банки: {esc(obj.banks)}"]
     if kind == "ticket":
         return topic, obj.status, TICKET_STATUS[obj.status], [
@@ -252,6 +278,16 @@ async def describe(s: AsyncSession, ref: str) -> tuple[str, str, str, list[str]]
         return topic, code, "заблокирован" if obj.is_banned else "активен", [
             f"Пользователь: {await who(s, obj.id)}",
             f"Баланс: {money.usdt(obj.balance)} USDT · в сделках {money.usdt(obj.frozen)}"]
+    if kind == "op":
+        code = "active" if obj.active else "off"
+        return topic, code, "активен" if obj.active else "не оператор", [
+            u("Оператор", obj.user_id), f"Долг: <b>{money.usdt(obj.debt)} USDT</b>"]
+    if kind == "team":
+        from bot.services import teams
+        return topic, obj.status, teams.STATUS[obj.status], [
+            f"Команда: <b>{esc(obj.name)}</b>", u("Тимлид", obj.leader_id),
+            f"Участников: {await teams.members(s, obj)} · процент тимлида {money.fmt(teams.pct(obj), 3)}%",
+            f"Чат: <code>{obj.chat_id}</code>" if obj.chat_id else "Чат: не подключён"]
     if kind == "card":
         code = "deleted" if obj.is_deleted else "banned" if obj.is_banned else "active" if obj.is_active else "off"
         label = {"deleted": "удалена", "banned": "заблокирована", "active": "включена", "off": "выключена"}[code]
@@ -276,12 +312,14 @@ async def render(s: AsyncSession, ref: str, attention: bool) -> tuple[str, str, 
     else:
         name, cb = REF_NAMES.get(kind, ("Событие", ""))
         head = f"{badge} <b>{name} #{oid}</b>" + (f" · {label}" if label else "")
+        if kind == "deal":
+            head += f" · /deal {oid}"
         markup = kb(btn("Открыть", f"{cb}:{oid}", "search")) if cb else None
     if attention:
         head += " · <b>нужно внимание</b>"
     rows = (await s.scalars(select(Event).where(Event.ref == ref).order_by(Event.id.desc()).limit(TIMELINE))).all()
-    timeline = [f"{at(e.created_at)} · {esc(e.text[:300])}" for e in reversed(rows)]
-    text = "\n".join([head, "", *facts, *(["", "<b>История</b>", *timeline] if timeline else [])])
+    timeline = [f"• {at(e.created_at)} · {esc(e.text[:300])}" for e in reversed(rows)]
+    text = "\n".join([head, "", *[f"• {f}" for f in facts], *(["", "<b>История</b>", *timeline] if timeline else [])])
     return topic, clean(text)[:3900], markup
 
 

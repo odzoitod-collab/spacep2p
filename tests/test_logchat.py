@@ -58,7 +58,7 @@ def test_forum_topics_and_live_cards(go, monkeypatch):
             s.add(Card(user_id=SELLER, kind="card", bank="Т-Банк", requisites="5536913812345672", holder="Иванов Иван",
                        min_rub=1000, max_rub=5000, is_active=True))
             await s.commit()
-        await b.run(msg(30, "/start"), cb(30, "bc:2"), msg(30, "2000"))
+        await b.run(msg(30, "/start"), cb(30, "buy:0"), msg(30, "2000"))
         go_btn = next(x for x in b.session.buttons(30) if x and x.startswith("bgo:"))
         await b.run(cb(30, go_btn))
         await b.deliver()

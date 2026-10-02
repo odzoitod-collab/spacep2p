@@ -15,7 +15,7 @@ from bot.emoji import back, btn, kb, pe
 from bot.models import Card, Deal, User, now
 from bot.handlers.seller import mask, parse_rub
 from bot.services import audit, deals, events, money, settings
-from bot.ui import at, clean, esc, notify, ok, quote, show, title, warn
+from bot.ui import at, clean, esc, notify, ok, person, quote, show, title, warn
 
 router = Router()
 
@@ -315,7 +315,8 @@ def deal_kb(d: Deal, viewer_id: int, card: Card | None = None):
             rows.append(btn("Показать чек", f"dl:pdf:{d.id}", "doc"))
     elif d.status == "waiting_payment":
         rows.append(btn("Обновить", f"dl:{d.id}", "refresh"))
-    rows.append([btn("Мои сделки", inline="сделки "), back("menu", "В меню")])
+    rows.append([btn("Написать", f"dmc:{d.id}", "support"), btn("Мои сделки", inline="сделки ")])
+    rows.append(back("menu", "В меню"))
     return kb(*rows)
 
 
@@ -529,7 +530,7 @@ async def accept_receipt(s: AsyncSession, d: Deal, buyer: User, fid: str, unique
     paid.receipt_unique_id = unique
     reused = await s.scalar(select(Deal.id).where(Deal.receipt_unique_id == unique, Deal.id != paid.id)
                             .order_by(Deal.id).limit(1))
-    log(s, paid, "paid", f"Покупатель {buyer.id} загрузил чек на {money.fmt(paid.amount_rub)} ₽"
+    log(s, paid, "paid", f"Покупатель {person(buyer)} загрузил чек на {money.fmt(paid.amount_rub)} ₽"
         + (" после срока оплаты" if late else "") + (" (через API)" if paid.api_client_id else "")
         + ", ждём продавца", notice=True)
     if reused:
@@ -586,7 +587,7 @@ async def cb_cancel2(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User):
     d = await deals.cancel(s, d.id, ("waiting_payment",))
     if not d:
         return await c.answer("Сделку уже нельзя отменить", show_alert=True)
-    log(s, d, "cancelled", f"Покупатель отменил сделку на {money.fmt(d.amount_rub)} ₽", notice=True)
+    log(s, d, "cancelled", f"Покупатель {person(user)} отменил сделку на {money.fmt(d.amount_rub)} ₽", notice=True)
     await s.commit()
     await deal_screen(bot, s, user, d, c, note=ok("Сделка отменена"))
     for uid in deals.sellers(d):
@@ -668,7 +669,8 @@ async def cb_confirm2(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User):
     d = await deals.complete(s, d.id, frm=("paid",))
     if not d:
         return await c.answer("Сделка уже изменена", show_alert=True)
-    log(s, d, "completed", f"Завершена{f' оператором {user.id}' if d.via_bybit else ''}: {money.fmt(d.amount_rub)} ₽, "
+    log(s, d, "completed", f"Подтвердил {'оператор' if d.via_bybit else 'продавец'} {person(user)}: "
+                           f"{money.fmt(d.amount_rub)} ₽, "
                            f"покупателю {money.usdt(d.buyer_credit)} USDT, площадке {money.usdt(d.platform_fee)} USDT",
         notice=True)
     await s.commit()
@@ -983,10 +985,13 @@ async def dispute_text(s: AsyncSession, d: Deal) -> str:
 
 def dispute_kb(d: Deal, *extra):
     seller = d.seller_id is not None
+    operator = d.operator_id if d.via_bybit else None
     people = [[btn("Покупатель", f"auv:{d.buyer_id}", "profile"),
-               btn("Продавец", f"auv:{d.seller_id}", "profile") if seller else None],
-              [btn("Написать покупателю", f"amsg:{d.buyer_id}", "support"),
-               btn("Написать продавцу", f"amsg:{d.seller_id}", "support") if seller else None]]
+               btn("Мерчант", f"auv:{d.seller_id}", "profile") if seller else None],
+              btn("Оператор", f"auv:{operator}", "profile") if operator else None,
+              [btn("Написать покупателю", f"dm:{d.id}:{d.buyer_id}", "support") if not d.api_client_id else None,
+               btn("Написать мерчанту", f"dm:{d.id}:{d.seller_id}", "support") if seller else None],
+              btn("Написать оператору", f"dm:{d.id}:{operator}", "support") if operator else None]
     files = btn("Чек и файлы", f"af:{d.id}", "clip")
     if d.status in deals.UNPAID:
         return kb(btn("Отменить сделку", f"ar:{d.id}:c", "cross", style="danger"), *people, *extra)

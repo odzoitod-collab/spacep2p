@@ -3,7 +3,7 @@ gives for any network it supports, withdrawals by a personal cheque or to an ext
 import logging
 import re
 from datetime import datetime, timedelta
-from decimal import ROUND_DOWN, Decimal
+from decimal import ROUND_DOWN, ROUND_UP, Decimal
 from uuid import uuid4
 
 from aiogram import Bot, F, Router
@@ -15,8 +15,8 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.emoji import back, btn, kb, pe
-from bot.models import Deposit, Ledger, User, Withdrawal, now
-from bot.services import events, money, settings, xrocket
+from bot.models import Deposit, Ledger, Operator, User, Withdrawal, now
+from bot.services import events, money, operators, settings, xrocket
 from bot.ui import at, esc, notify, ok, quote, show, title, warn
 
 log = logging.getLogger(__name__)
@@ -24,8 +24,9 @@ router = Router()
 
 KINDS = {
     "deposit": "Пополнение", "ton_deposit": "Пополнение USDT TON", "withdraw": "Вывод", "withdraw_refund": "Возврат вывода",
-    "deal_buy": "Покупка", "deal_sell": "Продажа", "admin": "Корректировка",
-    "freeze": "Заморозка", "unfreeze": "Разморозка", "migration": "Остаток заморозки при обновлении",
+    "deal_buy": "Покупка", "deal_sell": "Продажа", "admin": "Корректировка", "team_fee": "Доход тимлида",
+    "debt_repay": "Погашение долга оператора", "freeze": "Заморозка", "unfreeze": "Разморозка",
+    "migration": "Остаток заморозки при обновлении",
 }
 WD_STATUS = {"queued": "в очереди", "pending": "отправляется", "sent": "в сети", "unknown": "проверяется",
              "done": "выполнен", "failed": "не выполнен, возвращён", "cancelled": "отменён, возвращён"}
@@ -78,6 +79,25 @@ def fee_pct() -> str:
     return f"{money.fmt(settings.dec('deposit_fee'), 3)}%"
 
 
+def withdraw_fee(amount: Decimal, method: str, net_fee: Decimal = Decimal(0)) -> Decimal:
+    """withdraw_pct of the amount (to whole cents, up) plus the fixed part: withdraw_fee for a cheque; for an address
+    chain_withdraw_fee, which already covers xRocket's network fee — if the network takes more, that fee instead."""
+    pct = (amount * settings.dec("withdraw_pct") / 100).quantize(money.KOP, ROUND_UP)
+    fixed = settings.dec("withdraw_fee") if method == "xrocket" else max(settings.dec("chain_withdraw_fee"), net_fee)
+    return pct + fixed
+
+
+def withdraw_terms(method: str, net_fee: Decimal = Decimal(0)) -> str:
+    """The fee in words: «1,5% + 3 USDT (сеть включена)»."""
+    pct = f"{money.fmt(settings.dec('withdraw_pct'), 3)}%"
+    if method == "xrocket":
+        fixed = settings.dec("withdraw_fee")
+        return pct + (f" + {money.usdt(fixed)} USDT" if fixed else "")
+    fixed = max(settings.dec("chain_withdraw_fee"), net_fee)
+    return f"{pct} + {money.usdt(fixed)} USDT" + (" (сеть включена)" if fixed > net_fee or not net_fee else
+                                                  " (комиссия сети)")
+
+
 async def wallet_screen(bot: Bot, s: AsyncSession, user: User, src=None, note: str = ""):
     pending_dep = await s.scalar(select(Deposit).where(
         Deposit.user_id == user.id, Deposit.status == "active").order_by(Deposit.id.desc()).limit(1))
@@ -85,11 +105,19 @@ async def wallet_screen(bot: Bot, s: AsyncSession, user: User, src=None, note: s
         Withdrawal.user_id == user.id, Withdrawal.status.in_(("pending", "unknown", "sent"))))
     queued = (await s.scalars(select(Withdrawal).where(Withdrawal.user_id == user.id, Withdrawal.status == "queued")
                               .order_by(Withdrawal.id))).all()
+    in_flight = Decimal(await s.scalar(select(func.coalesce(func.sum(Withdrawal.amount), 0)).where(
+        Withdrawal.user_id == user.id, Withdrawal.status.in_(("queued", "pending", "unknown", "sent")))))
+    op = await s.get(Operator, user.id)
     lines = [
         title(pe("wallet"), "Кошелёк"),
-        quote(f"Доступно: <b>{money.usdt(user.balance)} USDT</b>",
-              f"В сделках: {money.usdt(user.frozen)} USDT" if user.frozen else ""),
-        f"Пополнение — комиссия {fee_pct()}. Вывод — чеком xRocket или на кошелёк в любой сети.",
+        quote(f"• Доступно: <b>{money.usdt(user.balance)} USDT</b>",
+              f"• Заморожено в сделках: {money.usdt(user.frozen)} USDT" if user.frozen else "",
+              f"• В выводах: {money.usdt(in_flight)} USDT" if in_flight else "",
+              f"• Долг оператора: <b>{money.usdt(op.debt)} USDT</b> — погасить в «Оператор»" if op and op.debt else ""),
+        "<b>Комиссии</b>",
+        quote(f"• Пополнение: {fee_pct()}",
+              f"• Вывод чеком xRocket: {withdraw_terms('xrocket')}",
+              f"• Вывод на кошелёк: {withdraw_terms('chain')}"),
     ]
     if checking:
         lines.append(f"{pe('clock')} Выводов в пути: <b>{checking}</b> — статус в истории.")
@@ -325,6 +353,8 @@ async def check_deposit(s: AsyncSession, dep: Deposit) -> str:
             events.add(s, f"dep:{dep.id}", "expired", f"Счёт {st} без оплаты", dep.user_id)
         await s.commit()
         return "expired"
+    if dep.purpose == "debt":
+        return await _repaid(s, dep, received, st)
     credit = credit_of(received)
     expected = dep.amount
     res = await s.execute(update(Deposit).where(Deposit.id == dep.id, Deposit.status == "active")
@@ -344,6 +374,31 @@ async def check_deposit(s: AsyncSession, dep: Deposit) -> str:
     return "credited"
 
 
+async def _repaid(s: AsyncSession, dep: Deposit, received: Decimal, st: str) -> str:
+    """An operator's invoice for his debt is paid: no fee, the debt goes down; anything above it goes to his balance."""
+    res = await s.execute(update(Deposit).where(Deposit.id == dep.id, Deposit.status == "active")
+                          .values(status="paid", credit=received, amount=received))
+    if res.rowcount != 1:
+        return "paid"
+    await s.refresh(dep)
+    paid, extra = await operators.repay(s, dep.user_id, received, f"счёт xRocket #{dep.id}")
+    if extra > 0:
+        await money.add(s, dep.user_id, extra, "deposit", f"dep:{dep.id}")
+    events.add(s, f"dep:{dep.id}", "credited", f"Погашение долга оператора: пришло {money.usdt(received)} USDT, "
+               f"погашено {money.usdt(paid)}" + (f", {money.usdt(extra)} сверх долга — на баланс" if extra else "")
+               + (f" · счёт {st}" if st != "paid" else ""), dep.user_id, notice=True)
+    await s.commit()
+    return "credited"
+
+
+async def deposit_done_text(s: AsyncSession, dep: Deposit) -> str:
+    if dep.purpose != "debt":
+        return f"{pe('ok')} <b>Баланс пополнен на {money.usdt(dep.credit)} USDT</b> · пополнение #{dep.id}"
+    op = await s.get(Operator, dep.user_id, populate_existing=True)
+    return (f"{pe('ok')} <b>Долг погашен: {money.usdt(dep.credit)} USDT</b> · счёт #{dep.id}\n"
+            f"• Осталось долга: <b>{money.usdt(op.debt if op else Decimal(0))} USDT</b>")
+
+
 @router.callback_query(F.data.regexp(r"^w:chk:(\d+)$"))
 async def cb_check(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User):
     dep = await s.get(Deposit, int(c.data.split(":")[2]))
@@ -356,6 +411,11 @@ async def cb_check(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User):
             return await c.answer(f"Не удалось проверить: {e.human}. Проверим автоматически.", show_alert=True)
     else:
         st = dep.status
+    if dep.purpose == "debt" and st in ("credited", "paid", "active"):
+        from bot.handlers.operator import operator_screen
+        await s.refresh(user)
+        return await operator_screen(bot, s, user, c, ok(f"Погашено {money.usdt(dep.credit)} USDT")
+                                     if st != "active" else warn("Оплата ещё не поступила — проверим автоматически."))
     if st in ("credited", "paid"):
         await s.refresh(user)
         return await wallet_screen(bot, s, user, c, ok(f"Зачислено {money.usdt(dep.credit)} USDT"))
@@ -375,8 +435,9 @@ async def cb_withdraw_choice(c: CallbackQuery, bot: Bot, user: User, state: FSMC
     await show(bot, user, "\n".join([
         title(pe("up"), "Вывод USDT"),
         quote(f"Доступно: <b>{money.usdt(user.balance)} USDT</b>"),
-        f"<b>Чек xRocket</b> — мгновенно, комиссия {settings.human('withdraw_fee')}.",
-        f"<b>На кошелёк</b> — {settings.human('chain_withdraw_fee')} + комиссия сети. Выберите сеть:",
+        f"• <b>Чек xRocket</b> — мгновенно, комиссия {withdraw_terms('xrocket')}",
+        f"• <b>На кошелёк</b> — комиссия {withdraw_terms('chain')}",
+        "Выберите способ или сеть:",
     ]), kb(btn("Чеком xRocket", "w:wd", "dollar", style="success"), *_net_rows("w:wn", nets), back("w", "Кошелёк")), c)
 
 
@@ -387,19 +448,19 @@ async def cb_withdraw(c: CallbackQuery, bot: Bot, user: User, state: FSMContext)
 
 
 def withdraw_prompt(user: User, err: str = "") -> str:
-    fee = settings.dec("withdraw_fee")
     return "\n".join([
         title(pe("up"), "Вывод чеком xRocket"),
-        quote(f"Доступно: <b>{money.usdt(user.balance)} USDT</b>",
-              f"Минимум {settings.get('withdraw_min')} USDT · комиссия {money.usdt(fee)} USDT"),
-        "Отправьте сумму в USDT. Чек активирует только ваш аккаунт.",
+        quote(f"• Доступно: <b>{money.usdt(user.balance)} USDT</b>",
+              f"• Минимум: {settings.get('withdraw_min')} USDT",
+              f"• Комиссия: {withdraw_terms('xrocket')}"),
+        "Отправьте сумму списания в USDT — чек придёт на сумму минус комиссия. Активирует его только ваш аккаунт.",
     ]) + (warn(err) if err else "")
 
 
 @router.message(W.withdraw, F.text)
 async def msg_withdraw(m: Message, bot: Bot, user: User, state: FSMContext):
     v = parse_usdt(m.text)
-    fee = settings.dec("withdraw_fee")
+    fee = withdraw_fee(v, "xrocket") if v is not None else Decimal(0)
     err = ("Введите сумму числом" if v is None
            else f"Минимум {settings.get('withdraw_min')} USDT" if v < settings.dec("withdraw_min")
            else "Сумма должна быть больше комиссии" if v <= fee
@@ -407,12 +468,12 @@ async def msg_withdraw(m: Message, bot: Bot, user: User, state: FSMContext):
     if err:
         return await show(bot, user, withdraw_prompt(user, err), kb(back("w:out", "Назад")))
     await state.set_state(None)
-    await state.update_data(wd_amount=str(v), wd_request=str(uuid4()))
+    await state.update_data(wd_amount=str(v), wd_fee=str(fee), wd_request=str(uuid4()))
     await show(bot, user, "\n".join([
         title(pe("up"), "Подтвердите вывод"),
-        quote(f"Спишется: <b>{money.usdt(v)} USDT</b>",
-              f"Комиссия: {money.usdt(fee)} USDT" if fee else "",
-              f"Сумма чека: <b>{money.usdt(v - fee)} USDT</b>"),
+        quote(f"• Спишется: <b>{money.usdt(v)} USDT</b>",
+              f"• Комиссия {withdraw_terms('xrocket')}: −{money.usdt(fee)} USDT",
+              f"• Сумма чека: <b>{money.usdt(v - fee)} USDT</b>"),
     ]), kb(btn("Получить чек", "w:go", "ok", style="success"), back("w", "Отмена")))
 
 
@@ -420,10 +481,13 @@ async def msg_withdraw(m: Message, bot: Bot, user: User, state: FSMContext):
 async def cb_withdraw_go(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User, state: FSMContext):
     data = await state.get_data()
     raw, request_id = data.get("wd_amount"), data.get("wd_request")
-    await state.update_data(wd_amount=None, wd_request=None)
+    await state.update_data(wd_amount=None, wd_fee=None, wd_request=None)
     if not raw or not request_id:
         return await c.answer("Заявка уже обработана или устарела. Начните вывод заново.", show_alert=True)
-    amount, fee = Decimal(raw), settings.dec("withdraw_fee")
+    amount = Decimal(raw)
+    fee = withdraw_fee(amount, "xrocket")
+    if data.get("wd_fee") and Decimal(data["wd_fee"]) != fee:
+        return await c.answer("Комиссия изменилась — начните вывод заново", show_alert=True)
     if amount < settings.dec("withdraw_min") or amount <= fee:
         return await c.answer("Некорректная сумма", show_alert=True)
     wd = Withdrawal(user_id=user.id, amount=amount, fee=fee, request_id=request_id)
@@ -536,19 +600,18 @@ async def msg_chain_memo(m: Message, bot: Bot, user: User, state: FSMContext):
     await _ask_amount(bot, user, state, memo)
 
 
-async def chain_fee(net: str) -> tuple[Decimal, Decimal, Decimal]:
-    """(total fee, xRocket's network part, xRocket's minimum) for a withdrawal in `net`."""
+async def chain_quota(net: str) -> tuple[Decimal, Decimal]:
+    """(xRocket's network fee, xRocket's minimum) for a withdrawal in `net`."""
     q = await xrocket.quota(net)
-    nf = xrocket.net_fee(q)
-    return settings.dec("chain_withdraw_fee") + nf, nf, Decimal(str(q["withdrawMinSize"])) if q else Decimal(0)
+    return xrocket.net_fee(q), Decimal(str(q["withdrawMinSize"])) if q else Decimal(0)
 
 
-def _amount_text(user: User, data: dict, fee: Decimal, err: str = "") -> str:
+def _amount_text(user: User, data: dict, nf: Decimal, err: str = "") -> str:
     return _chain_step(data["t_net"], 3, "\n".join([
-        quote(f"Адрес: <code>{esc(data['t_addr'])}</code>",
-              f"Memo: <code>{esc(data['t_memo'])}</code>" if data.get("t_memo") else "",
-              f"Доступно: <b>{money.usdt(user.balance)} USDT</b>",
-              f"Комиссия: <b>{money.usdt(fee)} USDT</b> · минимум {settings.get('chain_withdraw_min')} USDT"),
+        quote(f"• Адрес: <code>{esc(data['t_addr'])}</code>",
+              f"• Memo: <code>{esc(data['t_memo'])}</code>" if data.get("t_memo") else "",
+              f"• Доступно: <b>{money.usdt(user.balance)} USDT</b>",
+              f"• Комиссия: <b>{withdraw_terms('chain', nf)}</b> · минимум {settings.get('chain_withdraw_min')} USDT"),
         "Отправьте сумму списания — придёт сумма минус комиссия."]), err)
 
 
@@ -556,31 +619,34 @@ async def _ask_amount(bot, user, state: FSMContext, memo: str | None, src=None):
     await state.update_data(t_memo=memo)
     await state.set_state(W.amount)
     data = await state.get_data()
-    fee, *_ = await chain_fee(data["t_net"])
-    await show(bot, user, _amount_text(user, data, fee), kb(
-        btn(f"Вывести всё: {money.usdt(user.balance)} USDT", "w:wn:all", "up") if user.balance > fee else None,
+    nf, _ = await chain_quota(data["t_net"])
+    await show(bot, user, _amount_text(user, data, nf), kb(
+        btn(f"Вывести всё: {money.usdt(user.balance)} USDT", "w:wn:all", "up")
+        if user.balance > withdraw_fee(user.balance, "chain", nf) else None,
         back("w:out", "Отмена")), src)
 
 
 async def _chain_confirm(bot, user, state: FSMContext, v: Decimal | None, src=None):
     data = await state.get_data()
-    fee, nf, xmin = await chain_fee(data["t_net"])
+    nf, xmin = await chain_quota(data["t_net"])
+    fee = withdraw_fee(v, "chain", nf) if v is not None else Decimal(0)
     err = ("Введите сумму числом" if v is None
            else f"Минимум {settings.get('chain_withdraw_min')} USDT" if v < settings.dec("chain_withdraw_min")
            else "Сумма должна быть больше комиссии" if v <= fee
            else f"Доступно только {money.usdt(user.balance)} USDT" if v > user.balance
            else f"После комиссии должно остаться не меньше {money.usdt(xmin)} USDT" if v - fee < xmin else "")
     if err:
-        return await show(bot, user, _amount_text(user, data, fee, err), kb(back("w:out", "Отмена")), src)
+        return await show(bot, user, _amount_text(user, data, nf, err), kb(back("w:out", "Отмена")), src)
     await state.set_state(None)
     await state.update_data(t_amount=str(v), t_fee=str(fee), t_netfee=str(nf), t_request=str(uuid4()))
     await show(bot, user, "\n".join([
         title(pe("up"), "Проверьте вывод"),
-        quote(f"Сеть: <b>{xrocket.net_name(data['t_net'])}</b>",
-              f"Адрес: <code>{esc(data['t_addr'])}</code>",
-              f"Memo: <code>{esc(data['t_memo'])}</code>" if data.get("t_memo") else "",
-              f"Спишется: <b>{money.usdt(v)} USDT</b> · комиссия {money.usdt(fee)}",
-              f"Придёт: <b>{money.usdt(v - fee)} USDT</b>"),
+        quote(f"• Сеть: <b>{xrocket.net_name(data['t_net'])}</b>",
+              f"• Адрес: <code>{esc(data['t_addr'])}</code>",
+              f"• Memo: <code>{esc(data['t_memo'])}</code>" if data.get("t_memo") else "",
+              f"• Спишется: <b>{money.usdt(v)} USDT</b>",
+              f"• Комиссия {withdraw_terms('chain', nf)}: −{money.usdt(fee)} USDT",
+              f"• Придёт: <b>{money.usdt(v - fee)} USDT</b>"),
         f"{pe('warn')} Перевод в блокчейне не отменить. Сверьте начало и конец адреса.",
     ]), kb(btn("Отправить", "w:wn:go", "ok", style="success"), back("w:out", "Отмена")), src)
 

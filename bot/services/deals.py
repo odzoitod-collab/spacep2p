@@ -46,19 +46,25 @@ def requote(d: Deal, amount_rub: Decimal) -> money.Quote:
     return money.split(amount_rub, debit, d.buyer_rate or d.rate, d.platform_pct)
 
 
-def client_quote(qt: money.Quote, amount_rub: Decimal, rate: Decimal, client) -> tuple[money.Quote, Decimal | None,
-                                                                                       Decimal | None]:
-    """An API order: the merchant side as usual, the client priced by his own terms.
+def buyer_quote(qt: money.Quote, amount_rub: Decimal, rate: Decimal, buyer=None, client=None
+                ) -> tuple[money.Quote, Decimal | None, Decimal | None]:
+    """The merchant side as quoted; the buyer priced by his own terms — an API client's or a user's personal ones.
     Returns (quote, buyer_rate or None if it equals `rate`, platform percent or None = unchanged)."""
-    if client is None:
+    if client is None and not settings.has_terms(buyer):
         return qt, None, None
-    brate, pct = settings.client_terms(client)
+    brate, pct = settings.buyer_terms(buyer, client)
     try:
         q = money.split(amount_rub, qt.seller_debit, brate, pct)
     except ValueError:
-        raise DealError("Условия API-клиента выгоднее условий мерчанта — площадка ушла бы в минус. "
-                        "Напишите в поддержку.", "terms_loss")
+        raise DealError(("Условия API-клиента" if client is not None else "Ваши личные условия")
+                        + " выгоднее условий мерчанта — площадка ушла бы в минус. Напишите в поддержку.", "terms_loss")
     return q, (brate if brate != rate else None), pct
+
+
+def buyer_preview(amount_rub: Decimal, buyer=None) -> money.Quote:
+    """What a buyer gets for amount_rub (the buyer side does not depend on the merchant): for screens before a deal."""
+    rate, pct = settings.buyer_terms(buyer)
+    return money.split(amount_rub, Decimal("Infinity"), rate, pct)
 
 
 def card_busy():
@@ -268,7 +274,7 @@ async def create(s: AsyncSession, buyer: User, card_id: int, amount_rub: Decimal
         qt = money.quote(amount_rub, rate, sp, pp)
     except ValueError:
         raise DealError("Покупки временно недоступны: некорректные настройки комиссий. Напишите в поддержку.")
-    qt, brate, cpct = client_quote(qt, amount_rub, rate, client)
+    qt, brate, cpct = buyer_quote(qt, amount_rub, rate, buyer, client)
     if expect_credit is not None and qt.buyer_credit != expect_credit:
         raise DealError("Курс или комиссия изменились. Проверьте новую сумму.", "terms")
     if seller.balance < qt.seller_debit:  # seller row is locked, so freeze below cannot fail
@@ -431,10 +437,13 @@ async def add_evidence(s: AsyncSession, deal_id: int, uid: int, item: list) -> D
 async def complete(s: AsyncSession, deal_id: int, frm=("paid", "dispute"), actual_rub: Decimal | None = None,
                    reason: str = "confirmed") -> Deal | None:
     """Release coins to buyer. actual_rub re-prices the deal by the amount really received."""
+    from bot.services import events, operators, teams  # they build on this module's callers, not the other way round
     d = await s.get(Deal, deal_id, with_for_update=True, populate_existing=True)
     if not d or d.status not in frm:
         return None
-    for uid in sorted((d.buyer_id, d.seller_id)):
+    seller = await s.get(User, d.seller_id) if d.seller_id else None
+    team = await teams.of_user(s, seller)
+    for uid in sorted({d.buyer_id, d.seller_id, *([team.leader_id] if team else [])} - {None}):
         await money.lock(s, uid)
     old_debit = d.seller_debit
     values = {}
@@ -456,10 +465,55 @@ async def complete(s: AsyncSession, deal_id: int, frm=("paid", "dispute"), actua
     if d is None:
         return None
     ref = f"deal:{d.id}"
-    if frozen(d):  # a Bybit order: the USDT came to the operator's Bybit account, the platform credits the buyer
+    if frozen(d):
         await money.spend_frozen(s, d.seller_id, d.seller_debit, ref)
+    elif d.operator_id and d.bybit_url:  # a Bybit order: its USDT came to the operator's Bybit account — he owes them
+        await operators.accrue(s, d.operator_id, d.seller_debit, ref)
     await money.add(s, d.buyer_id, d.buyer_credit, "deal_buy", ref)
     money.platform(s, d.platform_fee, "deal_fee", ref)
+    if got := await teams.bonus(s, d):  # the merchant's team leader: his percent out of the platform's fee
+        team, fee = got
+        await money.add(s, team.leader_id, fee, "team_fee", ref)
+        money.platform(s, -fee, "team_fee", ref)
+        d.team_id, d.team_fee = team.id, fee
+        events.add(s, f"team:{team.id}", "fee", f"Тимлиду +{money.usdt(fee)} USDT · сделка #{d.id} на "
+                                                f"{money.fmt(d.amount_rub)} ₽", team.leader_id, notice=True)
+    return d
+
+
+async def change_amount(s: AsyncSession, deal_id: int, amount_rub: Decimal) -> tuple[Deal, Decimal]:
+    """An admin changes the amount of an open deal: re-priced by the deal's own terms; the merchant's frozen USDT
+    follow (more frozen or released). Returns (deal, old amount). Does not commit."""
+    d = await s.get(Deal, deal_id, with_for_update=True, populate_existing=True)
+    if not d or d.status not in OPEN:
+        raise DealError("Сделка уже закрыта")
+    if not amount_rub.is_finite() or not 0 < amount_rub < Decimal("100000000") or amount_rub.as_tuple().exponent < -2:
+        raise DealError("Некорректная сумма")
+    old = d.amount_rub
+    try:
+        q = requote(d, amount_rub)
+    except ValueError:
+        raise DealError("На этой сумме площадка ушла бы в минус — проверьте условия сделки")
+    if frozen(d) and d.seller_id and d.status in FUNDED:  # the merchant's USDT are frozen for this deal
+        diff = q.seller_debit - d.seller_debit
+        try:
+            if diff > 0:
+                await money.freeze(s, d.seller_id, diff, f"deal:{d.id}")
+            elif diff < 0:
+                await money.unfreeze(s, d.seller_id, -diff, f"deal:{d.id}")
+        except money.NotEnough:
+            raise DealError(f"У мерчанта не хватает свободных USDT: нужно ещё {money.usdt(diff)}")
+    d.amount_rub, d.seller_debit, d.buyer_credit, d.platform_fee = amount_rub, q.seller_debit, q.buyer_credit, \
+        q.platform_fee
+    return d, old
+
+
+async def extend(s: AsyncSession, deal_id: int, minutes: int) -> Deal:
+    """An admin gives more time to the current stage (payment, search, requisites). Does not commit."""
+    d = await s.get(Deal, deal_id, with_for_update=True, populate_existing=True)
+    if not d or d.status not in UNPAID:
+        raise DealError("Продлить можно только до оплаты")
+    d.expires_at = max(aware(d.expires_at), now()) + timedelta(minutes=minutes)
     return d
 
 
@@ -491,6 +545,13 @@ async def on_ban(s: AsyncSession, uid: int) -> tuple[list[Deal], list[Deal]]:
         if d := await cancel(s, did, ("waiting_payment",), "void", "ban_void"):  # not the buyer's fault
             cancelled.append(d)
     for did in (await s.scalars(select(Deal.id).where(Deal.status == "paid", Deal.seller_id == uid))).all():
+        if d := await _move(s, did, ("paid",), "dispute", dispute_reason="seller_banned"):
+            disputed.append(d)
+    # an operator: an order he accepted goes back to the other operators, a payment he had to check — to the admins
+    await s.execute(update(Deal).where(Deal.status == "checking", Deal.operator_id == uid, Deal.bybit_url.is_not(None))
+                    .values(operator_id=None).execution_options(synchronize_session=False))
+    for did in (await s.scalars(select(Deal.id).where(Deal.status == "paid", Deal.via_bybit,
+                                                      Deal.operator_id == uid))).all():
         if d := await _move(s, did, ("paid",), "dispute", dispute_reason="seller_banned"):
             disputed.append(d)
     return cancelled, disputed

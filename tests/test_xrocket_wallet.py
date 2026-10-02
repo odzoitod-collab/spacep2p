@@ -73,16 +73,16 @@ def test_withdraw_to_any_network_through_xrocket(go):
         await b.run(msg(BUYER, TRX))
         assert "шаг 3 из 3" in plain(b.session.last(BUYER))  # no memo step outside TON
         await b.run(msg(BUYER, "10"))
-        assert "Придёт: 8.9 USDT" in plain(b.session.last(BUYER))  # 10 − (1 platform + 0.1 network)
+        assert "Придёт: 6.85 USDT" in plain(b.session.last(BUYER))  # 10 − (1.5% + 3 fixed, network 0.1 inside)
         await b.run(cb(BUYER, "w:wn:go"))
-        assert b.rocket.withdrawal_calls == [("wd-1", "TRX", TRX, D("8.9"), None)]
+        assert b.rocket.withdrawal_calls == [("wd-1", "TRX", TRX, D("6.85"), None)]
         assert (await user(BUYER)).balance == D(90)
         b.rocket.withdrawals["wd-1"]["status"] = "COMPLETED"
         await tasks.sync_chain_withdrawals(b.bot)
         async with models.Session() as s:
             wd = await s.get(Withdrawal, 1)
             assert (wd.status, wd.network, wd.net_fee) == ("done", "TRX", D("0.1"))
-        assert await platform_income() == D(1)  # the network part paid xRocket
+        assert await platform_income() == D("3.05")  # 3.15 fee − 0.1 network part paid to xRocket
         assert "Вывод #1 выполнен" in plain(b.session.last(BUYER))
     go(fn)
 
@@ -137,13 +137,14 @@ def test_chat_gives_personal_one_time_links_and_keeps_a_pinned_summary(go):
                                                                      Event.ref == f"user:{BUYER}")) == 1
         await create_deal(b)
         await tasks.chat_pin(b.bot)
-        sent = [m for m in b.session.calls if type(m).__name__ == "SendMessage" and m.chat_id == CHAT]
-        assert len(sent) == 1 and "Курс" in sent[0].text and "Активных сделок: <b>1</b>" in sent[0].text
-        assert "@straitpay_bot" in sent[0].text
+        sent = [m for m in b.session.calls if type(m).__name__ == "SendAnimation" and m.chat_id == CHAT]
+        assert len(sent) == 1 and "Курс" in sent[0].caption and "Активных сделок: <b>1</b>" in sent[0].caption
+        urls = [x.url for row in sent[0].reply_markup.inline_keyboard for x in row]
+        assert "https://t.me/straitpay_bot?start=om" in urls  # the banner pin leads into the bot
         assert [m for m in b.session.calls if type(m).__name__ == "PinChatMessage"]
-        await tasks.chat_pin(b.bot)  # the second run edits the pinned message in place
-        assert len([m for m in b.session.calls if type(m).__name__ == "SendMessage" and m.chat_id == CHAT]) == 1
-        assert [m for m in b.session.calls if type(m).__name__ == "EditMessageText" and m.chat_id == CHAT]
+        await tasks.chat_pin(b.bot)  # the second run edits the pinned banner's caption in place
+        assert len([m for m in b.session.calls if type(m).__name__ == "SendAnimation" and m.chat_id == CHAT]) == 1
+        assert [m for m in b.session.calls if type(m).__name__ == "EditMessageCaption" and m.chat_id == CHAT]
     go(fn)
 
 
@@ -172,17 +173,15 @@ def test_toggles_keep_their_place_and_order_section_has_no_buy_buttons(go):
         assert [len(r) for r in layout.inline_keyboard] == [1, 1, 1, 2]  # a wide one never pairs up
         await ready(b)
         async with models.Session() as s:
-            s.add(models.OrderMerchant(user_id=SELLER, status="approved", source="s", speed="5", min_rub=D(1000),
-                                       max_rub=D(50000), max_open_rub=D(100000), accepting=True))
+            s.add(models.OrderMerchant(user_id=SELLER, status="approved", source="s", speed="5"))
             await s.commit()
         await b.run(cb(SELLER, "om"))
         kb_rows = rows(b, SELLER)
-        assert ["om:acc:0"] in kb_rows and ["om:mode"] in kb_rows
+        assert ["om:pay"] in kb_rows  # no on/off switch and no mode: every request comes, the way is chosen per take
         flat = sum(kb_rows, [])
+        assert "om:acc:0" not in flat and "om:mode" not in flat
         assert "orb:new" not in flat and "w" not in flat and "sl:st" not in flat
-        await b.run(cb(SELLER, "om:acc:0"))
-        kb_rows = rows(b, SELLER)
-        assert ["om:acc:1"] in kb_rows and ["om:mode"] in kb_rows
+        assert "На линии: заявки приходят все" in plain(b.session.last(SELLER))
         await b.run(cb(BUYER, "om"))
         assert "orb:new" not in b.session.buttons(BUYER) and "om:apply" in b.session.buttons(BUYER)
     go(fn)
@@ -194,8 +193,9 @@ def test_log_card_lists_people_with_usernames_one_fact_per_line(go):
         await create_deal(b)
         texts = await b.deliver()
         card = next(t for t in texts if t.startswith("🟡 Сделка #1"))
+        assert "/deal 1" in card.split("\n")[0]  # the number to follow the deal by
         lines = card.split("\n")
-        assert f"Покупатель: @u{BUYER} · U{BUYER} · {BUYER}" in lines
-        assert f"Мерчант: @u{SELLER} · U{SELLER} · {SELLER}" in lines
-        assert "Сумма: 10 000 ₽" in lines and "История" in lines
+        assert f"• Создал (покупатель): @u{BUYER} · U{BUYER} · {BUYER}" in lines  # one fact per line, as a bullet
+        assert f"• Принял (мерчант): @u{SELLER} · U{SELLER} · {SELLER}" in lines
+        assert "• Сумма: 10 000 ₽" in lines and "История" in lines
     go(fn)

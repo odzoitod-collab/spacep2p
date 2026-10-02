@@ -1,21 +1,25 @@
 """Order requisites: when no static card fits, a buyer (or an API client) requests requisites for an exact amount.
 
-    searching --merchant takes--> assigned --gives requisites (balance mode)--> waiting_payment -> (usual deal:
-        |                            |                                         receipt, confirmation, dispute, expiry)
-        |                            +--gives a Bybit order link (bybit mode)--> checking --operator gives the
-        |                            |          requisites of that order--> waiting_payment
+    searching --merchant takes--> assigned --gives requisites (balance)--> waiting_payment -> (usual deal:
+        |                            |                                    receipt, confirmation, dispute, expiry)
+        |                            +--gives a Bybit order link--> checking --an operator accepts the order and
+        |                            |          gives its requisites--> waiting_payment
         |                            |          (operator rejects the link -> assigned again)
         |                            +--declines / time is up--> searching (other merchants)
         +--nobody within order_search_minutes / buyer cancels--> cancelled ; checking past its deadline -> cancelled
 
-Order merchants have no percent: they sell at the fixed order_rate, seller_debit = amount_rub / order_rate. The
-deal's terms are fixed when the request is created.
+Every approved order merchant gets every request — no amount limits, no on/off switch — in the bot, and the request is
+also posted in the community chat and the team chats with a link into the bot. The merchant decides per request how
+to work it when he takes it:
+  * Bybit order (via_bybit): no balance needed, nothing frozen — he sends a link to his Bybit P2P order for
+    seller_debit USDT, every operator gets «Принять ордер», the first one gets the link, enters the order, gives its
+    requisites to the buyer, checks the payment and confirms; the USDT arrive on the operator's Bybit account (his
+    debt to the platform, services/operators.py) and the platform credits the buyer.
+  * Balance: his seller_debit is frozen when he takes the request (so a taken request is always covered) and
+    released if he declines or runs out of time; he gives the requisites and confirms the payment himself.
 
-Funds. Balance mode: the merchant's seller_debit is frozen when he takes the request (so a taken request is always
-covered) and released if he declines or runs out of time. Bybit mode (default): nothing is frozen and no balance is
-needed — the merchant gives a link to his Bybit P2P order for seller_debit USDT, an operator enters it, gives its
-requisites to the buyer, checks the payment and confirms; the USDT arrive on the operator's Bybit account and the
-platform credits the buyer. While searching/assigned/checking, expires_at is the stage deadline.
+Order merchants have no percent: they sell at the fixed order_rate, seller_debit = amount_rub / order_rate. The deal's
+terms are fixed when the request is created. While searching/assigned/checking, expires_at is the stage deadline.
 """
 from datetime import timedelta
 from decimal import Decimal
@@ -30,7 +34,6 @@ from bot.services.deals import DealError
 
 PAY_MINUTES = (15, 20, 30, 45, 60)  # payment windows a merchant can give; the setting sets the minimum
 REQUEST = ("searching", "assigned", "checking")  # before requisites are given
-MODES = {"bybit": "Bybit-ордер", "balance": "баланс"}
 BYBIT_HOSTS = ("bybit.com", "bybitglobal.com", "bybit.eu", "bybit.kz", "bybit.nl", "bybit.tr")
 
 
@@ -71,7 +74,7 @@ async def create_request(s: AsyncSession, buyer: User, amount_rub: Decimal, send
         qt = money.quote_fixed(amount_rub, rate, mr, pp)
     except ValueError:
         raise DealError("Покупки временно недоступны: некорректные настройки курса. Напишите в поддержку.")
-    qt, brate, cpct = deals.client_quote(qt, amount_rub, rate, client)
+    qt, brate, cpct = deals.buyer_quote(qt, amount_rub, rate, buyer, client)
     if expect_credit is not None and qt.buyer_credit != expect_credit:
         raise DealError("Курс или комиссия изменились. Проверьте новую сумму.", "terms")
     d = Deal(buyer_id=buyer.id, seller_id=None, card_id=None, amount_rub=amount_rub, rate=rate, seller_pct=Decimal(0),
@@ -92,39 +95,32 @@ async def open_rub(s: AsyncSession, uid: int) -> Decimal:
         Deal.seller_id == uid, Deal.is_order, Deal.status.in_(deals.FUNDED))))
 
 
-def fit_problem(m: OrderMerchant, u: User, d: Deal, busy_rub: Decimal) -> str:
-    """Why this merchant cannot take this request now ("" = he can)."""
-    if m.status != "approved":
-        return "доступ ордерного мерчанта не активен"
+def fit_problem(m: OrderMerchant | None, u: User, d: Deal, bybit: bool) -> str:
+    """Why this merchant cannot take this request this way now ("" = he can)."""
+    if m is None or m.status != "approved":
+        return "вы не ордерный мерчант" if m is None or m.status in ("pending", "rejected") else \
+            "доступ ордерного мерчанта приостановлен"
     if u.is_banned:
         return "аккаунт заблокирован"
-    if not m.min_rub <= d.amount_rub <= m.max_rub:
-        return f"сумма вне ваших настроек {money.fmt(m.min_rub)}–{money.fmt(m.max_rub)} ₽"
-    if busy_rub + d.amount_rub > m.max_open_rub:
-        return (f"лимит одновременной работы {money.fmt(m.max_open_rub)} ₽: уже в работе "
-                f"{money.fmt(busy_rub)} ₽")
-    if m.mode == "balance" and u.balance < d.seller_debit:  # a Bybit order needs no balance in the bot
-        return f"нужно {money.usdt(d.seller_debit)} USDT свободного баланса, у вас {money.usdt(u.balance)}"
+    if not bybit and u.balance < d.seller_debit:  # a Bybit order needs no balance in the bot
+        return (f"для работы с баланса нужно {money.usdt(d.seller_debit)} USDT свободных, у вас "
+                f"{money.usdt(u.balance)} — возьмите через Bybit-ордер")
     return ""
 
 
 async def eligible(s: AsyncSession, d: Deal) -> list[tuple[OrderMerchant, User]]:
-    """Merchants who accept requests now and can cover this one and have not been offered it yet (a live offer or
-    a decline both count). Not the buyer."""
-    declined = set((await s.scalars(select(OrderOffer.user_id).where(OrderOffer.deal_id == d.id))).all())
+    """Approved merchants who have not been offered this request yet (a live offer or a decline both count). Not the
+    buyer, not banned. No amount limits: every merchant sees every request and decides himself."""
+    seen = set((await s.scalars(select(OrderOffer.user_id).where(
+        OrderOffer.deal_id == d.id, OrderOffer.kind == "merchant"))).all())
     rows = (await s.execute(select(OrderMerchant, User).join(User, User.id == OrderMerchant.user_id).where(
-        OrderMerchant.status == "approved", OrderMerchant.accepting))).all()
-    out = []
-    for m, u in rows:
-        if u.id == d.buyer_id or u.id in declined:
-            continue
-        if not fit_problem(m, u, d, await open_rub(s, u.id)):
-            out.append((m, u))
-    return out
+        OrderMerchant.status == "approved", ~User.is_banned))).all()
+    return [(m, u) for m, u in rows if u.id != d.buyer_id and u.id not in seen]
 
 
-async def take(s: AsyncSession, deal_id: int, merchant: User) -> Deal:
-    """First merchant wins: the deal row is locked, the status checked, his funds frozen. Does not commit."""
+async def take(s: AsyncSession, deal_id: int, merchant: User, bybit: bool = True) -> Deal:
+    """First merchant wins: the deal row is locked, the status checked; with the balance his funds are frozen.
+    Does not commit."""
     d = await s.get(Deal, deal_id, with_for_update=True, populate_existing=True)
     if d is None or d.status != "searching" or deals.aware(d.expires_at) < now():
         raise DealError("Заявку уже взял другой мерчант или она закрыта", "taken")
@@ -132,9 +128,8 @@ async def take(s: AsyncSession, deal_id: int, merchant: User) -> Deal:
         raise DealError("Это ваша собственная заявка")
     m = await s.get(OrderMerchant, merchant.id)
     u = await money.lock(s, merchant.id)
-    if m is None or (problem := fit_problem(m, u, d, await open_rub(s, u.id))):
-        raise DealError(f"Не можете взять заявку: {problem or 'вы не ордерный мерчант'}", "cannot")
-    bybit = m.mode == "bybit"
+    if problem := fit_problem(m, u, d, bybit):
+        raise DealError(f"Не можете взять заявку: {problem}", "cannot")
     if not bybit:
         await money.freeze(s, u.id, d.seller_debit, f"deal:{d.id}")
     moved = await deals._move(s, d.id, ("searching",), "assigned", seller_id=u.id, via_bybit=bybit,
@@ -184,14 +179,47 @@ async def give_link(s: AsyncSession, deal_id: int, merchant: User, url: str) -> 
 
 
 async def claim(s: AsyncSession, deal_id: int, operator: User) -> Deal:
-    """The first operator who opens the Bybit order owns this check. Does not commit."""
+    """The first operator who accepts the Bybit order owns it; the others' offers close. Does not commit."""
     d = await s.get(Deal, deal_id, with_for_update=True, populate_existing=True)
     if d is None or d.status != "checking":
         raise DealError("Ордер уже обработан или заявка закрыта", "gone")
     if d.operator_id not in (None, operator.id):
-        raise DealError(f"Ордер уже взял другой оператор ({d.operator_id})", "taken")
+        raise DealError("Ордер уже принял другой оператор", "taken")
     d.operator_id = operator.id
     return d
+
+
+async def unclaim(s: AsyncSession, deal_id: int, operator: User) -> Deal | None:
+    """The operator gives the order back: it is offered to all operators again; a request an admin took without a
+    Bybit order goes back to the search. Does not commit."""
+    d = await s.get(Deal, deal_id, with_for_update=True, populate_existing=True)
+    if d is None or d.status != "checking" or d.operator_id != operator.id:
+        return None
+    if d.bybit_url is None:
+        return await deals._move(s, d.id, ("checking",), "searching", seller_id=None, via_bybit=False,
+                                 operator_id=None,
+                                 expires_at=now() + timedelta(minutes=settings.num("order_search_minutes")))
+    d.operator_id = None
+    return d
+
+
+async def admin_take(s: AsyncSession, deal_id: int, admin: User) -> tuple[Deal, int | None, int | None]:
+    """An admin gives the requisites of a request himself: he becomes its operator (nothing frozen, the platform
+    credits the buyer, the rubles come to the requisites he gives). A merchant who had taken it without a Bybit order
+    is released (his freeze too); with a Bybit order the merchant stays and the admin enters his order.
+    Returns (deal, released merchant, replaced operator). Does not commit."""
+    d = await s.get(Deal, deal_id, with_for_update=True, populate_existing=True)
+    if d is None or d.status not in REQUEST:
+        raise DealError("Реквизиты уже выданы или заявка закрыта", "gone")
+    merchant = d.seller_id if d.status == "assigned" or (d.status == "checking" and not d.bybit_url) else None
+    operator = d.operator_id if d.operator_id != admin.id else None
+    if d.status == "assigned" and deals.frozen(d) and d.seller_id:
+        await money.unfreeze(s, d.seller_id, d.seller_debit, f"deal:{d.id}")
+    keep = d.status == "checking" and d.bybit_url
+    moved = await deals._move(s, d.id, (d.status,), "checking", via_bybit=True, operator_id=admin.id,
+                              seller_id=d.seller_id if keep else None,
+                              expires_at=now() + timedelta(minutes=settings.num("order_take_minutes")))
+    return moved, merchant, operator
 
 
 async def reject_link(s: AsyncSession, deal_id: int, operator: User) -> Deal | None:
@@ -252,10 +280,11 @@ async def stale(s: AsyncSession) -> tuple[list[int], list[int], list[int]]:
     return tuple(out)
 
 
-async def forget_offers(s: AsyncSession, deal_id: int) -> list[tuple[int, int]]:
-    """(user id, message id) of offers still showing "Take" for this request; the caller edits the messages.
-    The rows are removed, so if the request returns to searching these merchants are offered it again."""
-    rows = (await s.execute(select(OrderOffer.user_id, OrderOffer.msg_id).where(
-        OrderOffer.deal_id == deal_id, ~OrderOffer.declined))).all()
-    await s.execute(delete(OrderOffer).where(OrderOffer.deal_id == deal_id, ~OrderOffer.declined))
-    return [(uid, mid) for uid, mid in rows if mid]
+async def forget_offers(s: AsyncSession, deal_id: int, kinds: tuple[str, ...] = ("merchant", "chat", "operator")
+                        ) -> list[tuple[int, int, str]]:
+    """(chat id, message id, kind) of offers still showing a button for this request; the caller edits the messages.
+    The rows are removed, so if the request returns to searching these merchants and chats get it again."""
+    where = (OrderOffer.deal_id == deal_id, ~OrderOffer.declined, OrderOffer.kind.in_(kinds))
+    rows = (await s.execute(select(OrderOffer.user_id, OrderOffer.msg_id, OrderOffer.kind).where(*where))).all()
+    await s.execute(delete(OrderOffer).where(*where))
+    return [(uid, mid, kind) for uid, mid, kind in rows if mid]

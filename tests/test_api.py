@@ -174,7 +174,12 @@ def test_rejection_with_reason_and_docs_served(go):
         assert "Подать заявку снова можно после" in plain(b.session.last(OTHER))
         async with http(b) as c:
             text = await (await c.get("/docs")).text()
-            assert "# Strait Pay API" in text and "/v1/orders" in text
+            assert "<h1" in text and "Strait Pay API" in text and "/v1/orders" in text  # an HTML page
+            assert "# Strait Pay API" in await (await c.get("/docs.md")).text()
+            for slug in ("help", "start", "buy", "sell", "merchant", "orders", "operator", "team", "wallet", "disputes"):
+                r = await c.get(f"/docs/{slug}")
+                assert r.status == 200 and "<article>" in await r.text(), slug
+            assert (await c.get("/docs/nope")).status == 404
             assert (await (await c.get("/")).json())["name"] == "Strait Pay API"
         assert (await user(OTHER)).balance == 0
     go(fn)

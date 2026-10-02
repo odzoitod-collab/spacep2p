@@ -2,8 +2,9 @@
 
 Assets:       the xRocket app balance: every deposit lands there and every withdrawal is paid from it.
 Liabilities:  users' available balances + USDT frozen in deals + withdrawals debited but not paid yet.
-Bybit:        USDT of Bybit-order deals arrive on the operators' Bybit accounts, outside the assets above, while the
-              buyers are credited in the bot: move them to xRocket (shown separately, not counted).
+Operators:    USDT of Bybit-order deals arrive on the operators' Bybit accounts while the buyers are credited in the
+              bot: each operator owes them (services/operators.py) and repays to xRocket — a receivable, shown
+              separately and not counted in the assets until it is repaid.
 Free:         assets − liabilities. This is what the owner can take out without touching users' money; it already
               contains the profit.
 """
@@ -15,7 +16,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.models import Deal, Ledger, User, Withdrawal, now
-from bot.services import xrocket
+from bot.services import operators, xrocket
 
 UNPAID = ("queued", "pending", "unknown", "sent")  # withdrawals debited from users, not paid out yet
 
@@ -34,6 +35,8 @@ class Snapshot:
     users: int
     online: int
     bybit: dict[str, Decimal]  # 24h / 7d / all: USDT received through Bybit orders of completed deals
+    op_debt: Decimal = Decimal(0)  # operators owe for accepted Bybit orders, not repaid yet
+    team_paid: Decimal = Decimal(0)  # paid to team leaders, all time
 
     @property
     def assets(self) -> Decimal:
@@ -81,4 +84,5 @@ async def snapshot(s: AsyncSession) -> Snapshot:
         users_available=await _sum(s, User.balance), users_frozen=await _sum(s, User.frozen),
         unpaid=Decimal(unpaid), unpaid_n=unpaid_n, queued=Decimal(queued), queued_n=queued_n,
         profit=profit, volume=volume, users=await s.scalar(select(func.count(User.id))),
-        online=await s.scalar(select(func.count(User.id)).where(User.is_online)), bybit=bybit)
+        online=await s.scalar(select(func.count(User.id)).where(User.is_online)), bybit=bybit,
+        op_debt=await operators.total_debt(s), team_paid=await _sum(s, Deal.team_fee, Deal.status == "completed"))

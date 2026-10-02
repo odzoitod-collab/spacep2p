@@ -1,5 +1,6 @@
-"""Order requisites: merchant application, request, race to take, requisites, payment, timeouts, API; Bybit-order
-mode (link -> operator check -> requisites -> operator confirms or wins the dispute with proof); fixed order rate.
+"""Order requisites: merchant application, request, race to take, requisites, payment, timeouts, API; Bybit orders
+(link -> «Принять ордер» for every operator -> the first one gives the requisites -> confirms (his debt) or wins the
+dispute with proof); fixed order rate. Every merchant gets every request and picks Bybit order or balance per take.
 
 The order rate is 104 ₽: a 52 000 ₽ request is a 500 USDT order, the buyer gets 52 000 / 100 × 94% = 488.8 USDT."""
 import asyncio
@@ -14,7 +15,7 @@ from sqlalchemy import select
 
 from bot import models, tasks
 from bot.api.server import build_app
-from bot.models import Deal, Event, Ledger, OrderMerchant, User
+from bot.models import Deal, Event, Ledger, Operator, OrderMerchant, User
 from bot.services import api, deals, money
 from tests.harness import cb, msg, plain
 from tests.test_api import apply_and_approve, auth
@@ -23,12 +24,10 @@ from tests.test_scenarios import ADMIN, BUYER, OTHER, PDF, SELLER, create_deal, 
 M1, M2 = 40, 41
 
 
-async def merchant(b, uid, balance=D(1000), mode="balance"):
-    """Registers, fills the application, gets approved by the admin, has USDT on the balance. New merchants start in
-    the Bybit mode; mode="balance" switches to freezing his own USDT."""
+async def merchant(b, uid, balance=D(1000)):
+    """Registers, fills the application, gets approved by the admin, has USDT on the balance."""
     await b.run(msg(uid, "/start"), cb(uid, "om"), cb(uid, "om:apply"), msg(uid, "свои карты и команда"),
-                cb(uid, "om:sp:0"), msg(uid, "5000"), msg(uid, "100000"), msg(uid, "200000"),
-                msg(uid, "Сбер, Т-Банк"), cb(uid, "om:skip"))
+                cb(uid, "om:sp:0"), msg(uid, "Сбер, Т-Банк"), cb(uid, "om:skip"))
     assert "Анкета отправлена" in plain(b.session.last(uid))
     assert any(f"aom:{uid}" in (b_ or "") for b_ in b.session.buttons(ADMIN))  # straight to the admin's chat
     await b.run(cb(ADMIN, f"aom:{uid}"), cb(ADMIN, f"aom:ok:{uid}"))
@@ -36,16 +35,24 @@ async def merchant(b, uid, balance=D(1000), mode="balance"):
         if balance:
             await money.add(s, uid, balance, "deposit", "dep:0")
             await s.commit()
-        om = await s.get(OrderMerchant, uid)
-        assert om.accepting and om.mode == "bybit"
-    if mode == "balance":
-        await b.run(cb(uid, "om"), cb(uid, "om:mode"))
-        assert "Режим: баланс" in plain(b.session.last(uid))
+        assert (await s.get(OrderMerchant, uid)).status == "approved"
 
 
 async def request(b, amount="52000", buyer=BUYER):
-    await b.run(cb(buyer, "buy:0"), cb(buyer, "orb:new"), msg(buyer, amount), cb(buyer, "orb:b:1"), cb(buyer, "orb:go"))
+    """A request for requisites under the amount: the bot makes one when no static card takes the amount, so the
+    sellers with cards step off their shift for the moment of the request."""
     async with models.Session() as s:
+        online = list((await s.scalars(select(User.id).where(User.is_online))).all())
+        for uid in online:
+            (await s.get(User, uid)).is_online = False
+        await s.commit()
+    await b.run(cb(buyer, "buy:0"), msg(buyer, amount))
+    assert "orb:go" in b.session.buttons(buyer), plain(b.session.last(buyer))
+    await b.run(cb(buyer, "orb:go"))
+    async with models.Session() as s:
+        for uid in online:
+            (await s.get(User, uid)).is_online = True
+        await s.commit()
         return await s.scalar(select(Deal).where(Deal.buyer_id == buyer).order_by(Deal.id.desc()))
 
 
@@ -55,7 +62,7 @@ async def deal(did):
 
 
 def offers(b, uid):
-    return [t for t in b.session.texts(uid) if "Ордерная заявка #" in t]
+    return [t for t in b.session.texts(uid) if re.search(r"Заявка #\d+ · [\d ]+ ₽ · ", plain(t))]
 
 
 async def give(b, uid, did, minutes=15):
@@ -68,14 +75,19 @@ def test_full_order_requisites_flow(go):
         await ready(b)  # the only static card cannot take 50 000 ₽
         await merchant(b, M1)
         d = await request(b)
-        assert d.status == "searching" and d.is_order and d.sender_bank == "Т-Банк" and d.seller_id is None
+        assert d.status == "searching" and d.is_order and d.sender_bank is None and d.seller_id is None
         assert (d.merchant_rate, d.seller_debit, d.buyer_credit) == (D(104), D(500), D("488.8"))
         assert "Ищем ордерного мерчанта" in plain(b.session.last(BUYER))
-        assert offers(b, M1) and f"orq:take:{d.id}" in b.session.buttons(M1)
+        assert offers(b, M1) and f"orq:take:{d.id}:b" in b.session.buttons(M1)
+        offer = plain(offers(b, M1)[-1])
+        for part in ("Сумма перевода: 52 000 ₽", "Курс ордера: 104 ₽", "Ордер: 500 USDT",
+                     "520 USDT → доход мерчанта ≈ +20 USDT"):
+            assert part in offer, part
 
-        await b.run(cb(M1, f"orq:take:{d.id}"))
+        assert f"orq:take:{d.id}:w" in b.session.buttons(M1)  # 1000 USDT cover it: both ways are offered
+        await b.run(cb(M1, f"orq:take:{d.id}:w"))
         taken = await deal(d.id)
-        assert taken.status == "assigned" and taken.seller_id == M1
+        assert taken.status == "assigned" and taken.seller_id == M1 and not taken.via_bybit
         m1 = await user(M1)
         assert m1.frozen == taken.seller_debit == D("500")  # 52 000 / 104, frozen when taken
         assert "Мерчант взял заявку" in plain(b.session.last(BUYER))
@@ -93,7 +105,7 @@ def test_full_order_requisites_flow(go):
         assert (await user(M1)).frozen == 0
 
         d2 = await request(b, "10400")  # the merchant gives the same requisites again with one tap
-        await b.run(cb(M1, f"orq:take:{d2.id}"))
+        await b.run(cb(M1, f"orq:take:{d2.id}:w"))
         assert any(x.startswith(f"orq:tpl:{d2.id}:") for x in b.session.buttons(M1) if x)
     go(fn)
 
@@ -106,8 +118,8 @@ def test_two_merchants_race_for_one_request(go):
         await merchant(b, M1)
         await merchant(b, M2)
         d = await request(b)
-        await asyncio.gather(b.dp.feed_update(b.bot, cb(M1, f"orq:take:{d.id}")),
-                             b.dp.feed_update(b.bot, cb(M2, f"orq:take:{d.id}")))
+        await asyncio.gather(b.dp.feed_update(b.bot, cb(M1, f"orq:take:{d.id}:w")),
+                             b.dp.feed_update(b.bot, cb(M2, f"orq:take:{d.id}:w")))
         won = await deal(d.id)
         loser = M2 if won.seller_id == M1 else M1
         assert won.status == "assigned" and (await user(loser)).frozen == 0  # only the winner's funds are frozen
@@ -123,14 +135,14 @@ def test_decline_and_timeouts(go):
         await merchant(b, M1)
         await merchant(b, M2)
         d = await request(b)
-        await b.run(cb(M1, f"orq:take:{d.id}"), cb(M1, f"orq:drop:{d.id}"))
+        await b.run(cb(M1, f"orq:take:{d.id}:w"), cb(M1, f"orq:drop:{d.id}"))
         d = await deal(d.id)
         assert d.status == "searching" and (await user(M1)).frozen == 0
         assert len(offers(b, M2)) == 2 and len(offers(b, M1)) == 1  # re-offered to the others at once
         await tasks.order_timeouts(b.bot)
         assert len(offers(b, M2)) == 2 and len(offers(b, M1)) == 1  # nobody twice, never to the one who declined
 
-        await b.run(cb(M2, f"orq:take:{d.id}"))
+        await b.run(cb(M2, f"orq:take:{d.id}:w"))
         async with models.Session() as s:  # M2 took it and went silent
             (await s.get(Deal, d.id)).expires_at = models.now() - timedelta(seconds=1)
             await s.commit()
@@ -151,24 +163,27 @@ def test_decline_and_timeouts(go):
     go(fn)
 
 
-def test_merchant_limits_and_buyer_cancel(go):
+def test_every_merchant_gets_every_request_and_picks_the_way(go):
     async def fn(b):
         await ready(b)
-        await merchant(b, M1, balance=D(100))  # 100 USDT covers 10 400 ₽ only
+        await merchant(b, M1, balance=D(100))  # 100 USDT cover 10 400 ₽ only
         big = await request(b, "52000")
-        assert not offers(b, M1)
-        async with models.Session() as s:
-            assert await s.scalar(select(Event.id).where(Event.kind == "no_merchants"))
+        assert offers(b, M1)  # no amount limits: the request comes anyway
+        assert f"orq:take:{big.id}:b" in b.session.buttons(M1) and f"orq:take:{big.id}:w" not in b.session.buttons(M1)
+        assert "не хватает" in plain(offers(b, M1)[-1])
+        await b.run(cb(M1, f"orq:take:{big.id}:w"))  # an old button or a forged one: refused with the reason
+        assert any("нужно 500 USDT свободных" in a for a in b.session.alerts())
+        assert (await deal(big.id)).status == "searching"
         await b.run(cb(BUYER, f"orb:cn:{big.id}"))
         assert (await deal(big.id)).status == "cancelled"
+        assert any("отменена покупателем" in plain(t) for t in b.session.texts(M1))  # the offer was closed
         small = await request(b, "8000")
-        assert f"orq:take:{small.id}" in b.session.buttons(M1)
-        await b.run(cb(M1, f"orq:take:{small.id}"), cb(BUYER, f"orb:cn:{small.id}"))
+        assert f"orq:take:{small.id}:w" in b.session.buttons(M1)
+        await b.run(cb(M1, f"orq:take:{small.id}:w"))
+        assert (await user(M1)).frozen == (await deal(small.id)).seller_debit
+        await b.run(cb(BUYER, f"orb:cn:{small.id}"))
         assert (await deal(small.id)).status == "cancelled" and (await user(M1)).frozen == 0
         assert "Покупатель отменил заявку" in plain(b.session.last(M1))
-        await b.run(cb(M1, "om"), cb(M1, "om:acc:0"))
-        await request(b, "9000")
-        assert len(offers(b, M1)) == 1  # switched off: no new offers
     go(fn)
 
 
@@ -184,7 +199,7 @@ def test_api_falls_back_to_order_requisites(go):
             order = await r.json()
             assert order["status"] == "searching_requisites" and order["requisites"] is None and order["order_requisites"]
             assert order["search_expires_at"]
-            await b.run(cb(M1, f"orq:take:{order['id']}"))
+            await b.run(cb(M1, f"orq:take:{order['id']}:w"))
             await give(b, M1, order["id"])
             got = await (await c.get(f"/v1/orders/{order['id']}", headers=auth(token))).json()
             assert got["status"] == "awaiting_payment" and got["requisites"]["number"] == "5536913812345672"
@@ -205,14 +220,14 @@ def test_order_cabinet_default_time_and_two_tap_template(go):
         await b.run(cb(M1, "om"), cb(M1, "om:pay"))
         assert "на оплату: 20 мин" in plain(b.session.last(M1))
         d = await request(b)
-        await b.run(cb(M1, f"orq:take:{d.id}"))
+        await b.run(cb(M1, f"orq:take:{d.id}:w"))
         await give(b, M1, d.id, 20)
         await b.run(cb(BUYER, f"dl:rc:{d.id}"), msg(BUYER, document=PDF), cb(M1, f"dl:ok2:{d.id}"))
         await b.run(cb(M1, "om"))
         text = plain(b.session.last(M1))
         assert "Сегодня: 1 · 52 000 ₽ · +20 USDT" in text and "Результаты" in text  # 520 − 500 at 104 ₽
         d2 = await request(b, "10400")
-        await b.run(cb(M1, f"orq:take:{d2.id}"))
+        await b.run(cb(M1, f"orq:take:{d2.id}:w"))
         tpl = next(x for x in b.session.buttons(M1) if x and x.startswith(f"orq:tpl:{d2.id}:"))
         await b.run(cb(M1, tpl))  # tap 1: the saved requisites, default time — straight to the check screen
         assert "На оплату: 20 мин" in plain(b.session.last(M1)) and f"orq:ok:{d2.id}" in b.session.buttons(M1)
@@ -255,8 +270,8 @@ def test_admin_commissions_and_order_rate(go):
         static = await create_deal(b, amount="10000")
         assert (static.seller_pct, static.seller_debit, static.buyer_credit) == (D("5.5"), D("94.5"), D(94))
         order = await request(b, "10200", buyer=OTHER)
-        assert "по 102 ₽" in plain([t for t in b.session.texts(M1) if "Ордерная заявка" in t][-1])
-        await b.run(cb(M1, f"orq:take:{order.id}"))
+        assert "Курс ордера: 102 ₽" in plain(offers(b, M1)[-1])
+        await b.run(cb(M1, f"orq:take:{order.id}:w"))
         assert (await deal(order.id)).seller_debit == D(100)  # 10 200 / 102
 
         async with models.Session() as s:  # the platform fee is cut below a personal rate: it is capped
@@ -286,36 +301,42 @@ def kb_data(m):
 
 async def bybit_requisites(b, did, link=LINK):
     """The merchant sends the link, the operator takes it and gives the requisites of the order."""
-    await b.run(cb(M1, f"orq:take:{did}"), msg(M1, link), cb(OP, f"opq:go:{did}"))
+    await b.run(cb(M1, f"orq:take:{did}:b"), msg(M1, link), cb(OP, f"opq:go:{did}"))
     await give(b, OP, did)
 
 
 def test_bybit_order_flow_without_balance(go):
     async def fn(b):
         await ready(b)
-        await merchant(b, M1, balance=D(0), mode="bybit")  # a Bybit merchant needs no balance in the bot
+        await merchant(b, M1, balance=D(0))  # a Bybit order needs no balance in the bot
         d = await request(b)
-        assert f"orq:take:{d.id}" in b.session.buttons(M1)
-        assert "Через Bybit-ордер" in plain(offers(b, M1)[-1])
+        assert f"orq:take:{d.id}:b" in b.session.buttons(M1) and f"orq:take:{d.id}:w" not in b.session.buttons(M1)
+        assert "Bybit-ордер: баланс не нужен" in plain(offers(b, M1)[-1])
 
-        await b.run(cb(M1, f"orq:take:{d.id}"))
+        await b.run(cb(M1, f"orq:take:{d.id}:b"))
         d = await deal(d.id)
         assert d.status == "assigned" and d.via_bybit and (await user(M1)).frozen == 0
         assert "Пришлите сюда ссылку на ордер" in plain(b.session.last(M1)) and "500 USDT" in plain(b.session.last(M1))
 
         await b.run(msg(M1, "https://evil.example/order/1"))
         assert "Нужна ссылка на ордер Bybit" in plain(b.session.last(M1))
-        await b.run(msg(M1, LINK))
+        await b.run(msg(OP2, "/start"), msg(M1, LINK))
         d = await deal(d.id)
         assert (d.status, d.bybit_url, d.operator_id) == ("checking", LINK, None)
         assert "оператор проверяет" in plain(b.session.last(BUYER))
-        to_op = [t for t in b.session.texts(OP) if "Bybit-ордер на проверку" in t][-1]
-        for part in (LINK, "Сумма ордера: 52 000 ₽", "Курс ордерного мерчанта: 104 ₽", "Зайти на: 500 USDT"):
-            assert part in plain(to_op) or part in to_op
-        assert f"opq:go:{d.id}" in b.session.buttons(OP2)
+        to_op = [t for t in b.session.texts(OP) if "Bybit-ордер · заявка" in t][-1]
+        for part in ("Сумма ордера: 52 000 ₽", "Курс мерчанта: 104 ₽", "Зайти на: 500 USDT"):
+            assert part in plain(to_op)
+        assert LINK not in to_op  # the link only goes to the operator who accepts the order
+        assert f"opq:go:{d.id}" in b.session.buttons(OP) and f"opq:go:{d.id}" in b.session.buttons(OP2)
 
-        await b.run(msg(OP2, "/start"), cb(OP, f"opq:go:{d.id}"), cb(OP2, f"opq:go:{d.id}"))
-        assert any("уже взял другой оператор" in a for a in b.session.alerts())
+        await b.run(cb(OP, f"opq:go:{d.id}"))
+        assert (await deal(d.id)).operator_id == OP
+        assert LINK in b.session.last(OP)  # now he has it
+        closed = [m for m in b.session.calls if type(m).__name__ == "EditMessageText" and m.chat_id == OP2]
+        assert closed and "принял другой оператор" in plain(closed[-1].text)  # gone for the others
+        await b.run(cb(OP2, f"opq:go:{d.id}"))
+        assert any("уже принял другой оператор" in a for a in b.session.alerts())
         assert (await deal(d.id)).operator_id == OP
         await b.run(cb(M1, f"orq:k:{d.id}:card"))  # the merchant cannot give the requisites himself
         assert any("уже не у вас" in a for a in b.session.alerts())
@@ -340,6 +361,7 @@ def test_bybit_order_flow_without_balance(go):
         async with models.Session() as s:
             fee = await s.scalar(select(Ledger.delta).where(Ledger.user_id.is_(None), Ledger.ref == f"deal:{d.id}"))
             assert fee == D("11.2")
+            assert (await s.get(Operator, OP)).debt == D(500)  # the order's USDT are on his Bybit: he owes them
         assert "Оператор подтвердил оплату" in plain(b.session.last(M1))
     go(fn)
 
@@ -347,7 +369,7 @@ def test_bybit_order_flow_without_balance(go):
 def test_operator_dispute_wins_with_proof(go):
     async def fn(b):
         await ready(b)
-        await merchant(b, M1, balance=D(0), mode="bybit")
+        await merchant(b, M1, balance=D(0))
         d = await request(b)
         await bybit_requisites(b, d.id)
         await b.run(cb(BUYER, f"dl:rc:{d.id}"), msg(BUYER, document=PDF),
@@ -376,9 +398,9 @@ def test_operator_dispute_wins_with_proof(go):
 def test_operator_rejects_link_reused_link_and_check_timeout(go):
     async def fn(b):
         await ready(b)
-        await merchant(b, M1, balance=D(0), mode="bybit")
+        await merchant(b, M1, balance=D(0))
         d = await request(b)
-        await b.run(cb(M1, f"orq:take:{d.id}"), msg(M1, LINK), cb(OP, f"opq:rj:{d.id}"))
+        await b.run(cb(M1, f"orq:take:{d.id}:b"), msg(M1, LINK), cb(OP, f"opq:rj:{d.id}"))
         d = await deal(d.id)
         assert (d.status, d.bybit_url) == ("assigned", None)
         assert "Оператор отклонил ссылку" in plain(b.session.last(M1)) and f"orq:give:{d.id}" in b.session.buttons(M1)
@@ -386,7 +408,7 @@ def test_operator_rejects_link_reused_link_and_check_timeout(go):
         assert (await deal(d.id)).status == "checking"
 
         d2 = await request(b, "10400", buyer=OTHER)
-        await b.run(cb(M1, f"orq:take:{d2.id}"), msg(M1, LINK))  # the same order for another request
+        await b.run(cb(M1, f"orq:take:{d2.id}:b"), msg(M1, LINK))  # the same order for another request
         assert "уже была в заявке" in plain(b.session.last(M1)) and (await deal(d2.id)).status == "assigned"
 
         async with models.Session() as s:  # no operator gave the requisites in time
@@ -404,9 +426,9 @@ def test_operator_rejects_link_reused_link_and_check_timeout(go):
 def test_buyer_cancels_while_operator_checks(go):
     async def fn(b):
         await ready(b)
-        await merchant(b, M1, balance=D(0), mode="bybit")
+        await merchant(b, M1, balance=D(0))
         d = await request(b)
-        await b.run(cb(M1, f"orq:take:{d.id}"), msg(M1, LINK), cb(OP, f"opq:go:{d.id}"), cb(BUYER, f"orb:cn:{d.id}"))
+        await b.run(cb(M1, f"orq:take:{d.id}:b"), msg(M1, LINK), cb(OP, f"opq:go:{d.id}"), cb(BUYER, f"orb:cn:{d.id}"))
         assert (await deal(d.id)).status == "cancelled"
         assert "Отмените ордер на Bybit" in plain(b.session.last(M1))
         assert any("не выдавайте реквизиты" in t for t in b.session.texts(OP))
@@ -416,12 +438,12 @@ def test_buyer_cancels_while_operator_checks(go):
 def test_api_bybit_order_statuses_history_and_liquidity(go):
     async def fn(b):
         await ready(b)
-        await merchant(b, M1, balance=D(0), mode="bybit")
+        await merchant(b, M1, balance=D(0))
         token = await apply_and_approve(b)
         async with TestClient(TestServer(build_app(b.bot))) as c:
             liq = await (await c.get("/v1/liquidity", headers=auth(token))).json()
-            assert liq["order_requisites"] == {"available": True, "merchants": 1, "min_rub": "5000.00",
-                                               "max_rub": "100000.00"}
+            assert liq["order_requisites"] == {"available": True, "merchants": 1, "min_rub": "1000.00",
+                                               "max_rub": "100000.00"}  # any amount of the order range
             r = await c.post("/v1/orders", headers=auth(token), json={"amount_rub": "52000", "external_id": "b-1"})
             order = await r.json()
             assert (r.status, order["status"], order["next_action"]) == (202, "searching_requisites", "wait")
@@ -432,7 +454,7 @@ def test_api_bybit_order_statuses_history_and_liquidity(go):
                     await api.enqueue_changes(s)
                 return await (await c.get(f"/v1/orders/{order['id']}", headers=auth(token))).json()
 
-            await b.run(cb(M1, f"orq:take:{order['id']}"))
+            await b.run(cb(M1, f"orq:take:{order['id']}:b"))
             assert (await status())["status"] == "merchant_assigned"
             await b.run(msg(M1, LINK))
             got = await status()

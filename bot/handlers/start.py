@@ -9,9 +9,11 @@ from aiogram.types import CallbackQuery, Message
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from bot import guides
 from bot.emoji import back, btn, kb, pe
-from bot.models import OrderMerchant, Ticket, User, now
-from bot.services import deals, events, money, settings
+from bot.models import Operator, OrderMerchant, Ticket, User, now
+from bot.services import deals, events, money, operators, settings
+from bot.handlers.wallet import withdraw_terms
 from bot.ui import BRAND, manual, ok, quote, show, title, warn
 
 router = Router()
@@ -32,11 +34,16 @@ async def main_menu(bot: Bot, s: AsyncSession, user: User, is_admin: bool, src=N
     todo = await deals.seller_todo(s, user.id)
     need_check = [d for d in todo if d.status == "paid"]
     om = await s.get(OrderMerchant, user.id)
+    op = await s.get(Operator, user.id)
+    is_op = await operators.is_operator(s, user.id) or bool(op and op.debt)
+    rate, pct = settings.buyer_terms(user)
     lines = [
         title(pe("shop"), BRAND),
-        quote(f"Баланс: <b>{money.usdt(user.balance)} USDT</b>"
+        quote(f"• Баланс: <b>{money.usdt(user.balance)} USDT</b>"
               + (f" · в сделках {money.usdt(user.frozen)}" if user.frozen else ""),
-              f"Курс: 1 USDT = <b>{money.fmt(settings.dec('rate'))} ₽</b>"),
+              f"• Курс: 1 USDT = <b>{money.fmt(rate)} ₽</b> · комиссия {money.fmt(pct, 3)}%"
+              + (" · ваши условия" if settings.has_terms(user) else ""),
+              f"• Долг оператора: <b>{money.usdt(op.debt)} USDT</b>" if op and op.debt else ""),
     ]
     if not active and not todo and user.balance == 0 and user.frozen == 0:  # a newcomer: one line per section
         lines += [f"{pe('info')} <b>RUB ⇄ USDT</b> — купить за рубли · <b>USDT ⇄ RUB</b> — продавать на свою "
@@ -49,8 +56,11 @@ async def main_menu(bot: Bot, s: AsyncSession, user: User, is_admin: bool, src=N
         [btn("RUB ⇄ USDT", "buy:0", style="success"), btn("USDT ⇄ RUB", "sl", style="danger")],
         btn("Ордерный кабинет" if om and om.status in ("approved", "suspended", "pending") else "Ордерные реквизиты",
             "om", wide=True),
+        btn("Оператор" + (f" · долг {money.usdt(op.debt)} USDT" if op and op.debt else ""), "op", wide=True)
+        if is_op else None,
         [btn("Мои сделки", inline="сделки "), btn("Помощь", "info")],
-        [btn(f"{BRAND} API", "api"), btn("Чат", "chat") if settings.get("chat_id") else None],
+        [btn("Команда", "tm"), btn(f"{BRAND} API", "api")],
+        btn("Чат", "chat") if settings.get("chat_id") else None,
         btn("Админ-панель", "a", wide=True) if is_admin else None,
     ), src)
 
@@ -82,27 +92,30 @@ async def cb_info(c: CallbackQuery, bot: Bot, user: User, state: FSMContext):
 
 async def info_screen(bot: Bot, user: User, src=None):
     url = support_url()
+    rate, pct = settings.buyer_terms(user)
     text = "\n".join([
         title(pe("info"), f"Помощь · {BRAND}"),
-        "<b>Как это работает</b>",
+        "<b>Коротко</b>",
         quote(settings.get("tutorial")),
+        "<b>Инструкции</b> — нажмите на название, откроется статья:",
+        quote(*guides.lines()),
         "<b>Условия</b>",
-        quote(f"Курс: <b>{money.fmt(settings.dec('rate'))} ₽</b> · комиссия покупателя "
-              f"<b>{settings.get('platform_pct')}%</b>",
-              f"Мерчант: <b>{settings.get('seller_pct')}%</b> по карте · ордера по курсу "
+        quote(f"• Курс: <b>{money.fmt(rate)} ₽</b> · комиссия покупателя <b>{money.fmt(pct, 3)}%</b>",
+              f"• Мерчант: <b>{settings.get('seller_pct')}%</b> по карте · ордера по курсу "
               f"<b>{money.fmt(settings.dec('order_rate'))} ₽</b>",
-              f"Оплата сделки: <b>{settings.get('deal_minutes')} мин</b> · спор через "
+              f"• Оплата сделки: <b>{settings.get('deal_minutes')} мин</b> · спор через "
               f"<b>{settings.get('confirm_minutes')} мин</b> без ответа продавца",
-              f"Пополнение: <b>{settings.get('deposit_fee')}%</b> · вывод чеком {settings.human('withdraw_fee')}, "
-              f"на кошелёк {settings.human('chain_withdraw_fee')} + сеть"),
-        f"{pe('info')} Как продавать и работать с ордерами — в {manual('инструкции')}."
-        if settings.get("manual_url") else "",
+              f"• Пополнение: <b>{settings.get('deposit_fee')}%</b>",
+              f"• Вывод: чеком {withdraw_terms('xrocket')} · на кошелёк {withdraw_terms('chain')}",
+              f"• Тимлиду: {settings.get('team_pct')}% от сделок своей команды"),
+        f"{pe('info')} Памятка продавца — в {manual('инструкции')}." if settings.get("manual_url") else "",
         f"Проблема? Напишите оператору: номер сделки и ваш ID <code>{user.id}</code>." if url
         else f"Ваш ID: <code>{user.id}</code>.",
     ])
     await show(bot, user, text, kb(
         btn("Написать оператору", url=url, style="primary") if url else None,
-        btn("Инструкция", url=settings.get("manual_url")) if settings.get("manual_url") else None,
+        [btn("Все инструкции", url=guides.index_url()) if guides.index_url() else None,
+         btn("Памятка продавца", url=settings.get("manual_url")) if settings.get("manual_url") else None],
         back("menu", "В меню"),
     ), src)
 

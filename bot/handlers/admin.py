@@ -13,11 +13,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.config import config
 from bot.emoji import back, btn, kb, pe
-from bot.handlers.deal import STATUS, dispute_kb, dispute_text, push, send_files, verdict_effects
+from bot.handlers.admin_deals import deal_view
+from bot.handlers.deal import STATUS, push, send_files, verdict_effects
 from bot.handlers.seller import card_icon, card_label
-from bot.handlers.wallet import ledger_line, parse_usdt
-from bot.models import Adjustment, ApiApplication, Card, OrderMerchant, Deal, Deposit, Event, Ledger, Ticket, User, Withdrawal, now
-from bot.services import audit, deals, events, money, orders, settings, xrocket
+from bot.handlers.wallet import ledger_line, parse_usdt, withdraw_terms
+from bot.models import (Adjustment, ApiApplication, Card, Deal, Deposit, Event, Ledger, Operator, OrderMerchant, Signup,
+                        Team, Ticket, User, Withdrawal, now)
+from bot.services import audit, deals, events, money, operators, orders, settings, teams, xrocket
 from bot.ui import at, esc, notify, ok, quote, show, title, warn
 
 router = Router()
@@ -30,7 +32,6 @@ class Adm(StatesGroup):
     search = State()
     balance = State()
     comment = State()
-    message = State()
     reply = State()
     verdict = State()
     pct = State()
@@ -69,7 +70,11 @@ async def admin_screen(bot: Bot, s: AsyncSession, user: User, src=None):
     api_apps = await count(ApiApplication.status == "pending")
     om_apps = await count(OrderMerchant.status == "pending")
     searching = await count(Deal.status.in_(orders.REQUEST))
-    backlog = await count(Event.alert, Event.sent_at.is_(None))
+    free_orders = await count(Deal.status == "checking", Deal.operator_id.is_(None))
+    team_apps = await count(Team.status == "pending")
+    signups = await count(Signup.status == "pending")
+    op_debt = await operators.total_debt(s)
+    backlog = await count(Event.alert, Event.sent_at.is_(None), Event.attempts < events.MAX_ATTEMPTS)
     income24 = await s.scalar(select(func.coalesce(func.sum(Ledger.delta), 0))
                               .where(Ledger.user_id.is_(None), Ledger.created_at > day))
     income = await s.scalar(select(func.coalesce(func.sum(Ledger.delta), 0)).where(Ledger.user_id.is_(None)))
@@ -83,15 +88,18 @@ async def admin_screen(bot: Bot, s: AsyncSession, user: User, src=None):
                             "выводы могут не пройти.")
     except Exception:
         rocket = "недоступно"
-    todo = [(disputes, f"{pe('flag')} Споров: <b>{disputes}</b>"),
-            (slow, f"{pe('clock')} Продавец молчит дольше {settings.get('confirm_minutes')} мин: <b>{slow}</b>"),
-            (unknown, f"{pe('up')} Выводов на проверке: <b>{unknown}</b>"),
-            (tickets, f"{pe('support')} Открытых обращений: <b>{tickets}</b>"),
-            (approvals, f"{pe('dollar')} Корректировок ждут подтверждения: <b>{approvals}</b>"),
-            (api_apps, f"{pe('key')} Заявок на API: <b>{api_apps}</b>"),
-            (om_apps, f"{pe('key')} Анкет ордерных мерчантов: <b>{om_apps}</b>"),
-            (searching, f"{pe('search')} Ордерных заявок ищут реквизиты: <b>{searching}</b>"),
-            (backlog, f"{pe('warn')} Недоставленных уведомлений: <b>{backlog}</b>")]
+    todo = [(signups, f"• Заявок на вход: <b>{signups}</b>"),
+            (disputes, f"• Споров: <b>{disputes}</b>"),
+            (slow, f"• Продавец молчит дольше {settings.get('confirm_minutes')} мин: <b>{slow}</b>"),
+            (unknown, f"• Выводов на проверке: <b>{unknown}</b>"),
+            (free_orders, f"• Bybit-ордеров ждут оператора: <b>{free_orders}</b>"),
+            (tickets, f"• Открытых обращений: <b>{tickets}</b>"),
+            (approvals, f"• Корректировок ждут подтверждения: <b>{approvals}</b>"),
+            (api_apps, f"• Заявок на API: <b>{api_apps}</b>"),
+            (om_apps, f"• Анкет ордерных мерчантов: <b>{om_apps}</b>"),
+            (team_apps, f"• Заявок на команды: <b>{team_apps}</b>"),
+            (searching, f"• Ордерных заявок ищут реквизиты: <b>{searching}</b>"),
+            (backlog, f"• Недоставленных уведомлений: <b>{backlog}</b>")]
     active = [line for n, line in todo if n]
     await show(bot, user, "\n".join([
         title(pe("settings"), "Админ-панель"),
@@ -99,27 +107,33 @@ async def admin_screen(bot: Bot, s: AsyncSession, user: User, src=None):
         quote(*active) if active else f"{pe('ok')} Очереди пусты",
         "<b>Сводка</b>",
         quote(
-            f"Пользователей: <b>{users}</b> · на смене: <b>{online}</b> · карт в работе: <b>{cards}</b>",
-            f"За 24 ч: <b>{done24}</b> сделок · <b>{money.fmt(Decimal(volume24))} ₽</b> · открыто сейчас: {opened}",
-            f"Доход: 24 ч <b>{money.usdt(Decimal(income24))}</b> · всего <b>{money.usdt(Decimal(income))} USDT</b>",
-            f"Балансы пользователей: <b>{money.usdt(held)} USDT</b> · xRocket: {rocket}",
+            f"• Пользователей: <b>{users}</b> · на смене: <b>{online}</b> · карт в работе: <b>{cards}</b>",
+            f"• За 24 ч: <b>{done24}</b> сделок · <b>{money.fmt(Decimal(volume24))} ₽</b> · открыто сейчас: {opened}",
+            f"• Доход: 24 ч <b>{money.usdt(Decimal(income24))}</b> · всего <b>{money.usdt(Decimal(income))} USDT</b>",
+            f"• Балансы пользователей: <b>{money.usdt(held)} USDT</b> · xRocket: {rocket}",
+            f"• Долг операторов (Bybit): <b>{money.usdt(op_debt)} USDT</b>" if op_debt else "",
         ),
     ]) + solvency, kb(
+        btn(f"Заявки на вход ({signups})", "asu", "pencil", style="primary") if signups else None,
         btn(f"Споры ({disputes})", "adl:dispute", "flag", style="danger") if disputes else None,
         btn(f"Продавец молчит ({slow})", "adl:slow", "clock") if slow else None,
         btn(f"Выводы на проверке ({unknown})", "awl:check", "up", style="danger") if unknown else None,
+        btn(f"Ордера без оператора ({free_orders})", "aopl", "shop", style="danger") if free_orders else None,
         btn(f"Обращения ({tickets})", "atl", "support", style="primary") if tickets else None,
         btn(f"Корректировки ({approvals})", "aadjl", "dollar", style="primary") if approvals else None,
         btn(f"Заявки на API ({api_apps})", "aapi", "key", style="primary") if api_apps else None,
         btn(f"Анкеты мерчантов ({om_apps})", "aoml", "key", style="primary") if om_apps else None,
+        btn(f"Заявки на команды ({team_apps})", "atml", "people", style="primary") if team_apps else None,
         btn("Финансы: сколько можно забрать", "afin", style="success"),
         [btn("Найти", "au", "search"), btn("Сделки", "ad", "list")],
         [btn("Ввод и вывод", "al", "wallet"), btn("Карты", "ac:0", "card")],
-        [btn("Комиссии", "acm", "percent"), btn("Ордерные мерчанты", "aoml", "key")],
-        [btn("API-клиенты", "aapi", "key"), btn("Чат и рассылка", "ach", "people")],
-        [btn("Обращения", "atl", "support"), btn("Отчёты CSV", "arp", "doc")],
-        [btn("Настройки", "as", "settings"), btn("Журнал", "aa", "list")],
-        [btn("Обновить", "a", "refresh"), back("menu", "В меню")],
+        [btn("Ордерные мерчанты", "aoml", "key"), btn("Операторы", "aopl", "shop")],
+        [btn("Команды", "atml", "people"), btn("API-клиенты", "aapi", "key")],
+        [btn("Комиссии", "acm", "percent"), btn("Настройки", "as", "settings")],
+        [btn("Чат и рассылка", "ach", "people"), btn("Обращения", "atl", "support")],
+        [btn("Отчёты CSV", "arp", "doc"), btn("Журнал", "aa", "list")],
+        [btn("Заявки на вход", "asu:all", "pencil"), btn("Обновить", "a", "refresh")],
+        back("menu", "В меню"),
     ), src)
 
 
@@ -239,6 +253,8 @@ async def commissions_screen(bot: Bot, s: AsyncSession, admin: User, src=None, n
     sp, orate = settings.dec("seller_pct"), settings.dec("order_rate")
     q, qo = money.quote(Decimal(10000), rate, sp, pp), money.quote_fixed(Decimal(10000), rate, orate, pp)
     personal = (await s.scalars(select(User).where(User.pct_static.is_not(None)).order_by(User.id).limit(20))).all()
+    buyers = (await s.scalars(select(User).where((User.buy_rate.is_not(None)) | (User.buy_pct.is_not(None)))
+                              .order_by(User.id).limit(20))).all()
     pct = lambda v: f"{money.fmt(v, 3)}%"  # noqa: E731
     await show(bot, admin, "\n".join([
         title(pe("percent"), "Комиссии и проценты"),
@@ -251,20 +267,28 @@ async def commissions_screen(bot: Bot, s: AsyncSession, admin: User, src=None, n
         f"На 10 000 ₽ покупатель получает {money.usdt(q.buyer_credit)} USDT; площадке {money.usdt(q.platform_fee)} "
         f"(карта) или {money.usdt(qo.platform_fee)} USDT (ордер: мерчант отдаёт {money.usdt(qo.seller_debit)}).",
         title(pe("wallet"), "Кошелёк"),
-        quote(f"{pe('down')} Пополнение (счёт и адрес): {settings.get('deposit_fee')}%",
-              f"{pe('up')} Вывод чеком: {settings.human('withdraw_fee')} · на кошелёк: "
-              f"{settings.human('chain_withdraw_fee')} + сеть xRocket"),
-        "API-клиенты могут работать по своим условиям (курс и процент) — «API-клиенты» → клиент.",
+        quote(f"• Пополнение (счёт и адрес): {settings.get('deposit_fee')}%",
+              f"• Вывод чеком: {withdraw_terms('xrocket')}",
+              f"• Вывод на кошелёк: {withdraw_terms('chain')} — комиссия сети xRocket внутри фикс. части"),
+        title(pe("people"), "Команды"),
+        quote(f"• Тимлиду: <b>{settings.get('team_pct')}%</b> от сделок участников (из дохода площадки, не больше него)"),
+        "Личные условия: API-клиентам — «API-клиенты» → клиент; покупателям — профиль → «Условия покупателя».",
         title(pe("star"), f"Личные ставки мерчантов ({len(personal)})"),
         quote(*[f"<code>{u.id}</code> {esc((u.name or '—')[:20])}: карта {pct(u.pct_static)}" for u in personal])
         if personal else "Нет — все работают по общим ставкам. Задать: профиль пользователя → «Проценты мерчанта».",
+        title(pe("star"), f"Личные условия покупателей ({len(buyers)})"),
+        quote(*[f"<code>{u.id}</code> {esc((u.name or '—')[:20])}: курс "
+                f"{money.fmt(settings.buyer_terms(u)[0])} ₽ · {pct(settings.buyer_terms(u)[1])}" for u in buyers])
+        if buyers else "Нет — задать: профиль пользователя → «Условия покупателя».",
         "Ставка фиксируется в сделке при её создании: изменения не трогают открытые сделки.",
     ]) + note, kb(
         [btn("Покупатель", "acs:platform_pct", "dollar"), btn("Курс", "acs:rate", "swap")],
         [btn("Мерчант: карта", "acs:seller_pct", "card"), btn("Курс ордерного", "acs:order_rate", "key")],
-        [btn("Пополнение", "acs:deposit_fee", "down"), btn("Вывод чеком", "acs:withdraw_fee", "up")],
-        btn("Вывод на кошелёк", "acs:chain_withdraw_fee", "up"),
+        [btn("Пополнение", "acs:deposit_fee", "down"), btn("Вывод, %", "acs:withdraw_pct", "up")],
+        [btn("Вывод чеком, фикс", "acs:withdraw_fee", "up"), btn("На кошелёк, фикс", "acs:chain_withdraw_fee", "up")],
+        btn("Процент тимлида", "acs:team_pct", "people"),
         *[btn(f"Личная ставка · {u.id} {(u.name or '')[:16]}", f"aup:{u.id}", "star") for u in personal],
+        *[btn(f"Покупатель · {u.id} {(u.name or '')[:16]}", f"aut:{u.id}", "star") for u in buyers],
         back("a", "Админ-панель"),
     ), src)
 
@@ -453,6 +477,17 @@ DEP_LABEL = {"new": "создаётся", "active": "ждёт оплаты", "pa
 
 async def user_screen(bot: Bot, s: AsyncSession, admin: User, u: User, src=None, note: str = "", found=None):
     st = await user_stats(s, u.id)
+    oper = await s.get(Operator, u.id)
+    team = await s.get(Team, u.team_id) if u.team_id else None
+    led = await teams.led_by(s, u.id)
+    om = await s.get(OrderMerchant, u.id)
+    is_op = await operators.is_operator(s, u.id)
+    roles = [r for r in (
+        "оператор" if is_op else "",
+        "ордерный мерчант" if om and om.status == "approved" else "",
+        f"тимлид «{esc(led.name)}»" if led and led.status in ("approved", "suspended") else "",
+        f"в команде «{esc(team.name)}»" if team and (not led or led.id != team.id) else "") if r]
+    rate, pct_ = settings.buyer_terms(u)
     status = ("заблокирован" if u.is_banned else "активен") + (" · на смене" if u.is_online else "")
     head = []
     if found:
@@ -465,9 +500,13 @@ async def user_screen(bot: Bot, s: AsyncSession, admin: User, u: User, src=None,
         f"@{esc(u.username or '—')} · зарегистрирован {at(u.created_at, 'd')}",
         f"Статус: {pe('ban') + ' ' if u.is_banned else ''}<b>{status}</b>",
         f"Последняя активность: {at(u.last_seen, 'dt')}",
+        f"Роли: {', '.join(roles)}" if roles else "",
         "",
         quote(f"{pe('dollar')} Доступно: <b>{money.usdt(u.balance)} USDT</b>",
-              f"{pe('lock')} Заморожено: <b>{money.usdt(u.frozen)} USDT</b>"),
+              f"{pe('lock')} Заморожено: <b>{money.usdt(u.frozen)} USDT</b>",
+              f"Долг оператора: <b>{money.usdt(oper.debt)} USDT</b>" if oper and oper.debt else "",
+              f"Личные условия покупки: курс {money.fmt(rate)} ₽ · {money.fmt(pct_, 3)}%" if settings.has_terms(u)
+              else ""),
         quote(
             _role_line(f"{pe('down')} Покупки", st["buy"]),
             _role_line(f"{pe('up')} Продажи", st["sell"]),
@@ -482,10 +521,11 @@ async def user_screen(bot: Bot, s: AsyncSession, admin: User, u: User, src=None,
             f"{'awv' if found[0] == 'wd' else 'adp'}:{found[1].id}", "search", style="primary") if found else None,
         [btn("Сделки", f"aud:{u.id}", "fire"), btn("Операции", f"auh:{u.id}", "list")],
         [btn("Карты", f"auc:{u.id}", "card"), btn("Споры", f"aus:{u.id}", "flag")],
-        [btn("Ввод и вывод", f"auw:{u.id}", "wallet"), btn("Написать", f"amsg:{u.id}", "support")],
+        [btn("Ввод и вывод", f"auw:{u.id}", "wallet"), btn("Написать", f"dm:0:{u.id}", "support")],
         btn("Изменить баланс", f"aadj:{u.id}", "dollar", style="primary"),
-        btn("Процент мерчанта" + (" · личный" if u.pct_static is not None else ""),
-            f"aup:{u.id}", "star"),
+        [btn("Процент мерчанта" + (" · личный" if u.pct_static is not None else ""), f"aup:{u.id}", "star"),
+         btn("Условия покупателя" + (" · личные" if settings.has_terms(u) else ""), f"aut:{u.id}", "star")],
+        btn("Оператор: долг и ордера", f"aop:{u.id}", "shop") if is_op or (oper and oper.debt) else None,
         [btn("Снять со смены", f"auo:{u.id}", "pause") if u.is_online else None,
          btn("Разблокировать", f"aub:{u.id}:0", "ok", style="success") if u.is_banned
          else btn("Заблокировать", f"aub:{u.id}:1", "ban", style="danger")],
@@ -832,33 +872,6 @@ async def cb_adjust_pending(c: CallbackQuery, bot: Bot, s: AsyncSession, user: U
     ), c)
 
 
-# ---------- direct message to a user (support reply) ----------
-
-@router.callback_query(F.data.regexp(r"^amsg:(\d+)$"))
-async def cb_message(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User, state: FSMContext):
-    uid = int(c.data.split(":")[1])
-    u = await s.get(User, uid)
-    if not u:
-        return await c.answer()
-    await state.set_state(Adm.message)
-    await state.update_data(uid=uid)
-    await show(bot, user, f"{title(pe('support'), 'Сообщение пользователю')} {_who(u)}\n\n"
-                          "Отправьте текст (до 2000 символов). Пользователь сможет ответить через «Помощь».",
-               kb(back(f"auv:{uid}", "Отмена")), c)
-
-
-@router.message(Adm.message, F.text)
-async def msg_message(m: Message, bot: Bot, s: AsyncSession, user: User, state: FSMContext):
-    uid = (await state.get_data())["uid"]
-    await state.set_state(None)
-    u = await s.get(User, uid)
-    sent = await notify(bot, uid, f"{pe('support')} <b>Сообщение от поддержки</b>\n\n{esc(m.text[:2000])}",
-                        kb(btn("Ответить", "sup", "support"), back("x", "Скрыть", "cross")))
-    audit.log(s, user.id, "message", f"user:{uid}", m.text[:2000])
-    await user_screen(bot, s, user, u, note=ok("Сообщение доставлено") if sent
-                      else warn("Не доставлено: пользователь заблокировал бота"))
-
-
 @router.callback_query(F.data.regexp(r"^auc:(\d+)$"))
 async def cb_user_cards(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User):
     uid = int(c.data.split(":")[1])
@@ -958,7 +971,8 @@ async def cb_card_action(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User
 
 @router.callback_query(F.data == "ad")
 async def cb_deals(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User):
-    await show(bot, user, title(pe("list"), "Сделки") + "\n\nКонкретную сделку найдите через «Найти» → <code>#номер</code>.", kb(
+    await show(bot, user, title(pe("list"), "Сделки") + "\n\nКонкретная сделка по номеру: команда <code>/deal 15</code>, "
+               "«Найти» → <code>#15</code> или «Открыть» на её карточке в лог-чате.", kb(
         btn("Споры", "adl:dispute", "flag"),
         btn("Продавец молчит", "adl:slow", "clock"),
         btn("Все открытые", "adl:open", "fire"),
@@ -997,18 +1011,6 @@ async def cb_deal_list(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User):
 def ago(dt) -> str:
     minutes = int((now() - deals.aware(dt)).total_seconds() // 60)
     return f"{minutes} мин" if minutes < 60 else f"{minutes // 60} ч" if minutes < 2880 else f"{minutes // 1440} дн"
-
-
-async def deal_view(bot: Bot, s: AsyncSession, user: User, d: Deal, src=None, note: str = ""):
-    markup = dispute_kb(d, btn("История сделки", f"aev:deal:{d.id}", "list"), back("ad", "Сделки"))
-    await show(bot, user, await dispute_text(s, d) + note, markup, src)
-
-
-@router.callback_query(F.data.regexp(r"^adv:(\d+)$"))
-async def cb_deal_view(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User):
-    d = await s.get(Deal, int(c.data.split(":")[1]))
-    if d:
-        await deal_view(bot, s, user, d, c)
 
 
 @router.callback_query(F.data.regexp(r"^af:(\d+)$"))
@@ -1093,6 +1095,9 @@ async def resolve(bot: Bot, s: AsyncSession, user: User, did: int, verdict: str,
         d = await s.get(Deal, did, populate_existing=True)
         return await deal_view(bot, s, user, d, src, warn(error or "Сделка уже закрыта другим администратором"))
     res.resolution = comment or None
+    if verdict == "c" and res.is_order and res.card_id is None:  # a request: its offers in chats and bots close
+        from bot.handlers.orders import CLOSED, close_offers
+        await close_offers(bot, s, res, f"Заявка #{res.id} {CLOSED['void']}")
     audit.log(s, user.id, "resolve", f"deal:{res.id}", VERDICTS[verdict] + (f": {comment}" if comment else ""))
     events.add(s, f"deal:{res.id}", "resolved", f"Решено {VERDICTS[verdict]} ({user.name})"
                + (f": {comment}" if comment else ""), notice=True)

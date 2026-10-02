@@ -35,6 +35,14 @@ class User(Base):
     # personal static-card merchant rate set by an admin; None = the general seller_pct.
     # Order merchants have no percent: they work at the fixed order_rate.
     pct_static: Mapped[Decimal | None] = mapped_column(Numeric(6, 3))
+    # personal terms of this user as a buyer (static card and order requisites alike), set by an admin;
+    # None = the general rate / platform_pct. Like an API client's own terms.
+    buy_rate: Mapped[Decimal | None] = mapped_column(RUB)
+    buy_pct: Mapped[Decimal | None] = mapped_column(Numeric(6, 3))
+    team_id: Mapped[int | None] = mapped_column(index=True)  # the team he joined by its leader's link
+    # new | pending | approved | rejected: with signup_review on, a new user fills an application (Signup) and uses
+    # the bot after an admin approves it; users from before the review existed are approved
+    access: Mapped[str] = mapped_column(String(10), default="new", server_default="approved")
 
 
 class Card(Base):
@@ -108,9 +116,12 @@ class Deal(Base):
     via_bybit: Mapped[bool] = mapped_column(default=False, server_default=false())
     bybit_url: Mapped[str | None] = mapped_column(String(300), index=True)
     operator_id: Mapped[int | None] = mapped_column(BigInteger)
-    # the buyer's side rate when it differs from `rate` (an API client with its own terms); `rate` stays the
+    # the buyer's side rate when it differs from `rate` (an API client or a buyer with own terms); `rate` stays the
     # merchant side rate, so the merchant's terms and income never depend on the client
     buyer_rate: Mapped[Decimal | None] = mapped_column(RUB)
+    # the merchant's team: its leader got team_fee USDT out of the platform's fee when the deal completed
+    team_id: Mapped[int | None]
+    team_fee: Mapped[Decimal] = mapped_column(USDT, default=Decimal(0), server_default=text("0"))
 
 
 class Deposit(Base):
@@ -127,6 +138,8 @@ class Deposit(Base):
     network: Mapped[str | None] = mapped_column(String(8))
     address: Mapped[str | None] = mapped_column(String(128))
     expires_at: Mapped[datetime | None]
+    # deposit: credited to the balance minus deposit_fee; debt: an operator repays his debt (no fee)
+    purpose: Mapped[str] = mapped_column(String(8), default="deposit", server_default="deposit")
 
 
 class Withdrawal(Base):
@@ -235,7 +248,9 @@ class FsmState(Base):
 
 class OrderMerchant(Base):
     """Merchant who gives requisites on request (order requisites). The row is also the application:
-    pending -> approved | rejected; approved -> suspended by an admin."""
+    pending -> approved | rejected; approved -> suspended by an admin. An approved merchant gets every request
+    (no amount limits, no on/off switch) and picks how to work each one when he takes it: a Bybit order link or
+    his own balance (deal.via_bybit)."""
     __tablename__ = "order_merchants"
     user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"), primary_key=True)
     status: Mapped[str] = mapped_column(String(10), index=True, default="pending")
@@ -243,13 +258,7 @@ class OrderMerchant(Base):
     speed: Mapped[str] = mapped_column(String(40))  # how fast a card can be given
     banks: Mapped[str] = mapped_column(String(200), default="")
     about: Mapped[str] = mapped_column(Text, default="")
-    min_rub: Mapped[Decimal] = mapped_column(RUB)
-    max_rub: Mapped[Decimal] = mapped_column(RUB)
-    max_open_rub: Mapped[Decimal] = mapped_column(RUB)  # RUB in open order deals at once (own risk / exchange balance)
-    accepting: Mapped[bool] = mapped_column(default=False)  # receives new requests right now
     pay_minutes: Mapped[int] = mapped_column(default=15, server_default=text("15"))  # default payment window given
-    # bybit: gives a Bybit P2P order link, no balance needed; balance: freezes his USDT and gives requisites himself
-    mode: Mapped[str] = mapped_column(String(8), default="bybit", server_default="bybit")
     admin_id: Mapped[int | None] = mapped_column(BigInteger)
     reason: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(default=now)
@@ -257,7 +266,9 @@ class OrderMerchant(Base):
 
 
 class OrderOffer(Base):
-    """A request shown to a merchant (message with "Take"). declined: not offered to him again."""
+    """A request shown somewhere with a button. kind: merchant (his private chat, «Взять»), chat (a post in the
+    community or a team chat, user_id = the chat id, a link into the bot), operator (a Bybit order waiting for an
+    operator, «Принять ордер»). declined: the merchant gave the request up and is not offered it again."""
     __tablename__ = "order_offers"
     id: Mapped[int] = mapped_column(primary_key=True)
     deal_id: Mapped[int] = mapped_column(ForeignKey("deals.id"), index=True)
@@ -265,6 +276,54 @@ class OrderOffer(Base):
     msg_id: Mapped[int | None]
     declined: Mapped[bool] = mapped_column(default=False)
     created_at: Mapped[datetime] = mapped_column(default=now)
+    kind: Mapped[str] = mapped_column(String(8), default="merchant", server_default="merchant")
+
+
+class Operator(Base):
+    """Operator of Bybit-order deals, added by an admin (OPERATOR_IDS in .env still work). He enters the merchant's
+    Bybit order, gives its requisites and confirms the payment: the order's USDT arrive on his Bybit account, so each
+    confirmed deal adds its seller_debit to his debt; he repays it with an xRocket invoice or from his balance."""
+    __tablename__ = "operators"
+    __table_args__ = (CheckConstraint("debt >= 0", name="ck_operators_debt_nonneg"),)
+    user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"), primary_key=True)
+    active: Mapped[bool] = mapped_column(default=True)
+    debt: Mapped[Decimal] = mapped_column(USDT, default=Decimal(0))
+    added_by: Mapped[int | None] = mapped_column(BigInteger)
+    created_at: Mapped[datetime] = mapped_column(default=now)
+
+
+class Signup(Base):
+    """Application of a new user: who he is (P2P seller or buyer), daily turnover, a screenshot (sellers).
+    pending -> approved | rejected; posted in the log chat's «Заявки на вход» topic with the decision buttons."""
+    __tablename__ = "signups"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"), index=True)
+    role: Mapped[str] = mapped_column(String(8))  # seller | buyer
+    turnover: Mapped[str] = mapped_column(String(60))
+    proof: Mapped[str | None] = mapped_column(String(256))  # screenshot: "photo:<file_id>" or a document file_id
+    status: Mapped[str] = mapped_column(String(10), index=True, default="pending")
+    admin_id: Mapped[int | None] = mapped_column(BigInteger)
+    reason: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(default=now)
+    decided_at: Mapped[datetime | None]
+
+
+class Team(Base):
+    """A team of merchants around a leader. The row is also the application: pending -> approved | rejected;
+    approved -> suspended. Users who start the bot by the leader's link join it; requests are posted in its chat;
+    the leader gets pct (None = the team_pct setting) of every completed deal of a member."""
+    __tablename__ = "teams"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    leader_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"), unique=True)
+    name: Mapped[str] = mapped_column(String(64))
+    about: Mapped[str] = mapped_column(Text, default="")
+    status: Mapped[str] = mapped_column(String(10), index=True, default="pending")
+    chat_id: Mapped[int | None] = mapped_column(BigInteger)
+    pct: Mapped[Decimal | None] = mapped_column(Numeric(6, 3))
+    admin_id: Mapped[int | None] = mapped_column(BigInteger)
+    reason: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(default=now)
+    decided_at: Mapped[datetime | None]
 
 
 class ApiApplication(Base):
@@ -499,6 +558,27 @@ MIGRATIONS: list[tuple[int, list[str]]] = [
         "ALTER TABLE IF EXISTS api_clients ADD COLUMN IF NOT EXISTS rate NUMERIC(14, 2)",
         "ALTER TABLE IF EXISTS api_clients ADD COLUMN IF NOT EXISTS pct NUMERIC(6, 3)",
         "ALTER TABLE deals ADD COLUMN IF NOT EXISTS buyer_rate NUMERIC(14, 2)",
+    ]),
+    (14, [
+        # order merchants get every request and choose Bybit order / balance per request: no limits, no switch;
+        # operators and teams come from create_all; personal buyer terms; operator debt repaid by invoice
+        "ALTER TABLE IF EXISTS order_merchants DROP COLUMN IF EXISTS min_rub",
+        "ALTER TABLE IF EXISTS order_merchants DROP COLUMN IF EXISTS max_rub",
+        "ALTER TABLE IF EXISTS order_merchants DROP COLUMN IF EXISTS max_open_rub",
+        "ALTER TABLE IF EXISTS order_merchants DROP COLUMN IF EXISTS accepting",
+        "ALTER TABLE IF EXISTS order_merchants DROP COLUMN IF EXISTS mode",
+        "ALTER TABLE IF EXISTS order_offers ADD COLUMN IF NOT EXISTS kind VARCHAR(8) NOT NULL DEFAULT 'merchant'",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS buy_rate NUMERIC(14, 2)",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS buy_pct NUMERIC(6, 3)",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS team_id INTEGER",
+        "CREATE INDEX IF NOT EXISTS ix_users_team_id ON users (team_id)",
+        "ALTER TABLE deals ADD COLUMN IF NOT EXISTS team_id INTEGER",
+        "ALTER TABLE deals ADD COLUMN IF NOT EXISTS team_fee NUMERIC(20, 6) NOT NULL DEFAULT 0",
+        "ALTER TABLE deposits ADD COLUMN IF NOT EXISTS purpose VARCHAR(8) NOT NULL DEFAULT 'deposit'",
+    ]),
+    (15, [
+        # entry by application: everyone already in the bot keeps working; signups come from create_all
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS access VARCHAR(10) NOT NULL DEFAULT 'approved'",
     ]),
 ]
 

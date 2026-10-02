@@ -14,7 +14,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from bot.config import config
 from bot.emoji import back, btn, kb, pe
 from bot.handlers.admin import DEP_LABEL, WD_LABEL
-from bot.handlers.wallet import check_deposit, notify_withdrawal, reconcile, send_cheque, sync_withdrawal
+from bot.handlers.wallet import (check_deposit, deposit_done_text, notify_withdrawal, reconcile, send_cheque,
+                                 sync_withdrawal)
 from bot.models import Audit, Deal, Deposit, Event, Ledger, Ticket, User, Withdrawal, now
 from bot.services import audit, events, money, xrocket
 from bot.ui import at, esc, notify, ok, quote, show, title, warn
@@ -256,7 +257,7 @@ async def cb_deposit_check(c: CallbackQuery, bot: Bot, s: AsyncSession, user: Us
     except xrocket.XRocketError as e:
         return await deposit_screen(bot, s, user, dep, c, warn(f"xRocket не ответил: {e.human}. Повторите позже."))
     if st == "credited":
-        await notify(bot, dep.user_id, f"{pe('ok')} <b>Баланс пополнен на {money.usdt(dep.credit)} USDT</b> · счёт #{dep.id}")
+        await notify(bot, dep.user_id, await deposit_done_text(s, dep))
     dep = await s.get(Deposit, dep.id, populate_existing=True)
     await deposit_screen(bot, s, user, dep, c, ok({"credited": "Оплачен, зачислено", "expired": "Истёк без оплаты"}
                                                   .get(st, "Ещё не оплачен")))
@@ -266,16 +267,19 @@ async def cb_deposit_check(c: CallbackQuery, bot: Bot, s: AsyncSession, user: Us
 
 REF_NAMES = {"om": ("Ордерный мерчант", "aom"), "apa": ("Заявка на API", "aap"), "apc": ("API-клиент", "acl"),
              "wd": ("Вывод", "awv"), "dep": ("Пополнение", "adp"), "deal": ("Сделка", "adv"), "user": ("Пользователь", "auv"),
-             "card": ("Карта", "acv"), "adj": ("Корректировка", "adjv"), "ticket": ("Обращение", "atk")}
+             "card": ("Карта", "acv"), "adj": ("Корректировка", "adjv"), "ticket": ("Обращение", "atk"),
+             "op": ("Оператор", "aop"), "team": ("Команда", "atm")}
 
 
-@router.callback_query(F.data.regexp(r"^aev:(wd|dep|deal|user|card|adj|ticket|apa|apc|om):(\d+)$"))
+@router.callback_query(F.data.regexp(r"^aev:(wd|dep|deal|user|card|adj|ticket|apa|apc|om|op|team):(\d+)$"))
 async def cb_events(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User):
     _, kind, oid = c.data.split(":")
     rows = await events.history(s, f"{kind}:{oid}")
     name, cb = REF_NAMES[kind]
-    lines = [f"{at(e.created_at, 'dt')} · {esc(e.text)}" + (f" {pe('bell')}" if e.alert else "") for e in rows]
-    await show(bot, user, title(pe("list"), f"История · {name} #{oid}") + "\n\n"
+    lines = [f"• {at(e.created_at, 'dt')} · {esc(e.text[:200])}" + (f" {pe('bell')}" if e.alert else "") for e in rows]
+    while len("\n".join(lines)) > 3300:  # a long history: the latest events fit into one message
+        lines.pop(0)
+    await show(bot, user, title(pe("list"), f"История · {name} #{oid}") + "\nПоследние события, новые внизу.\n\n"
                + (quote(*lines) if lines else "Событий нет (операция создана до журнала событий)."),
                kb(back(f"{cb}:{oid}", "Назад")), c)
 

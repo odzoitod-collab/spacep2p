@@ -24,9 +24,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.config import config
 from bot.emoji import back, btn, kb, pe
-from bot.models import Card, Deal, Event, OrderMerchant, Session, Setting, User, now
+from bot.models import Card, Deal, Event, OrderMerchant, Session, Setting, Team, User, now
 from bot.services import audit, deals, events, money, orders, settings
-from bot.ui import MSK, clean, esc, notify, ok, paced, quote, show, title
+from bot import ui
+from bot.ui import MSK, clean, deep_link, esc, notify, ok, paced, quote, show, title
 
 log = logging.getLogger(__name__)
 router = Router()
@@ -70,16 +71,23 @@ async def cb_chat(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User):
 
 @events_router.chat_member()
 async def on_member(e: ChatMemberUpdated, s: AsyncSession):
-    """A user joined the community chat by his personal link: one line in his log card."""
-    if e.chat.id != chat_id() or e.new_chat_member.status != "member" or e.old_chat_member.status == "member":
+    """A user joined the community chat or a team chat by his personal link: one line in his log card (and the
+    team's)."""
+    if e.new_chat_member.status != "member" or e.old_chat_member.status == "member":
+        return
+    team = None if e.chat.id == chat_id() else await s.scalar(select(Team).where(Team.chat_id == e.chat.id))
+    if e.chat.id != chat_id() and team is None:
         return
     name = (e.invite_link.name or "") if e.invite_link else ""
     joined = e.new_chat_member.user
     owner = int(name) if name.isdigit() else None
     who = f"@{joined.username}" if joined.username else joined.full_name
+    where = f"чат команды «{team.name}»" if team else "чат"
     events.add(s, f"user:{owner or joined.id}", "chat_join",
-               f"Вступил в чат: {who}" + ("" if owner in (None, joined.id) else f" — по ссылке пользователя {owner}"),
+               f"Вступил в {where}: {who}" + ("" if owner in (None, joined.id) else f" — по ссылке пользователя {owner}"),
                owner or joined.id, alert=owner not in (None, joined.id), notice=True)
+    if team:
+        events.add(s, f"team:{team.id}", "chat_join", f"В чат команды вступил {who}", joined.id, notice=True)
 
 
 # ---------- the pinned summary ----------
@@ -94,7 +102,7 @@ async def summary(s: AsyncSession) -> dict:
     return {
         "online": await count(User.is_online, ~User.is_banned),
         "cards": len(await deals.market(s, 0, None, None, None)),
-        "om": await count(OrderMerchant.status == "approved", OrderMerchant.accepting),
+        "om": await count(OrderMerchant.status == "approved"),
         "open": await count(Deal.status.in_(("waiting_payment", "paid"))),
         "requests": await count(Deal.status.in_(orders.REQUEST)),
         "day": (n24, Decimal(rub24)), "all": (n_all, Decimal(rub_all)),
@@ -102,50 +110,71 @@ async def summary(s: AsyncSession) -> dict:
     }
 
 
-def pin_text(st: dict, bot_name: str) -> str:
+def pin_text(st: dict) -> str:
     rate, pp = settings.dec("rate"), settings.dec("platform_pct")
     example = money.quote(Decimal(10000), rate, settings.dec("seller_pct"), pp).buyer_credit
     return clean("\n".join([
         f"📌 <b>Strait Pay · сводка</b> · {now().astimezone(MSK):%d.%m %H:%M} МСК",
         "",
         "<b>Курс</b>",
-        f"1 USDT = <b>{money.fmt(rate)} ₽</b> · комиссия {money.fmt(pp, 3)}%",
-        f"10 000 ₽ → <b>{money.usdt(example)} USDT</b>",
+        f"• 1 USDT = <b>{money.fmt(rate)} ₽</b> · комиссия {money.fmt(pp, 3)}%",
+        f"• 10 000 ₽ → <b>{money.usdt(example)} USDT</b>",
+        f"• Ордерным мерчантам: {money.fmt(settings.dec('order_rate'))} ₽ за USDT",
         "",
         "<b>Сейчас</b>",
-        f"Продавцов на смене: <b>{st['online']}</b> · карт доступно: <b>{st['cards']}</b>",
-        f"Ордерных мерчантов на приёме: <b>{st['om']}</b>",
-        f"Активных сделок: <b>{st['open']}</b> · заявок на реквизиты: <b>{st['requests']}</b>",
+        f"• Продавцов на смене: <b>{st['online']}</b> · карт: <b>{st['cards']}</b>",
+        f"• Ордерных мерчантов: <b>{st['om']}</b>",
+        f"• Активных сделок: <b>{st['open']}</b> · заявок на реквизиты: <b>{st['requests']}</b>",
         "",
         "<b>Оборот</b>",
-        f"За 24 ч: <b>{st['day'][0]}</b> сделок · <b>{money.fmt(st['day'][1])} ₽</b>",
-        f"За всё время: <b>{st['all'][0]}</b> сделок · <b>{money.fmt(st['all'][1])} ₽</b>",
-        f"Пользователей: <b>{st['users']}</b>",
+        f"• За 24 ч: <b>{st['day'][0]}</b> сделок · <b>{money.fmt(st['day'][1])} ₽</b>",
+        f"• Всего: <b>{st['all'][0]}</b> сделок · <b>{money.fmt(st['all'][1])} ₽</b> · пользователей {st['users']}",
         "",
-        f"Купить или продать USDT — @{bot_name}" if bot_name else "",
+        "Заявки покупателей публикуются в этом чате — «Взять заявку в боте».",
     ]))
 
 
+async def pin_markup(bot: Bot):
+    return kb(btn("Открыть бота", url=await deep_link(bot, "menu"), icon="shop", style="success"),
+              btn("Стать ордерным мерчантом", url=await deep_link(bot, "om"), icon="key"))
+
+
 async def publish_pin(bot: Bot, s: AsyncSession) -> str:
-    """Edit the pinned summary or post and pin a new one. Returns what happened (for the admin screen)."""
+    """Edit the pinned summary (the banner with the summary as its caption) or post and pin a new one. Returns what
+    happened (for the admin screen)."""
     chat = chat_id()
     if chat is None:
         return "чат не задан"
-    text = pin_text(await summary(s), (await bot.me()).username or "")
+    text, markup = pin_text(await summary(s)), await pin_markup(bot)
+    banner = ui.banner_path() is not None
     key = f"chat_pin:{chat}"
     row = await s.get(Setting, key)
     if row:
-        try:
-            await paced(lambda: bot.edit_message_text(text=text, chat_id=chat, message_id=int(row.value),
-                                                      disable_web_page_preview=True))
-            return "обновлён"
-        except TelegramBadRequest as e:
-            if "not modified" in str(e):
-                return "актуален"
-            # deleted or too old: post it again
+        mid, _, kind = row.value.partition(":")  # "<message id>:c" — the banner's caption; old rows are text
+        if (kind == "c") == banner:
+            try:
+                if banner:
+                    await paced(lambda: bot.edit_message_caption(chat_id=chat, message_id=int(mid), caption=text,
+                                                                 reply_markup=markup))
+                else:
+                    await paced(lambda: bot.edit_message_text(text=text, chat_id=chat, message_id=int(mid),
+                                                              reply_markup=markup, disable_web_page_preview=True))
+                return "обновлён"
+            except TelegramBadRequest as e:
+                if "not modified" in str(e):
+                    return "актуален"
+                # deleted or too old: post it again
+        else:  # switched between text and banner: the old pin goes away
+            with suppress(TelegramAPIError):
+                await bot.unpin_chat_message(chat, message_id=int(mid))
     try:
-        m = await paced(lambda: bot.send_message(chat, text, disable_notification=True, disable_web_page_preview=True))
-        await s.merge(Setting(key=key, value=str(m.message_id)))
+        if banner:
+            async with ui._upload:
+                m = await ui.send_banner(bot, chat, text, markup)
+        else:
+            m = await paced(lambda: bot.send_message(chat, text, reply_markup=markup, disable_notification=True,
+                                                     disable_web_page_preview=True))
+        await s.merge(Setting(key=key, value=f"{m.message_id}:c" if banner else str(m.message_id)))
         await s.commit()
         await bot.pin_chat_message(chat, m.message_id, disable_notification=True)
     except TelegramAPIError as e:
@@ -182,9 +211,15 @@ async def chat_screen(bot: Bot, s: AsyncSession, admin: User, src=None, note: st
                           "Права бота: " + ", ".join(f"{'✅' if v else '❌'} {k}" for k, v in rights))
         except TelegramAPIError as e:
             state = quote(f"ID: <code>{chat}</code>", f"{pe('warn')} Бот не видит чат: {esc(str(e)[:120])}")
-        joins = await s.scalar(select(func.count(Event.id)).where(Event.kind == "chat_join"))
-        lines += [state, f"Вступили по личным ссылкам: <b>{joins}</b>",
-                  "Кнопка «Чат» в меню выдаёт каждому личную ссылку на один вход. Закреп обновляется каждые 5 мин."]
+        joins = await s.scalar(select(func.count(Event.id)).where(Event.kind == "chat_join",
+                                                                  Event.ref.like("user:%")))
+        team_chats = await s.scalar(select(func.count(Team.id)).where(Team.status == "approved",
+                                                                      Team.chat_id.is_not(None)))
+        lines += [state, quote(f"• Вступили по личным ссылкам: <b>{joins}</b>",
+                               f"• Чатов команд (туда тоже идут заявки): <b>{team_chats}</b>"),
+                  "• Кнопка «Чат» в меню выдаёт каждому личную ссылку на один вход",
+                  "• Закреп — баннер со сводкой, обновляется каждые 5 мин",
+                  "• Все ордерные заявки публикуются в чат с кнопкой «Взять заявку в боте»"]
     await show(bot, admin, "\n".join(lines) + note, kb(
         btn("Обновить закреп", "ach:pin", "refresh", style="primary") if chat else None,
         btn("Изменить ID чата" if chat else "Задать ID чата", "acx:chat_id", "pencil"),
