@@ -40,7 +40,8 @@ class Adm(StatesGroup):
 
 
 ADJ_REASONS = {"deposit_fix": "Исправление пополнения", "compensation": "Компенсация", "refund": "Возврат",
-               "tech": "Техническая корректировка", "other": "Другое"}
+               "tech": "Техническая корректировка", "other": "Другое",
+               "manual": "Ручная правка"}  # «manual»: only /balance (handlers.admin_balance), not in the picker
 ADJ_STATUS = {"draft": "черновик", "pending": "ждёт второго администратора", "done": "проведена",
               "cancelled": "отменена", "failed": "отклонена: не хватило доступного баланса"}
 
@@ -139,7 +140,8 @@ async def admin_screen(bot: Bot, s: AsyncSession, user: User, src=None, note: st
         [btn(_n("Мерчанты", om_apps), "aoml", "key"), btn(_n("Операторы", free_orders), "aopl", "shop")],
         [btn(_n("Команды", team_apps), "atml", "people"), btn(_n("API", api_apps), "aapi", "key")],
         [btn("Финансы", "afin", "stats"), btn(_n("xRocket", queued_wd), "axr", "wallet")],
-        [btn(_n("Корректировки", approvals), "aadjl", "dollar"), btn("Карты", "ac:0", "card")],
+        [btn(_n("Корректировки", approvals), "aadjl", "dollar"), btn("Балансы", "bal:p:0", "wallet")],
+        btn("Карты", "ac:0", "card"),
         [btn("Комиссии", "acm", "percent"), btn("Настройки", "as", "settings")],
         [btn("Чат и канал", "ach", "people"), btn("Администраторы", "aadm", "lock")],
         [btn("Журнал", "aa", "list"), btn("Отчёты CSV", "arp", "doc")],
@@ -204,7 +206,7 @@ async def settings_screen(bot: Bot, user: User, src=None, note: str = ""):
     ]
     for (name, keys), icon in zip(settings.GROUPS, SETTING_ICONS):
         lines += ["", section(icon, name),
-                  " · ".join(f"{SHORT.get(k, k)} <b>{esc(_brief(k))}</b>" for k in keys)]
+                  " · ".join(f"{esc(SHORT.get(k, k))} <b>{esc(_brief(k))}</b>" for k in keys)]
     lines += ["", quote("Изменить — раздел кнопкой ниже.")]
     await show(bot, user, "\n".join(lines) + note, kb(
         *[btn(name, f"asg:{i}", "pencil") for i, (name, _) in enumerate(settings.GROUPS)],
@@ -842,7 +844,7 @@ async def msg_money(m: Message, bot: Bot, user: User, state: FSMContext):
         "",
         f"Сумма: <b>{data['sign']}{money.usdt(v)} USDT</b>",
         "Шаг 2/3. Выберите причину:",
-    ]), kb(*[btn(label, f"amr:{code}", "pencil") for code, label in ADJ_REASONS.items()],
+    ]), kb(*[btn(label, f"amr:{code}", "pencil") for code, label in ADJ_REASONS.items() if code != "manual"],
            back(f"aadj:{data['uid']}", "Отмена")))
 
 
@@ -933,8 +935,9 @@ async def cb_adjustment(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User)
         await adjustment_screen(bot, s, user, a, c)
 
 
-async def apply_adjustment(s: AsyncSession, adj_id: int, admin: User) -> tuple[str, Adjustment]:
-    """Idempotent: the row lock plus the status check make a repeated click a no-op."""
+async def apply_adjustment(s: AsyncSession, adj_id: int, admin: User, quiet: bool = False) -> tuple[str, Adjustment]:
+    """Idempotent: the row lock plus the status check make a repeated click a no-op. quiet: a mass action
+    (/balance) — the done step stays in the history but posts nothing; the action posts one summary itself."""
     a = await s.get(Adjustment, adj_id, with_for_update=True, populate_existing=True)
     if a.status not in ("draft", "pending"):
         return "already", a
@@ -961,10 +964,11 @@ async def apply_adjustment(s: AsyncSession, adj_id: int, admin: User) -> tuple[s
         return "failed", a
     a.status, a.done_at = "done", now()
     a.balance_after, a.balance_before = u.balance, u.balance - a.delta
-    audit.log(s, admin.id, "balance", f"user:{a.user_id}", f"adj #{a.id}: {a.delta} USDT, {_adj_reason(a)}")
+    audit.log(s, admin.id, "balance", f"user:{a.user_id}", f"adj #{a.id}: {a.delta} USDT, {_adj_reason(a)}",
+              alert=not quiet)
     events.add(s, ref, "done", f"{'+' if a.delta > 0 else ''}{money.usdt(a.delta)} USDT пользователю {a.user_id}: "
                                f"{money.usdt(a.balance_before)} → {money.usdt(a.balance_after)} ({_adj_reason(a)})",
-               a.user_id, alert=True)
+               a.user_id, alert=not quiet)
     return "done", a
 
 

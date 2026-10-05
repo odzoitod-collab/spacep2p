@@ -533,7 +533,8 @@ async def _new_card(bot, s, chat, ref, topic, text, markup, lm: LogMessage | Non
 
 ACTIONS = {
     "ban": ("ban", "Заблокировал пользователя"), "unban": ("ok", "Разблокировал пользователя"),
-    "balance": ("dollar", "Изменил баланс"), "setting": ("settings", "Изменил настройку"),
+    "balance": ("dollar", "Изменил баланс"), "balance_mass": ("dollar", "Массово изменил балансы"),
+    "setting": ("settings", "Изменил настройку"),
     "merchant_pct": ("percent", "Личная ставка мерчанта"), "buyer_terms": ("star", "Условия покупателя"),
     "resolve": ("flag", "Решение по сделке"), "deal_take": ("key", "Взял заявку на себя"),
     "deal_amount": ("pencil", "Изменил сумму сделки"), "deal_extend": ("clock", "Продлил срок сделки"),
