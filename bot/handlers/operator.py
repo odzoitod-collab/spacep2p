@@ -69,7 +69,7 @@ async def operator_screen(bot: Bot, s: AsyncSession, user: User, src=None, note:
               style="primary" if d.status in ("checking", "paid") else None) for d in working],
         *([btn(f"Принять ордер #{d.id} · {money.usdt(d.seller_debit)} USDT", f"opq:go:{d.id}", "bell")
            for d in free] if active else []),
-        [btn("История долга", "op:h", "list"), btn("Обновить", "op", "refresh")],
+        btn("История долга", "op:h", "list"),
         back("menu", "В меню"),
     ), src)
 

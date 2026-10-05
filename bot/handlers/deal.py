@@ -315,7 +315,7 @@ def deal_kb(d: Deal, viewer_id: int, card: Card | None = None):
             rows.append(btn("Показать чек", f"dl:pdf:{d.id}", "doc"))
     elif d.status == "waiting_payment":
         rows.append(btn("Обновить", f"dl:{d.id}", "refresh"))
-    rows.append([btn("Написать", f"dmc:{d.id}", "support"), btn("Мои сделки", inline="сделки ")])
+    rows.append([btn("Чат сделки", f"dch:{d.id}", "support"), btn("Мои сделки", inline="сделки ")])
     rows.append(back("menu", "В меню"))
     return kb(*rows)
 
@@ -437,10 +437,13 @@ async def not_a_pdf(bot: Bot, m: Message) -> bool:
     return b"%PDF-" not in buf.getvalue()[:1024]
 
 
-async def send_receipt(bot: Bot, chat: int, fid: str, caption: str, markup=None, silent: bool = False):
+async def send_receipt(bot: Bot, chat: int, fid: str, caption: str, markup=None, silent: bool = False,
+                       thread: int | None = None):
     if fid.startswith("photo:"):
-        return await bot.send_photo(chat, fid[6:], caption=caption, reply_markup=markup, disable_notification=silent)
-    return await bot.send_document(chat, fid, caption=caption, reply_markup=markup, disable_notification=silent)
+        return await bot.send_photo(chat, fid[6:], caption=caption, reply_markup=markup, disable_notification=silent,
+                                    message_thread_id=thread)
+    return await bot.send_document(chat, fid, caption=caption, reply_markup=markup, disable_notification=silent,
+                                   message_thread_id=thread)
 
 
 def _receipt_prompt(d: Deal, err: str = "") -> str:
@@ -883,18 +886,19 @@ async def msg_evidence(m: Message, bot: Bot, s: AsyncSession, user: User, state:
 
 # ---------- admin-facing dispute card (used by admin handlers and background tasks) ----------
 
-async def send_files(bot: Bot, chat: int, d: Deal):
-    """Receipt and dispute evidence for an admin: photos/videos and documents as albums (up to 10), texts as one
-    message — a dispute with 20 files is a few messages, not 20."""
+async def send_files(bot: Bot, chat: int, d: Deal, thread: int | None = None):
+    """Receipt and dispute evidence for an admin (in his private chat or right in the admin chat's topic): photos /
+    videos and documents as albums (up to 10), texts as one message — a dispute with 20 files is a few messages."""
     cap = f"Сделка #{d.id}"
+    t = {"message_thread_id": thread}
     if d.receipt_file_id:
-        await send_receipt(bot, chat, d.receipt_file_id, f"{cap}: чек покупателя")
+        await send_receipt(bot, chat, d.receipt_file_id, f"{cap}: чек покупателя", thread=thread)
     names = {"video": "видео", "photo": "фото", "document": "файл"}
     who = {"buyer": "покупатель", "seller": "продавец"}
     items = [(f[0], f[1], who.get(f[2] if len(f) > 2 else "seller", "")) for f in d.dispute_files or []]
     texts = [f"<b>{w}:</b> {esc(v)}" for k, v, w in items if k == "text"]
     if texts:
-        await bot.send_message(chat, f"<b>{cap}: пояснения сторон</b>\n" + "\n\n".join(texts)[:3900])
+        await bot.send_message(chat, f"<b>{cap}: пояснения сторон</b>\n" + "\n\n".join(texts)[:3900], **t)
     visual = [(k, v, w) for k, v, w in items if k in ("photo", "video")]
     docs = [(k, v, w) for k, v, w in items if k == "document"]
     for group in (visual, docs):
@@ -903,11 +907,11 @@ async def send_files(bot: Bot, chat: int, d: Deal):
             if len(chunk) == 1:
                 k, v, w = chunk[0]
                 send = {"video": bot.send_video, "photo": bot.send_photo}.get(k, bot.send_document)
-                await send(chat, v, caption=f"{cap}: {names[k]} — {w}")
+                await send(chat, v, caption=f"{cap}: {names[k]} — {w}", **t)
                 continue
             media = [{"photo": InputMediaPhoto, "video": InputMediaVideo}.get(k, InputMediaDocument)(
                 media=v, caption=f"{cap}: {names[k]} — {w}") for k, v, w in chunk]
-            await bot.send_media_group(chat, media)
+            await bot.send_media_group(chat, media, **t)
 
 
 def verdict_effects(d: Deal, verdict: str) -> list[str]:

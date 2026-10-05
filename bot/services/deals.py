@@ -312,6 +312,15 @@ async def _check_client(s: AsyncSession, client, amount_rub: Decimal) -> None:
                         "daily_limit")
 
 
+def _api_event(s: AsyncSession, d: Deal | None) -> None:
+    """An API order changed its status: its webhook is queued in the same transaction, so a client gets every
+    status — also the ones that last less than the delivery task's tick (a receipt confirmed at once)."""
+    if d is not None and d.api_client_id is not None and d.api_notified != d.status:
+        from bot.models import ApiEvent
+        s.add(ApiEvent(client_id=d.api_client_id, deal_id=d.id, status=d.status))
+        d.api_notified = d.status
+
+
 async def _move(s: AsyncSession, deal_id: int, frm: tuple[str, ...], to: str, **values) -> Deal | None:
     """Atomic status transition. Returns fresh deal or None if status already changed."""
     values["closed_at"] = None if to in OPEN else now()
@@ -320,7 +329,9 @@ async def _move(s: AsyncSession, deal_id: int, frm: tuple[str, ...], to: str, **
     )
     if res.rowcount != 1:
         return None
-    return await s.get(Deal, deal_id, populate_existing=True)
+    d = await s.get(Deal, deal_id, populate_existing=True)
+    _api_event(s, d)
+    return d
 
 
 async def mark_paid(s: AsyncSession, deal_id: int, buyer_id: int, file_id: str) -> Deal | None:
@@ -331,7 +342,11 @@ async def mark_paid(s: AsyncSession, deal_id: int, buyer_id: int, file_id: str) 
         Deal.id == deal_id, Deal.buyer_id == buyer_id,
         Deal.status == "waiting_payment", Deal.expires_at > now(),
     ).values(status="paid", receipt_file_id=file_id, paid_at=now()).execution_options(synchronize_session=False))
-    return await s.get(Deal, deal_id, populate_existing=True) if res.rowcount == 1 else None
+    if res.rowcount != 1:
+        return None
+    d = await s.get(Deal, deal_id, populate_existing=True)
+    _api_event(s, d)
+    return d
 
 
 async def expire(s: AsyncSession, deal_id: int) -> Deal | None:
@@ -455,12 +470,14 @@ async def complete(s: AsyncSession, deal_id: int, frm=("paid", "dispute"), actua
     if frozen(d):
         await money.spend_frozen(s, d.seller_id, d.seller_debit, ref)
     elif d.operator_id and d.bybit_url:  # a Bybit order: its USDT came to the operator's Bybit account — he owes them
-        await operators.accrue(s, d.operator_id, d.seller_debit, ref)
+        op = await operators.accrue(s, d.operator_id, d.seller_debit, ref)
+        operators.log(s, d.operator_id, d, "completed", f"долг +{money.usdt(d.seller_debit)} USDT, всего "
+                                                        f"{money.usdt(op.debt)} USDT")
     await money.add(s, d.buyer_id, d.buyer_credit, "deal_buy", ref)
     money.platform(s, d.platform_fee, "deal_fee", ref)
     if got := await teams.bonus(s, d):  # the merchant's team leader: his percent out of the platform's fee
         team, fee = got
-        await money.add(s, team.leader_id, fee, "team_fee", ref)
+        await money.add_team(s, team.leader_id, fee, ref)  # onto his team balance, he moves it to the main one
         money.platform(s, -fee, "team_fee", ref)
         d.team_id, d.team_fee = team.id, fee
         events.add(s, f"team:{team.id}", "fee", f"Тимлиду +{money.usdt(fee)} USDT · сделка #{d.id} на "

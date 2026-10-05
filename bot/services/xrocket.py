@@ -224,6 +224,40 @@ def net_fee(q: dict | None) -> Decimal:
 
 rocket: XRocket | None = None
 _usdt: tuple[float, Decimal] | None = None  # (loop time, available USDT) of the last balance request
+TOKEN_KEY = "xrocket_token"  # settings: a token set in the admin panel wins over XROCKET_TOKEN from .env
+
+
+def token(env_token: str) -> str:
+    from bot.services import settings
+    return settings.raw(TOKEN_KEY) or env_token
+
+
+def hint(tok: str) -> str:
+    """A token as admins see it: never in full."""
+    return f"…{tok[-4:]}" if len(tok) > 8 else "задан" if tok else "не задан"
+
+
+async def check_token(tok: str, base_url: str) -> Decimal:
+    """Available USDT of the app behind `tok`; raises XRocketError if xRocket does not accept it."""
+    client = XRocket(tok, base_url)
+    try:
+        bal = await asyncio.wait_for(client.balances(), 10)
+    except asyncio.TimeoutError as e:
+        raise XRocketError("network", "timeout") from e
+    finally:
+        await client.close()
+    usdt = next((b for b in bal if b.get("asset") == "USDT"), None)
+    return Decimal(str(usdt.get("available", "0"))) if usdt else Decimal(0)
+
+
+async def switch(tok: str, base_url: str) -> None:
+    """Use another token from now on: a new client, cached answers of the old app forgotten."""
+    global rocket, _usdt, _networks
+    old, rocket = rocket, XRocket(tok, base_url)
+    _usdt, _networks = None, None
+    _quotas.clear()
+    if old is not None and hasattr(old, "close"):
+        await old.close()
 
 
 async def usdt_available(max_age: float = 0, timeout: float = 5) -> Decimal:

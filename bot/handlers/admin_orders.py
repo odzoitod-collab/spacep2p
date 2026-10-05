@@ -9,15 +9,15 @@ from aiogram.types import CallbackQuery, Message
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from bot.config import config
+from bot.services.admins import IsAdmin
 from bot.emoji import back, btn, kb, pe
 from bot.models import Deal, OrderMerchant, User, now
 from bot.services import audit, events, money, orders, settings
-from bot.ui import at, esc, notify, ok, quote, show, title, warn
+from bot.ui import alink, at, card, cf, esc, notify, quote, show, title, ulink, verdict, warn
 
 router = Router()
-router.message.filter(F.from_user.id.in_(config.admin_ids))
-router.callback_query.filter(F.from_user.id.in_(config.admin_ids))
+router.message.filter(IsAdmin())
+router.callback_query.filter(IsAdmin())
 
 STATUS = {"pending": "на рассмотрении", "approved": "работает", "rejected": "отклонена", "suspended": "приостановлен"}
 
@@ -54,28 +54,33 @@ async def merchant_card(bot: Bot, s: AsyncSession, admin: User, m: OrderMerchant
                                                                 Deal.dispute_reason.is_not(None)))
     bybit_n = await s.scalar(select(func.count(Deal.id)).where(Deal.seller_id == m.user_id, Deal.via_bybit,
                                                                Deal.status == "completed"))
+    decided = await s.get(User, m.admin_id) if m.admin_id else None
     await show(bot, admin, "\n".join([
-        title(pe("key"), f"Ордерный мерчант · {STATUS[m.status]}"),
-        "<b>Кто</b>",
-        quote(f"• {esc(u.name or '—')} @{esc(u.username or '—')} (<code>{u.id}</code>)"
-              + (" · ЗАБАНЕН" if u.is_banned else ""),
-              f"• Источник: {esc(m.source)}",
-              f"• Скорость выдачи: {esc(m.speed)}",
-              f"• Банки: {esc(m.banks)}"),
-        "<b>Работа</b>",
-        quote(f"• Курс: {money.fmt(settings.dec('order_rate'))} ₽ · заявки приходят все, режим выбирает при взятии",
-              f"• Баланс: {money.usdt(u.balance)} USDT · в работе сейчас {money.fmt(await orders.open_rub(s, u.id))} ₽",
-              f"• Выполнено: {done_n} на {money.fmt(Decimal(done_rub))} ₽ (Bybit-ордером {bybit_n}) · споров {disputes}",
-              f"• Анкета {at(m.created_at, 'dt')}"
-              + (f" · решение {at(m.decided_at, 'dt')} (<code>{m.admin_id}</code>)" if m.decided_at else "")),
-        f"<b>О себе</b>\n{esc(m.about)}" if m.about else "",
-        f"Причина отказа: <i>{esc(m.reason)}</i>" if m.reason else "",
+        title(pe("key"), f"Ордерный мерчант {alink('om', m.user_id, f'#{m.user_id}')}") + f" · {STATUS[m.status]}",
+        "",
+        card(cf("Кто", ulink(u) + (" · <b>ЗАБАНЕН</b>" if u.is_banned else ""), icon="profile"),
+             cf("Анкета", f"источник: {esc(m.source)}", f"скорость выдачи: {esc(m.speed)}", f"банки: {esc(m.banks)}",
+                icon="list"),
+             cf("Работа", f"курс {money.fmt(settings.dec('order_rate'))} ₽ · заявки приходят все, режим — при взятии",
+                f"баланс {money.usdt(u.balance)} USDT · в работе сейчас {money.fmt(await orders.open_rub(s, u.id))} ₽",
+                f"выполнено {done_n} на {money.fmt(Decimal(done_rub))} ₽ (Bybit-ордером {bybit_n}) · споров {disputes}",
+                icon="stats"),
+             cf("Репутация", orders.rep_line(*await orders.reputation(s, m.user_id)), icon="star"),
+             cf("Пропуски реквизитов", f"{m.strikes} из {settings.get('strike_limit')} подряд" if m.strikes else "",
+                f"<b>пауза до {at(m.sleep_until, 'dt')}</b>" if orders.asleep(m) else "", icon="warn"),
+             cf("Решение", f"анкета {at(m.created_at, 'dt')}"
+                + (f" · решение {at(m.decided_at, 'dt')} · {ulink(decided, m.admin_id)}" if m.decided_at else ""),
+                icon="clock"),
+             cf("О себе", esc(m.about), icon="info") if m.about else "",
+             cf("Причина отказа", f"<i>{esc(m.reason)}</i>", icon="cross") if m.reason else ""),
     ]) + note, kb(
         [btn("Одобрить", f"aom:ok:{m.user_id}", "ok", style="success"),
          btn("Отклонить", f"aom:no:{m.user_id}", "cross", style="danger")] if m.status == "pending" else None,
+        btn("Снять паузу и пропуски", f"aom:wake:{m.user_id}", "ok", style="success")
+        if orders.asleep(m) or m.strikes else None,
         btn("Приостановить", f"aom:st:{m.user_id}:0", "pause", style="danger") if m.status == "approved" else None,
         btn("Возобновить", f"aom:st:{m.user_id}:1", "ok", style="success") if m.status == "suspended" else None,
-        [btn("Профиль", f"auv:{m.user_id}", "profile"), btn("История", f"aev:om:{m.user_id}", "list")],
+        btn("История", f"aev:om:{m.user_id}", "list"),
         back("aoml", "Ордерные мерчанты")), src)
 
 
@@ -102,7 +107,7 @@ async def cb_approve(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User):
         "• «Взять · Bybit-ордер» — баланс не нужен, присылаете ссылку на ордер",
         "• «Взять · с баланса» — замораживаем ваши USDT, реквизиты выдаёте сами"]),
                  kb(btn("Открыть кабинет", "om", "key", style="success"), back("x", "Скрыть", "cross")))
-    await merchant_card(bot, s, user, m, c, ok("Одобрена, мерчант уведомлён"))
+    await merchant_card(bot, s, user, m, c, "\n\n" + verdict("ok", "Одобрено", user))
 
 
 @router.callback_query(F.data.regexp(r"^aom:no:(\d+)$"))
@@ -110,8 +115,9 @@ async def cb_reject_ask(c: CallbackQuery, bot: Bot, user: User, state: FSMContex
     uid = int(c.data.split(":")[2])
     await state.set_state(AdmOrders.reason)
     await state.set_data({"om": uid})
-    await show(bot, user, f"{title(pe('cross'), 'Отказ ордерному мерчанту')}\n\nНапишите причину (5–500 символов) — "
-                          "её увидит заявитель.", kb(back(f"aom:{uid}", "Отмена")), c)
+    await show(bot, user, f"{pe('cross')} <b>Отказ ордерному мерчанту</b>\n\n"
+                          + quote("Напишите причину следующим сообщением (5–500 символов) — её увидит заявитель."),
+               kb(back(f"aom:{uid}", "Отмена")), c)
 
 
 @router.message(AdmOrders.reason, F.text)
@@ -130,7 +136,20 @@ async def msg_reject(m: Message, bot: Bot, s: AsyncSession, user: User, state: F
     events.add(s, f"om:{uid}", "rejected", f"Анкета отклонена ({user.name}): {reason}", uid, alert=True)
     await s.commit()
     await notify(bot, uid, f"{pe('cross')} <b>Анкета ордерного мерчанта отклонена.</b>\nПричина: {esc(reason)}")
-    await merchant_card(bot, s, user, om, note=ok("Отклонена, заявитель уведомлён"))
+    await merchant_card(bot, s, user, om, note="\n\n" + verdict("cross", "Отклонено", user))
+
+
+@router.callback_query(F.data.regexp(r"^aom:wake:(\d+)$"))
+async def cb_wake(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User):
+    m = await s.get(OrderMerchant, int(c.data.split(":")[2]), with_for_update=True, populate_existing=True)
+    if not m:
+        return await c.answer("Анкета не найдена", show_alert=True)
+    m.strikes, m.sleep_until = 0, None
+    audit.log(s, user.id, "om_wake", f"om:{m.user_id}")
+    events.add(s, f"om:{m.user_id}", "wake", f"Пауза и пропуски сняты ({user.name})", m.user_id, notice=True)
+    await s.commit()
+    await notify(bot, m.user_id, f"{pe('ok')} Администрация сняла паузу: заявки снова приходят.")
+    await merchant_card(bot, s, user, m, c, "\n\n" + verdict("ok", "Пауза снята", user))
 
 
 @router.callback_query(F.data.regexp(r"^aom:st:(\d+):([01])$"))
@@ -146,5 +165,5 @@ async def cb_status(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User):
     await s.commit()
     await notify(bot, m.user_id, f"{pe('key')} Доступ ордерного мерчанта {what} администрацией."
                  + (" Взятые заявки завершите как обычно." if on == "0" else ""))
-    await merchant_card(bot, s, user, m, c, ok(what.capitalize()))
+    await merchant_card(bot, s, user, m, c, "\n\n" + verdict("ok" if on == "1" else "pause", what.capitalize(), user))
 

@@ -183,3 +183,18 @@ def test_rejection_with_reason_and_docs_served(go):
             assert (await (await c.get("/")).json())["name"] == "Strait Pay API"
         assert (await user(OTHER)).balance == 0
     go(fn)
+
+
+def test_guides_site_has_the_route_and_the_brand(go):
+    async def fn(b):
+        from aiohttp.test_utils import TestClient, TestServer
+        from bot.api.server import build_app
+        async with TestClient(TestServer(build_app(b.bot))) as c:
+            page = await (await c.get("/docs/orders")).text()
+            assert "Шаг 5 из 10" in page and 'class=on aria-current=page' in page and "На этой странице" in page
+            assert 'href="/docs/operator"' in page and "Дальше →" in page  # the next guide
+            logo = await c.get("/docs/static/logo.png")
+            assert logo.status == 200 and logo.content_type == "image/png"
+            assert (await c.get("/docs/static/..%2F..%2F.env")).status == 404
+            assert "API для сервисов" in await (await c.get("/docs/help")).text()
+    go(fn)

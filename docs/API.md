@@ -42,6 +42,21 @@ Strait Pay API позволяет вашему сервису принимать
 * Реквизиты выдаёт продавец: карта или номер телефона для СБП, банк и ФИО получателя.
 * Под каждый заказ продавец замораживает свои USDT (или реквизиты выдаёт оператор Strait Pay из Bybit-ордера
   мерчанта), поэтому зачисление после подтверждения гарантировано.
+* Если готовой карты под сумму нет, заказ становится **заявкой на ордерные реквизиты** — её получают все ордерные
+  мерчанты. Взявший либо выдаёт реквизиты сам (с замороженного баланса), либо за 2 минуты присылает ссылку на свой
+  Bybit-ордер: оператор Strait Pay заходит в ордер и выдаёт покупателю его реквизиты. Каждый шаг виден в поле
+  `detail` заказа:
+
+```
+POST /v1/orders ─▶ searching_requisites / searching_merchant         все ордерные мерчанты получают заявку
+                    │
+                    ├─ мерчант взял «с баланса» ─▶ merchant_assigned / merchant_preparing_requisites
+                    │                                         └─ реквизиты ─▶ awaiting_payment
+                    └─ мерчант взял «Bybit-ордер» ─▶ merchant_assigned / waiting_bybit_order   (2 мин на ссылку)
+                              └─ ссылка ─▶ requisites_check / waiting_operator
+                                     └─ оператор принял ─▶ requisites_check / operator_checking_order
+                                            └─ реквизиты из ордера ─▶ awaiting_payment
+```
 * Если продавец не подтверждает оплату, вы открываете спор. Решение принимает администрация Strait Pay.
 
 ## 2. Получение доступа
@@ -102,7 +117,22 @@ awaiting_payment ──receipt──▶ verifying ──продавец под�
 ```
 
 Статусы до реквизитов (`searching_requisites`, `merchant_assigned`, `requisites_check`) могут сменять друг друга
-несколько раз: мерчант отказался — заявка снова в поиске. Показывайте покупателю «подбираем реквизиты» во всех трёх.
+несколько раз: мерчант отказался, не прислал ссылку за 2 минуты или в его ордере не оказалось реквизитов — заявка
+снова в поиске у других мерчантов. Показывайте покупателю «подбираем реквизиты» во всех трёх.
+
+**`detail` — шаг внутри статуса** и **`status_text`** — готовая фраза для покупателя:
+
+| `status` | `detail` | `status_text` |
+|---|---|---|
+| `searching_requisites` | `searching_merchant` | Ищем ордерного мерчанта под сумму |
+| `merchant_assigned` | `waiting_bybit_order` | Мерчант взял заявку и создаёт Bybit-ордер |
+| `merchant_assigned` | `merchant_preparing_requisites` | Мерчант взял заявку и выдаёт реквизиты |
+| `requisites_check` | `waiting_operator` | Ордер мерчанта ждёт оператора |
+| `requisites_check` | `operator_checking_order` | Оператор проверяет ордер и выдаёт реквизиты |
+| остальные | совпадает со `status` | Реквизиты выданы — ждём перевод и чек · Чек у продавца… · Готово… |
+
+**`flow`** — откуда реквизиты: `{"type": "static_card" | "order_requisites", "via": null | "merchant_balance" |
+"bybit_order", "operator_assigned": true | false}`. Личности мерчантов и операторов не раскрываются.
 
 Итоговые статусы — `success` и `cancelled`. `expired` может смениться на `verifying`, если прислать чек до
 `late_receipt_until`. Если продавец молчит слишком долго, спор открывается автоматически.
@@ -127,6 +157,8 @@ awaiting_payment ──receipt──▶ verifying ──продавец под�
   заказов: и по статичным картам, и по ордерным реквизитам. `GET /v1/rates` всегда показывает именно ваши условия.
 * При `success` сумма `amount_usdt` зачисляется на баланс владельца токена (`GET /v1/balance`). Если спор решён
   по фактически пришедшей сумме, `amount_rub` и `amount_usdt` в заказе пересчитываются.
+* `withdrawable` — сколько можно вывести: USDT, полученные по заказам, выводятся сразу; пополнения кошелька —
+  только после того, как прокручены в сделках.
 * Вывод — в боте: USDT на ваш адрес в любой сети xRocket (TON, TRC-20, ERC-20, BEP-20, Solana; для бирж в TON — с memo) или чеком xRocket.
 
 ## 6. Методы
@@ -149,7 +181,7 @@ awaiting_payment ──receipt──▶ verifying ──продавец под�
 ### GET /v1/balance
 
 ```json
-{"currency": "USDT", "available": "412.500000", "frozen": "0.000000"}
+{"currency": "USDT", "available": "412.500000", "frozen": "0.000000", "withdrawable": "412.500000"}
 ```
 
 ### GET /v1/rates
@@ -238,7 +270,18 @@ curl -X POST https://api.<домен>/v1/orders \
 
 ### GET /v1/orders/{id} — заказ
 
-Ответ в том же формате, что и при создании. Дополнительные поля:
+Ответ в том же формате, что и при создании.
+
+**Быстрый статус без частого опроса (long poll).** `GET /v1/orders/{id}?wait=25&since=<status или detail>` держит
+запрос до 30 секунд и отвечает **сразу**, как только `status` и `detail` заказа отличаются от `since` (иначе — по
+истечении `wait` с тем же состоянием). Передавайте в `since` последний увиденный `detail` и повторяйте запрос — так
+вы узнаете о выдаче реквизитов за секунду, не нагружая API. Ошибка: `invalid_query` (422), если `wait` не число.
+
+```bash
+curl "https://api.<домен>/v1/orders/1533?wait=25&since=waiting_operator" -H "Authorization: Bearer sp_live_XXXX"
+```
+
+Дополнительные поля:
 `dispute_available_at` — в статусе `verifying`, с какого момента можно открыть спор;
 `late_receipt_until` — в статусе `expired`, до какого момента принимается поздний чек.
 
@@ -319,6 +362,8 @@ curl -X POST https://api.<домен>/v1/orders/1532/receipt \
            "amount_usdt": "94.000000", "...": "..."}}
 ```
 
+* Событие уходит в течение ~2 секунд после смены статуса. **Каждый** статус получает своё событие — даже если
+  он длился секунду (чек загружен и тут же подтверждён: придут и `verifying`, и `success`).
 * Ответьте **2xx** в течение 10 секунд. Любой другой ответ или таймаут — повтор через 10 с, 20 с, 40 с … (не реже
   раза в час), всего до 20 попыток, примерно сутки.
 * События по одному заказу приходят в порядке изменений. `status` верхнего уровня — статус на момент события,
@@ -395,7 +440,8 @@ function verify(secret, headers, rawBody) {
 2. Покупатель выбирает сумму. При желании сначала `GET /v1/liquidity`.
 3. `POST /v1/orders` с вашим `external_id` → показать `requisites`, **точную** `amount_rub` и таймер до `expires_at`.
 4. Покупатель переводит деньги и загружает чек у вас → `POST /v1/orders/{id}/receipt`.
-5. Ждать вебхук `success` (или опрашивать `GET /v1/orders/{id}` не чаще раза в 10 секунд) → выдать товар.
+5. Ждать вебхук `success` (или long poll `GET /v1/orders/{id}?wait=25&since=<detail>`) → выдать товар.
+   Пока заказ в поиске реквизитов, показывайте покупателю `status_text` — он объясняет каждый шаг.
 6. Обработать `cancelled` и `expired`, а при `verifying` дольше `dispute_available_at` — `POST …/dispute`.
 7. Выводить накопленные USDT в боте: «Кошелёк → Вывести».
 
@@ -409,6 +455,9 @@ H = {"Authorization": "Bearer sp_live_XXXX"}
 
 with httpx.Client(base_url=API, headers=H, timeout=20) as c:
     order = c.post("/orders", json={"amount_rub": "5000", "external_id": "cart-42"}).json()
+    while order["requisites"] is None and order["next_action"] == "wait":  # ордерные реквизиты: ждём выдачи
+        print(order["status_text"])
+        order = c.get(f"/orders/{order['id']}", params={"wait": 25, "since": order["detail"]}, timeout=40).json()
     print(order["requisites"], order["amount_rub"], order["expires_at"])
     with open("receipt.pdf", "rb") as f:
         c.post(f"/orders/{order['id']}/receipt", files={"file": ("receipt.pdf", f, "application/pdf")})
@@ -449,6 +498,9 @@ api.<домен> {
 
 ### История изменений
 
+* **v1.3** — поля `detail`, `status_text`, `flow` (Bybit-ордер, баланс мерчанта, оператор), long poll
+  `GET /v1/orders/{id}?wait=&since=`, вебхуки в течение ~2 секунд, в `/v1/liquidity` считаются только мерчанты не на
+  паузе.
 * **v1.2** — статусы `merchant_assigned` и `requisites_check` (раньше оба показывались как `searching_requisites`;
   если вы сравниваете статус строго, добавьте их в «ищем реквизиты»), поля `next_action`, `stage`,
   `stage_deadline`, метод `GET /v1/orders/{id}/history`, блок `order_requisites` в `GET /v1/liquidity`, отмена

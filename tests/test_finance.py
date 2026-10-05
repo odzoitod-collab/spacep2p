@@ -29,11 +29,16 @@ def test_numbers_add_up_and_stats_message_is_edited(go, monkeypatch):
         monkeypatch.setattr(config, "log_chat_id", forum)
         b.session.forums[forum] = set()
         await tasks.stats_topic(b.bot)
-        posted = [m for m in b.session.calls if type(m).__name__ == "SendMessage" and m.chat_id == forum]
-        assert len(posted) == 1 and posted[0].message_thread_id and "Финансы Strait Pay" in posted[0].text
+        posted = [m for m in b.session.calls if type(m).__name__ == "SendMessage" and m.chat_id == forum
+                  and "Финансы Strait Pay" in m.text]
+        assert len(posted) == 1 and posted[0].message_thread_id
+        pinned = [m for m in b.session.calls if type(m).__name__ == "SendMessage" and m.chat_id == forum
+                  and "Что приходит само" in m.text]
+        assert pinned and [m for m in b.session.calls if type(m).__name__ == "PinChatMessage"]  # the topic's help
         assert any(m.name == "📊 Статистика и финансы" for m in b.session.calls if type(m).__name__ == "CreateForumTopic")
         await tasks.stats_topic(b.bot)  # ten minutes later: the same message is edited, not a new one
-        assert len([m for m in b.session.calls if type(m).__name__ == "SendMessage" and m.chat_id == forum]) == 1
+        assert len([m for m in b.session.calls if type(m).__name__ == "SendMessage" and m.chat_id == forum
+                    and "Финансы Strait Pay" in m.text]) == 1
         assert [m for m in b.session.calls if type(m).__name__ == "EditMessageText" and m.chat_id == forum]
     go(fn)
 

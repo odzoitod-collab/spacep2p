@@ -105,6 +105,20 @@ def _log(s: AsyncSession, uid: int | None, delta: Decimal, kind: str, ref: str, 
     s.add(Ledger(user_id=uid, delta=delta, frozen_delta=frozen_delta, kind=kind, ref=ref, note=note))
 
 
+def withdrawable(u: User) -> Decimal:
+    """What may leave the platform: the balance minus deposits not turned over yet. A deposit cannot simply go back
+    out: it has to work in deals first. Purchases, team income and admin credits are withdrawable at once."""
+    from bot.services import settings
+    if settings.get("withdraw_turnover") != "1":
+        return u.balance
+    return max(u.balance - u.deposit_lock, Decimal(0))
+
+
+def _turned_over(u: User, amount: Decimal) -> None:
+    """USDT of this user really went to someone else (a buyer, the operator debt): that much of his deposit worked."""
+    u.deposit_lock = max(u.deposit_lock - amount, Decimal(0))
+
+
 async def add(s: AsyncSession, uid: int, delta: Decimal, kind: str, ref: str = "", note: str | None = None) -> User:
     if not delta.is_finite():
         raise ValueError("Invalid amount")
@@ -112,6 +126,10 @@ async def add(s: AsyncSession, uid: int, delta: Decimal, kind: str, ref: str = "
     if u.balance + delta < 0:
         raise NotEnough
     u.balance += delta
+    if kind == "deposit" and delta > 0:
+        u.deposit_lock += delta  # to be turned over before it can be withdrawn
+    elif kind == "debt_repay" and delta < 0:
+        _turned_over(u, -delta)
     _log(s, uid, delta, kind, ref, note)
     return u
 
@@ -145,8 +163,38 @@ async def spend_frozen(s: AsyncSession, uid: int, amount: Decimal, ref: str) -> 
     if u.frozen < amount:
         raise NotEnough
     u.frozen -= amount
+    _turned_over(u, amount)  # sold to a buyer: that much of the deposit worked
     _log(s, uid, -amount, "deal_sell", ref, frozen_delta=-amount)
 
 
 def platform(s: AsyncSession, amount: Decimal, kind: str, ref: str) -> None:
     _log(s, None, amount, kind, ref)
+
+
+# A team leader's own balance (team_balance) is part of his holdings, journaled with its own kinds: per user
+# sum(delta of TEAM kinds) == team_balance and sum(delta of the other kinds) == balance + frozen.
+TEAM = ("team_income", "team_out")
+
+
+async def add_team(s: AsyncSession, uid: int, amount: Decimal, ref: str) -> User:
+    """The leader's percent of a member's deal: onto his team balance."""
+    if not amount.is_finite() or amount <= 0:
+        raise ValueError("Invalid amount")
+    u = await lock(s, uid)
+    u.team_balance += amount
+    _log(s, uid, amount, "team_income", ref)
+    return u
+
+
+async def team_to_balance(s: AsyncSession, uid: int, amount: Decimal) -> User:
+    """The leader moves his team earnings to the main balance (then withdraws them as usual)."""
+    if not amount.is_finite() or amount <= 0:
+        raise ValueError("Invalid amount")
+    u = await lock(s, uid)
+    if u.team_balance < amount:
+        raise NotEnough
+    u.team_balance -= amount
+    u.balance += amount
+    _log(s, uid, -amount, "team_out", f"team:{uid}")
+    _log(s, uid, amount, "team_in", f"team:{uid}")
+    return u

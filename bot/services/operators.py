@@ -14,13 +14,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.config import config
 from bot.models import Operator
-from bot.services import events, money
+from bot.services import admins, events, money
 
 
 async def ids(s: AsyncSession) -> list[int]:
     rows = (await s.scalars(select(Operator.user_id).where(Operator.active).order_by(Operator.created_at))).all()
     out = list(dict.fromkeys([*config.operator_ids, *rows]))
-    return out or list(config.admin_ids)
+    return out or admins.ids()
 
 
 async def is_operator(s: AsyncSession, uid: int) -> bool:
@@ -61,3 +61,9 @@ async def repay(s: AsyncSession, uid: int, amount: Decimal, how: str) -> tuple[D
 
 async def total_debt(s: AsyncSession) -> Decimal:
     return Decimal(await s.scalar(select(func.coalesce(func.sum(Operator.debt), 0))))
+
+
+def log(s: AsyncSession, operator_id: int, deal, action: str, details: str = "") -> None:
+    """One operator action on a Bybit order (accepted, gave requisites, returned, no requisites...): a post of its own
+    in the admin chat's «Операторы» topic (handlers.logchat), next to the deal's history. Does not commit."""
+    events.add(s, f"opa:{operator_id}", action[:32], f"{deal.id}\x1f{details}"[:1000], operator_id, alert=True)

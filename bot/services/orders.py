@@ -95,6 +95,44 @@ async def open_rub(s: AsyncSession, uid: int) -> Decimal:
         Deal.seller_id == uid, Deal.is_order, Deal.status.in_(deals.FUNDED))))
 
 
+REP_WINDOW = 30  # the reputation is the average of this many latest scores
+
+
+async def reputation(s: AsyncSession, uid: int) -> tuple[Decimal | None, int]:
+    """(average of the latest scores or None while there are fewer than rep_min_count, how many scores in all)."""
+    from bot.models import MerchantRating
+    scores = list((await s.scalars(select(MerchantRating.score).where(
+        MerchantRating.merchant_id == uid, MerchantRating.score.is_not(None))
+        .order_by(MerchantRating.id.desc()).limit(REP_WINDOW))).all())
+    total = await s.scalar(select(func.count(MerchantRating.id)).where(
+        MerchantRating.merchant_id == uid, MerchantRating.score.is_not(None)))
+    if total < settings.num("rep_min_count"):
+        return None, total
+    return (Decimal(sum(scores)) / len(scores)).quantize(Decimal("0.1")), total
+
+
+def rep_line(rep: Decimal | None, total: int) -> str:
+    return f"★ {money.fmt(rep, 1)} из 10 · оценок {total}" if rep is not None else \
+        f"пока нет ({total} из {settings.get('rep_min_count')} оценок)"
+
+
+def bybit_problem(rep: Decimal | None, d: Deal) -> str:
+    """Why a merchant with this reputation may not take this request by a Bybit order ("" = he may)."""
+    if rep is None:
+        return ""
+    if rep < settings.dec("rep_low"):
+        return f"репутация {money.fmt(rep, 1)} ниже {settings.get('rep_low')} — только с баланса"
+    if rep < settings.dec("rep_mid") and d.amount_rub > settings.dec("rep_mid_max_rub"):
+        return (f"репутация {money.fmt(rep, 1)}: Bybit-заявки до {money.fmt(settings.dec('rep_mid_max_rub'))} ₽ "
+                "— эту возьмите с баланса")
+    return ""
+
+
+def asleep(m: OrderMerchant | None) -> bool:
+    """On a pause after strike_limit requests in a row without requisites: takes and gets no requests."""
+    return m is not None and m.sleep_until is not None and deals.aware(m.sleep_until) > now()
+
+
 def fit_problem(m: OrderMerchant | None, u: User, d: Deal, bybit: bool) -> str:
     """Why this merchant cannot take this request this way now ("" = he can)."""
     if m is None or m.status != "approved":
@@ -102,6 +140,9 @@ def fit_problem(m: OrderMerchant | None, u: User, d: Deal, bybit: bool) -> str:
             "доступ ордерного мерчанта приостановлен"
     if u.is_banned:
         return "аккаунт заблокирован"
+    if asleep(m):
+        return (f"пауза до {deals.aware(m.sleep_until).astimezone(deals.MSK):%d.%m %H:%M} МСК — "
+                f"{settings.num('strike_limit')} раза подряд не дали реквизиты по своему ордеру")
     if not bybit and u.balance < d.seller_debit:  # a Bybit order needs no balance in the bot
         return (f"для работы с баланса нужно {money.usdt(d.seller_debit)} USDT свободных, у вас "
                 f"{money.usdt(u.balance)} — возьмите через Bybit-ордер")
@@ -115,7 +156,7 @@ async def eligible(s: AsyncSession, d: Deal) -> list[tuple[OrderMerchant, User]]
         OrderOffer.deal_id == d.id, OrderOffer.kind == "merchant"))).all())
     rows = (await s.execute(select(OrderMerchant, User).join(User, User.id == OrderMerchant.user_id).where(
         OrderMerchant.status == "approved", ~User.is_banned))).all()
-    return [(m, u) for m, u in rows if u.id != d.buyer_id and u.id not in seen]
+    return [(m, u) for m, u in rows if u.id != d.buyer_id and u.id not in seen and not asleep(m)]
 
 
 async def take(s: AsyncSession, deal_id: int, merchant: User, bybit: bool = True) -> Deal:
@@ -130,10 +171,18 @@ async def take(s: AsyncSession, deal_id: int, merchant: User, bybit: bool = True
     u = await money.lock(s, merchant.id)
     if problem := fit_problem(m, u, d, bybit):
         raise DealError(f"Не можете взять заявку: {problem}", "cannot")
+    if await s.scalar(select(OrderOffer.id).where(OrderOffer.deal_id == d.id, OrderOffer.user_id == merchant.id,
+                                                  OrderOffer.declined).limit(1)):
+        raise DealError("Вы уже работали с этой заявкой — её выполнит другой мерчант", "cannot")
+    if bybit and (problem := bybit_problem((await reputation(s, merchant.id))[0], d)):
+        raise DealError(f"Не можете взять через Bybit-ордер: {problem}", "cannot")
     if not bybit:
         await money.freeze(s, u.id, d.seller_debit, f"deal:{d.id}")
+    # a Bybit order: order_link_minutes for the link, or the request is not his (it goes to the others);
+    # with the balance: order_take_minutes to fill in the requisites
+    minutes = settings.num("order_link_minutes" if bybit else "order_take_minutes")
     moved = await deals._move(s, d.id, ("searching",), "assigned", seller_id=u.id, via_bybit=bybit,
-                              expires_at=now() + timedelta(minutes=settings.num("order_take_minutes")))
+                              expires_at=now() + timedelta(minutes=minutes))
     if moved is None:  # unreachable with the row lock, kept as a guard
         raise DealError("Заявку уже взял другой мерчант", "taken")
     return moved
@@ -161,6 +210,9 @@ async def give_requisites(s: AsyncSession, deal_id: int, who: User, kind: str, b
                 max_rub=d.amount_rub, is_active=False, is_deleted=True)  # never listed in the market
     s.add(card)
     await s.flush()
+    if d.via_bybit and d.bybit_url and d.seller_id and (m := await s.get(
+            OrderMerchant, d.seller_id, with_for_update=True, populate_existing=True)):
+        m.strikes = 0  # his order had requisites: the misses in a row start again (row locked, like strike())
     return await deals._move(s, d.id, (d.status,), "waiting_payment", card_id=card.id,
                              expires_at=now() + timedelta(minutes=minutes))
 
@@ -228,7 +280,21 @@ async def reject_link(s: AsyncSession, deal_id: int, operator: User) -> Deal | N
     if d is None or d.status != "checking" or d.operator_id not in (None, operator.id):
         return None
     return await deals._move(s, d.id, ("checking",), "assigned", bybit_url=None, operator_id=None,
-                             expires_at=now() + timedelta(minutes=settings.num("order_take_minutes")))
+                             expires_at=now() + timedelta(minutes=settings.num("order_link_minutes")))
+
+
+async def strike(s: AsyncSession, merchant_id: int) -> tuple[int, object]:
+    """An operator says the merchant's order had no requisites: one more miss in a row; at strike_limit the merchant
+    sleeps strike_sleep_hours (no requests) and the count starts again. Returns (misses in a row, sleeps until or
+    None). Does not commit."""
+    m = await s.get(OrderMerchant, merchant_id, with_for_update=True, populate_existing=True)
+    if m is None:
+        return 0, None
+    m.strikes += 1
+    if m.strikes < settings.num("strike_limit"):
+        return m.strikes, None
+    m.strikes, m.sleep_until = 0, now() + timedelta(hours=settings.num("strike_sleep_hours"))
+    return settings.num("strike_limit"), m.sleep_until
 
 
 async def release(s: AsyncSession, deal_id: int, why: str = "declined") -> Deal | None:
@@ -238,9 +304,10 @@ async def release(s: AsyncSession, deal_id: int, why: str = "declined") -> Deal 
     if d is None or d.status not in ("assigned", "checking"):
         return None
     merchant = d.seller_id
-    if deals.frozen(d):
+    if merchant and deals.frozen(d):
         await money.unfreeze(s, merchant, d.seller_debit, f"deal:{d.id}")
-    s.add(OrderOffer(deal_id=d.id, user_id=merchant, declined=True))
+    if merchant:  # he does not get this request again
+        s.add(OrderOffer(deal_id=d.id, user_id=merchant, declined=True))
     res = await deals._move(s, d.id, (d.status,), "searching", seller_id=None, via_bybit=False, bybit_url=None,
                             operator_id=None, expires_at=now() + timedelta(minutes=settings.num("order_search_minutes")))
     return res

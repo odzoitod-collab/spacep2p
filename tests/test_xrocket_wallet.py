@@ -46,7 +46,7 @@ def test_deposit_by_address_in_any_network_minus_fee(go):
         assert "1.5%" in plain(b.session.last(BUYER))
         await b.run(cb(BUYER, "w:adr:TRX"))
         text = plain(b.session.last(BUYER))
-        assert "TRC-20" in text and "TRXaddr1" in text and "Только USDT" in text
+        assert "TRC-20" in text and "TRXaddr1" in text and "только USDT" in text
         assert b.rocket.invoices[-1][0] is None and b.rocket.addresses == [("inv1", "TRX")]  # open amount, xRocket address
         await b.run(cb(BUYER, "w:adr:TRX"))  # the live address is shown again, not a new one
         assert len(b.rocket.addresses) == 1
@@ -115,11 +115,11 @@ def test_chat_gives_personal_one_time_links_and_keeps_a_pinned_summary(go):
     async def fn(b):
         await ready(b)
         await b.run(cb(ADMIN, "ach"))
-        assert "Чат не подключён" in plain(b.session.last(ADMIN))
+        assert "Статус: не подключён" in plain(b.session.last(ADMIN))
         await b.run(cb(ADMIN, "acx:chat_id"), msg(ADMIN, "12345"))
         assert "начинается с «-»" in plain(b.session.last(ADMIN))
         await b.run(msg(ADMIN, str(CHAT)))
-        assert "Права бота: ✅ приглашать, ✅ закреплять" in plain(b.session.last(ADMIN))
+        assert "Права бота: приглашать — да, закреплять — да" in plain(b.session.last(ADMIN))
         await b.run(msg(BUYER, "/start"))
         assert "chat" in b.session.buttons(BUYER)
         await b.run(cb(BUYER, "chat"))
@@ -138,7 +138,9 @@ def test_chat_gives_personal_one_time_links_and_keeps_a_pinned_summary(go):
         await create_deal(b)
         await tasks.chat_pin(b.bot)
         sent = [m for m in b.session.calls if type(m).__name__ == "SendAnimation" and m.chat_id == CHAT]
-        assert len(sent) == 1 and "Курс" in sent[0].caption and "Активных сделок: <b>1</b>" in sent[0].caption
+        pin = plain(sent[0].caption)
+        assert len(sent) == 1 and "Курс: 1 USDT = 100 ₽ · комиссия 6%" in pin and "Доход: 5% с каждой сделки" in pin
+        assert "Курс: 104 ₽ за USDT, без процента" in pin and "сделок" not in pin  # the terms, no statistics
         urls = [x.url for row in sent[0].reply_markup.inline_keyboard for x in row]
         assert "https://t.me/straitpay_bot?start=om" in urls  # the banner pin leads into the bot
         assert [m for m in b.session.calls if type(m).__name__ == "PinChatMessage"]
@@ -187,15 +189,20 @@ def test_toggles_keep_their_place_and_order_section_has_no_buy_buttons(go):
     go(fn)
 
 
-def test_log_card_lists_people_with_usernames_one_fact_per_line(go):
+def test_log_card_lists_people_as_links_in_the_card_style(go):
     async def fn(b):
         await ready(b)
         await create_deal(b)
+        before = len(b.session.calls)
         texts = await b.deliver()
         card = next(t for t in texts if t.startswith("🟡 Сделка #1"))
-        assert "/deal 1" in card.split("\n")[0]  # the number to follow the deal by
         lines = card.split("\n")
-        assert f"• Создал (покупатель): @u{BUYER} · U{BUYER} · {BUYER}" in lines  # one fact per line, as a bullet
-        assert f"• Принял (мерчант): @u{SELLER} · U{SELLER} · {SELLER}" in lines
-        assert "• Сумма: 10 000 ₽" in lines and "История" in lines
+        assert f"👤 Покупатель: @u{BUYER} · U{BUYER} · {BUYER}" in lines  # a label and its value on a branch
+        assert f"🏪 Мерчант: @u{SELLER} · U{SELLER} · {SELLER}" in lines
+        assert "💰 Сумма:" in lines and "10 000 ₽ → покупателю 94 USDT" in lines and "История" in lines
+        raw = next(m.text for m in b.session.calls[before:] if "Сделка" in (getattr(m, "text", "") or ""))
+        # the number and the people open their admin cards in the bot
+        assert 'href="https://t.me/straitpay_bot?start=a-deal-1"' in raw
+        assert f'href="https://t.me/straitpay_bot?start=a-user-{BUYER}"' in raw
+        assert "<blockquote expandable><b>История</b>" in raw and "МСК</i>" in raw
     go(fn)

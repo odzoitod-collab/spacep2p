@@ -22,6 +22,7 @@ SPEC: dict[str, tuple[str, str, str]] = {
     "late_hold_minutes": ("30", "int", "Удержание залога после истечения"),
     "late_minutes": ("720", "int", "Приём позднего чека после срока"),
     "adjust_approval_usdt": ("0", "dec", "Второй админ для корректировок от"),
+    "withdraw_turnover": ("1", "int0", "Вывод только прокрученного"),
     "online_minutes": ("60", "int0", "Автоконец смены без действий"),
     "receipt_images": ("0", "int0", "Формат чеков"),
     "log_all": ("1", "int0", "Лог-чат"),
@@ -33,10 +34,20 @@ SPEC: dict[str, tuple[str, str, str]] = {
     "order_take_minutes": ("10", "int", "Ордер: мерчанту на выдачу реквизитов"),
     "order_pay_minutes": ("15", "int", "Ордер: минимальное время на оплату"),
     "order_check_minutes": ("15", "int", "Ордер: оператору на Bybit-ордер"),
+    "order_link_minutes": ("2", "int", "Ордер: мерчанту на ссылку Bybit"),
+    "strike_limit": ("3", "int", "Ордер: пропусков реквизитов до паузы"),
+    "strike_sleep_hours": ("72", "int", "Ордер: пауза мерчанта, часов"),
+    "rep_min_count": ("10", "int", "Репутация: оценок до расчёта"),
+    "rep_low": ("5", "dec", "Репутация: ниже — без Bybit-ордеров"),
+    "rep_mid": ("7", "dec", "Репутация: ниже — Bybit с лимитом"),
+    "rep_mid_max_rub": ("30000", "dec", "Репутация: лимит Bybit-заявки"),
     "chain_withdraw_min": ("3", "dec", "Минимальный вывод на кошелёк"),
     "chain_withdraw_fee": ("3", "dec", "Фикс. комиссия вывода на кошелёк"),
     "team_pct": ("1", "pct", "Тимлиду от сделок команды"),
     "chat_id": ("", "chat", "Чат сообщества"),
+    "channel_id": ("", "chat", "Инфо-канал"),
+    "join_required": ("1", "int0", "Вступление в чат и канал"),
+    "channel_autopost_hours": ("24", "int0", "Автопост в канал, часов"),
     "signup_review": ("1", "int0", "Вход новых пользователей"),
     "docs_url": ("https://straitpay.best/docs", "url", "Сайт с инструкциями"),
     "tutorial": (
@@ -57,11 +68,13 @@ GROUPS: list[tuple[str, list[str]]] = [
     ("Сроки сделок", ["deal_minutes", "confirm_minutes", "escalate_minutes", "late_hold_minutes", "late_minutes",
                       "online_minutes"]),
     ("Кошелёк и лимиты", ["deposit_min", "withdraw_min", "chain_withdraw_min",
-                          "adjust_approval_usdt"]),
-    ("Правила и лог-чат", ["receipt_images", "log_all", "signup_review"]),
-    ("Тексты, поддержка, чат", ["support", "tutorial", "manual_url", "docs_url", "chat_id"]),
+                          "adjust_approval_usdt", "withdraw_turnover"]),
+    ("Правила и лог-чат", ["receipt_images", "log_all", "signup_review", "join_required"]),
+    ("Тексты, поддержка, чат", ["support", "tutorial", "manual_url", "docs_url", "chat_id", "channel_id",
+                                "channel_autopost_hours"]),
     ("Ордерные реквизиты", ["order_min_rub", "order_max_rub", "order_search_minutes", "order_take_minutes",
-                            "order_pay_minutes", "order_check_minutes"]),
+                            "order_link_minutes", "order_pay_minutes", "order_check_minutes", "strike_limit",
+                            "strike_sleep_hours", "rep_min_count", "rep_low", "rep_mid", "rep_mid_max_rub"]),
 ]
 HINTS = {
     "dec": "Число, дробная часть через точку или запятую.",
@@ -79,8 +92,24 @@ HINTS = {
                   "(через Bybit-ордер или из баланса). Процента у ордерных мерчантов нет. Не выше курса сервиса / "
                   "(1 − процент площадки), иначе площадка доплачивала бы покупателю из своих.",
     "seller_pct": "Процент от суммы сделки по статичной карте, который получает мерчант. Не больше процента площадки.",
-    "chat": "ID группы, например <code>-1001234567890</code> (бот — админ с правом приглашать и закреплять). "
-            "«-» — отключить чат.",
+    "chat": "ID группы или канала, например <code>-1001234567890</code> (бот — админ с правом приглашать, "
+            "закреплять и публиковать). «-» — отключить.",
+    "join_required": "1 — без вступления в чат сообщества и подписки на инфо-канал (если они заданы) главное меню "
+                     "не откроется; 0 — бот только предлагает вступить.",
+    "order_link_minutes": "Сколько минут у мерчанта на ссылку Bybit-ордера после «Взять». Не успел — заявка не "
+                          "считается взятой и уходит другим.",
+    "strike_limit": "Сколько раз подряд мерчант может не дать реквизиты по своему ордеру (по ответу оператора), "
+                    "прежде чем уйдёт на паузу.",
+    "strike_sleep_hours": "На сколько часов мерчант уходит на паузу (не получает и не берёт заявки).",
+    "withdraw_turnover": "1 — пополнение нельзя сразу вывести: выводится только баланс сверх непрокрученных "
+                         "пополнений (пополнение уменьшается на USDT, ушедшие покупателям в завершённых сделках). "
+                         "Купленное, доход тимлида и начисления админа выводятся сразу. 0 — выключено.",
+    "channel_autopost_hours": "Раз во сколько часов бот публикует в инфо-канал промо-пост (по кругу: курсы, "
+                              "безопасность, заработок на карте, Bybit-заявки, команды, покупка, вывод). 0 — выключено.",
+    "rep_min_count": "После скольких оценок операторов (1–10) у мерчанта считается репутация и действуют ограничения.",
+    "rep_low": "Средняя оценка ниже этой — мерчант берёт заявки только с баланса, без Bybit-ордеров.",
+    "rep_mid": "Средняя оценка ниже этой (но не ниже нижней) — Bybit-заявки только до лимита суммы.",
+    "rep_mid_max_rub": "Максимальная сумма Bybit-заявки для мерчанта со средней репутацией, ₽.",
     "url": "Ссылка https://… (например, на статью в Telegraph). «-» — убрать ссылку из бота.",
     "chain_withdraw_fee": "USDT сверх процента с каждого вывода на кошелёк, комиссия сети xRocket уже внутри: "
                           "если сеть берёт больше, пользователь платит комиссию сети.",
@@ -90,7 +119,7 @@ HINTS = {
                 "сделки участника команды. Платит площадка из своего дохода по сделке, не больше него.",
     "deposit_fee": "Процент с каждого пополнения — и счётом, и по адресу. Удерживается из поступившей суммы.",
 }
-FLAGS = ("receipt_images", "log_all", "signup_review")
+FLAGS = ("receipt_images", "log_all", "signup_review", "join_required", "withdraw_turnover")
 RATES = ("rate", "order_rate")  # RUB per 1 USDT
 
 _cache: dict[str, str] = {}
@@ -148,7 +177,9 @@ def human(key: str, value: str | None = None) -> str:
     if key in FLAGS:
         return {"receipt_images": {"1": "PDF и фото", "0": "только PDF"},
                 "log_all": {"1": "все события", "0": "только проблемы"},
-                "signup_review": {"1": "по заявке", "0": "открыт всем"}}[key].get(v, v)
+                "signup_review": {"1": "по заявке", "0": "открыт всем"},
+                "join_required": {"1": "обязательно", "0": "по желанию"},
+                "withdraw_turnover": {"1": "включено", "0": "выключено"}}[key].get(v, v)
     if key == "online_minutes" and v == "0":
         return "выключено"
     if key == "adjust_approval_usdt" and Decimal(v) == 0:
@@ -156,6 +187,8 @@ def human(key: str, value: str | None = None) -> str:
     if kind == "pct":
         return f"{v}%"
     if kind in ("int", "int0"):
+        if key.endswith("_hours"):
+            return f"{v} ч"
         if not key.endswith("minutes"):
             return v
         n = int(v)
@@ -175,6 +208,11 @@ def human(key: str, value: str | None = None) -> str:
 
 def get(key: str) -> str:
     return _cache.get(key, SPEC[key][0])
+
+
+def raw(key: str) -> str:
+    """A stored value that is not an admin setting (the log chat, granted admins...): "" if not set."""
+    return _cache.get(key, "")
 
 
 def dec(key: str) -> Decimal:

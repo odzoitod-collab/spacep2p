@@ -43,3 +43,31 @@ def test_text_only_mode_has_no_emoji(go):
             for row in getattr(getattr(m, "reply_markup", None), "inline_keyboard", []) or []:
                 assert all(btn.icon_custom_emoji_id is None for btn in row)
     go(fn)
+
+
+def test_card_style_helpers():
+    from bot.ui import cf, clean, quote, section
+    assert quote("• Баланс: <b>5 USDT</b>", "• просто строка") == \
+        "<blockquote><b>Баланс:</b> <b>5 USDT</b>\nпросто строка</blockquote>"  # no list mixes both looks
+    assert quote("• один", "• два") == "<blockquote>• один\n• два</blockquote>"  # a plain list keeps its bullets
+    assert quote("• 14:05 · событие") == "<blockquote>• 14:05 · событие</blockquote>"  # a time is not a label
+    assert cf("Сумма", "10 ₽") == "<blockquote><b>Сумма:</b></blockquote>\n<b><code> ╰</code></b>  10 ₽"
+    assert cf("Сумма", "a", "", "b").split("\n")[1:] == ["<b><code>├</code></b>  a", "<b><code>╰</code></b>  b"]
+    assert cf("Пусто", "", "") == ""
+    text = clean("\n".join(["T", cf("Кто", "x", icon="profile"), section("bell", "Раздел"), quote("• x: y")]))
+    assert text.count("<tg-emoji") == 2  # card labels and section headers keep their icons
+
+
+def test_every_screen_fits_under_the_banner(go):
+    """A screen longer than a caption cannot keep the banner and is re-sent as text: every screen of the tour fits."""
+    from bot.ui import CAPTION_LIMIT, visible_len
+
+    async def fn(b):
+        await tour(b)
+        await b.run(cb(BUYER, "info:g"), cb(ADMIN, "acm"), cb(ADMIN, "aadm"), cb(ADMIN, "atml"))
+        long = [(m.chat_id, visible_len(t)) for m in b.session.calls
+                if type(m).__name__ in ("SendAnimation", "EditMessageCaption", "SendMessage", "EditMessageText")
+                and (t := getattr(m, "text", None) or getattr(m, "caption", None)) and m.chat_id in (BUYER, SELLER, ADMIN)
+                and visible_len(t) > CAPTION_LIMIT]
+        assert not long, long
+    go(fn)

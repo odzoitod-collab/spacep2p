@@ -1,32 +1,37 @@
 """Admin operation cards (withdrawal, deposit), event history, support tickets, CSV reports, alert rendering."""
 import csv
 import io
+from contextlib import suppress
 from datetime import timedelta
 from decimal import Decimal
 
 from aiogram import Bot, F, Router
+from aiogram.exceptions import TelegramAPIError
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import BufferedInputFile, CallbackQuery, Message
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.config import config
+from bot.services.admins import IsAdmin
 from bot.emoji import back, btn, kb, pe
 from bot.handlers.admin import DEP_LABEL, WD_LABEL
 from bot.handlers.wallet import (check_deposit, deposit_done_text, notify_withdrawal, reconcile, send_cheque,
                                  sync_withdrawal)
 from bot.models import Audit, Deal, Deposit, Event, Ledger, Ticket, User, Withdrawal, now
-from bot.services import audit, events, money, xrocket
-from bot.ui import at, esc, notify, ok, quote, show, title, warn
+from bot.services import admins, audit, events, money, settings, xrocket
+from bot.ui import alink, at, cf, esc, files_to, notify, ok, quote, section, show, title, ulink, warn
+from bot.ui import card as fields
 
 router = Router()
-router.message.filter(F.from_user.id.in_(config.admin_ids))
-router.callback_query.filter(F.from_user.id.in_(config.admin_ids))
+router.message.filter(IsAdmin())
+router.callback_query.filter(IsAdmin())
 
 
 class Ops(StatesGroup):
     reply = State()
+    token = State()
 
 
 def _who(u: User | None, uid: int) -> str:
@@ -58,6 +63,100 @@ async def cb_payments(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User):
     ), c)
 
 
+# ---------- xRocket: the app, its balance, the payout queue, the token ----------
+
+@router.callback_query(F.data.in_({"axr", "axr:go"}))
+async def cb_xrocket(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User, state: FSMContext):
+    await state.set_state(None)
+    note = ""
+    if c.data == "axr:go":  # send what the balance covers now, in order
+        from bot.tasks import payout_queue
+        before = await s.scalar(select(func.count(Withdrawal.id)).where(Withdrawal.status == "queued"))
+        await payout_queue(bot)
+        left = await s.scalar(select(func.count(Withdrawal.id)).where(Withdrawal.status == "queued"))
+        audit.log(s, user.id, "payout_queue", "", f"{before} → {left}")
+        note = ok(f"Отправлено из очереди: {before - left}, осталось {left}")
+    await xrocket_screen(bot, s, user, c, note)
+
+
+async def xrocket_screen(bot: Bot, s: AsyncSession, admin: User, src=None, note: str = ""):
+    tok = xrocket.token(config.xrocket_token)
+    try:
+        funds = await xrocket.usdt_available(timeout=5)
+        status = f"подключён · на балансе приложения <b>{money.usdt(funds)} USDT</b>"
+    except Exception as e:  # noqa: BLE001 - shown to the admin as it is
+        funds, status = None, f"<b>нет ответа</b>: {esc(getattr(e, 'human', str(e))[:120])}"
+    queued = (await s.scalars(select(Withdrawal).where(Withdrawal.status == "queued").order_by(Withdrawal.id)
+                              .limit(15))).all()
+    need = sum((w.amount - w.fee + (w.net_fee or 0) for w in queued), Decimal(0))
+    people = {u.id: u for u in (await s.scalars(select(User).where(User.id.in_({w.user_id for w in queued})))).all()}
+    await show(bot, admin, "\n".join([
+        title(pe("wallet"), "xRocket"),
+        "",
+        fields(cf("Статус", status, icon="info"),
+               cf("Токен", f"<code>{xrocket.hint(tok)}</code> · " + ("из админ-панели" if settings.raw(xrocket.TOKEN_KEY)
+                                                                       else "из .env (XROCKET_TOKEN)"), icon="key"),
+               cf("Сети USDT", ", ".join(xrocket.net_name(n) for n in await xrocket.networks()), icon="swap"),
+               cf("Очередь выводов", f"<b>{len(queued)}</b> на {money.usdt(need)} USDT"
+                  + (f" · не хватает <b>{money.usdt(need - funds)} USDT</b>" if funds is not None and need > funds
+                     else ""), icon="clock")),
+        "\n".join(f"{i}. {alink('wd', w.id, f'#{w.id}')} · {money.usdt(w.amount - w.fee)} USDT · "
+                  f"{'чек' if w.method == 'xrocket' else xrocket.net_name(w.network)} · "
+                  f"{ulink(people.get(w.user_id), w.user_id)}" for i, w in enumerate(queued, 1)) if queued else "",
+        "",
+        quote("Выводы встают в очередь, когда на балансе приложения не хватает USDT, и уходят строго по порядку "
+              "сами (проверка раз в 30 с). Пополните приложение в @xRocket — или нажмите «Отправить очередь»."),
+    ]).replace("\n\n\n", "\n\n") + note, kb(
+        btn("Отправить очередь сейчас", "axr:go", "up", style="success") if queued else None,
+        btn("Сменить токен", "axr:tok", "key") if admins.is_owner(admin.id) else None,
+        btn("Пополнения и выводы", "al", "list"),
+        back("a", "Админ-панель")), src)
+
+
+@router.callback_query(F.data == "axr:tok")
+async def cb_token(c: CallbackQuery, bot: Bot, user: User, state: FSMContext):
+    if not admins.is_owner(user.id):
+        return await c.answer("Менять токен могут только владельцы", show_alert=True)
+    await state.set_state(Ops.token)
+    await show(bot, user, _token_text(), kb(back("axr", "Отмена")), c)
+
+
+def _token_text(err: str = "") -> str:
+    return "\n".join([
+        f"{pe('key')} <b>Новый токен xRocket Pay API</b>",
+        "",
+        quote("Пришлите токен следующим сообщением: @xRocket → Rocket Pay → ваше приложение → API-токен. "
+              "Бот проверит его запросом баланса и сразу удалит ваше сообщение. Действует для всех операций с "
+              "этой минуты; открытые счета и выводы старого приложения проверяйте в нём самом."),
+    ]) + (warn(err) if err else "")
+
+
+@router.message(Ops.token, F.text)
+async def msg_token(m: Message, bot: Bot, s: AsyncSession, user: User, state: FSMContext):
+    with suppress(TelegramAPIError):
+        await m.delete()  # a secret: gone at once, whatever happens next
+    tok = m.text.strip()
+    if not admins.is_owner(user.id):
+        await state.set_state(None)
+        return await show(bot, user, warn("Менять токен могут только владельцы"), kb(back("a", "Админ-панель")))
+    if not 20 <= len(tok) <= 200 or any(ch.isspace() for ch in tok):
+        return await show(bot, user, _token_text("Это не похоже на токен — скопируйте его целиком"),
+                          kb(back("axr", "Отмена")))
+    try:
+        funds = await xrocket.check_token(tok, config.xrocket_base_url)
+    except xrocket.XRocketError as e:
+        return await show(bot, user, _token_text(f"xRocket не принял токен: {e.human}"), kb(back("axr", "Отмена")))
+    await state.set_state(None)
+    old = xrocket.token(config.xrocket_token)
+    await settings.put(s, xrocket.TOKEN_KEY, tok)
+    audit.log(s, user.id, "xrocket_token", "", f"{xrocket.hint(old)} → {xrocket.hint(tok)}")
+    events.add(s, "app:xrocket", "token", f"Токен xRocket сменён ({user.name}): {xrocket.hint(tok)}", user.id,
+               alert=True)
+    await s.commit()
+    await xrocket.switch(tok, config.xrocket_base_url)
+    await xrocket_screen(bot, s, user, note=ok(f"Токен принят: на балансе приложения {money.usdt(funds)} USDT"))
+
+
 # ---------- withdrawal card ----------
 
 WD_NEXT = {
@@ -73,51 +172,56 @@ async def withdrawal_screen(bot: Bot, s: AsyncSession, admin: User, wd: Withdraw
     u = await s.get(User, wd.user_id)
     last = await s.scalar(select(Event).where(Event.ref == f"wd:{wd.id}").order_by(Event.id.desc()).limit(1))
     if wd.method == "chain":
+        nxt = {"pending": "Списано, запрос в xRocket ещё не отправлен — фоновая задача отправит его в течение минуты.",
+               "unknown": "Ответ xRocket неизвестен — сверим по clientWithdrawalId; если xRocket его не знает, "
+                          "запрос повторится с тем же id (двойного вывода не будет).",
+               "sent": "xRocket принял вывод, транзакция в пути. Статус проверяется раз в минуту.",
+               "done": "Выполнен xRocket.", "failed": "Не выполнен, сумма возвращена на баланс."}.get(wd.status, "")
         return await show(bot, admin, "\n".join([
-            title(pe("up"), f"Вывод на кошелёк #{wd.id} · {WD_LABEL.get(wd.status, wd.status)}"),
-            quote(
-                f"{pe('profile')} Пользователь: {_who(u, wd.user_id)}",
-                f"{pe('swap')} Сеть: <b>{xrocket.net_name(wd.network)}</b>",
-                f"{pe('wallet')} Списано: <b>{money.usdt(wd.amount)} USDT</b> · к отправке "
-                f"{money.usdt(wd.amount - wd.fee)} · комиссия {money.usdt(wd.fee)} (сеть {money.usdt(wd.net_fee)})",
-                f"{pe('key')} Адрес: <code>{esc(wd.address or '—')}</code>"
-                + (f" · memo <code>{esc(wd.memo)}</code>" if wd.memo else ""),
-                f"{pe('clock')} Создан: {at(wd.created_at, 'dt')}" + (f" · отправлен {at(wd.sent_at, 'dt')}" if wd.sent_at else ""),
-                f"{pe('key')} clientWithdrawalId: <code>wd-{wd.id}</code> · tx: <code>{esc(wd.tx_hash or '—')}</code>",
-                f"{pe('info')} Ошибка: {esc(wd.error[:200])}" if wd.error else "",
-                f"{pe('list')} Последнее событие: {esc(last.text[:150])} · {at(last.created_at, 'dt')}" if last else "",
+            title(pe("up"), f"Вывод на кошелёк {alink('wd', wd.id, f'#{wd.id}')}") + f" · {WD_LABEL.get(wd.status, wd.status)}",
+            "",
+            fields(
+                cf("Пользователь", ulink(u, wd.user_id), icon="profile"),
+                cf("Сумма", f"Списано: <b>{money.usdt(wd.amount)} USDT</b>",
+                   f"к отправке {money.usdt(wd.amount - wd.fee)} · комиссия {money.usdt(wd.fee)} "
+                   f"(сеть {money.usdt(wd.net_fee)})", icon="wallet"),
+                cf("Куда", f"сеть <b>{xrocket.net_name(wd.network)}</b>", f"<code>{esc(wd.address or '—')}</code>"
+                   + (f" · memo <code>{esc(wd.memo)}</code>" if wd.memo else ""), icon="swap"),
+                cf("Когда", f"создан {at(wd.created_at, 'dt')}" + (f" · отправлен {at(wd.sent_at, 'dt')}" if wd.sent_at else ""),
+                   icon="clock"),
+                cf("xRocket", f"clientWithdrawalId: <code>wd-{wd.id}</code>", f"tx: <code>{esc(wd.tx_hash or '—')}</code>",
+                   f"ошибка: {esc(wd.error[:200])}" if wd.error else "", icon="key"),
+                cf("Последнее событие", f"{esc(last.text[:150])} · {at(last.created_at, 'dt')}", icon="list") if last else "",
             ),
-            {"pending": "Списано, запрос в xRocket ещё не отправлен — фоновая задача отправит его в течение минуты.",
-             "unknown": "Ответ xRocket неизвестен — сверим по clientWithdrawalId; если xRocket его не знает, "
-                        "запрос повторится с тем же id (двойного вывода не будет).",
-             "sent": "xRocket принял вывод, транзакция в пути. Статус проверяется раз в минуту.",
-             "done": "Выполнен xRocket.", "failed": "Не выполнен, сумма возвращена на баланс."}.get(wd.status, ""),
+            "",
+            quote(nxt) if nxt else "",
         ]) + note, kb(
             btn("Проверить в xRocket", f"wt:{wd.id}", "refresh", style="primary")
             if wd.status in ("pending", "sent", "unknown") else None,
             btn("Транзакция", icon="search", url=wd.link) if wd.link else None,
-            [btn("Профиль", f"auv:{wd.user_id}", "profile"), btn("История вывода", f"aev:wd:{wd.id}", "list")],
+            btn("История вывода", f"aev:wd:{wd.id}", "list"),
             back("al", "Пополнения и выводы"),
         ), src)
     await show(bot, admin, "\n".join([
-        title(pe("up"), f"Вывод #{wd.id} · {WD_LABEL.get(wd.status, wd.status)}"),
+        title(pe("up"), f"Вывод {alink('wd', wd.id, f'#{wd.id}')}") + f" · {WD_LABEL.get(wd.status, wd.status)}",
         "",
-        quote(
-            f"{pe('profile')} Пользователь: {_who(u, wd.user_id)}",
-            f"{pe('wallet')} Списано: <b>{money.usdt(wd.amount)} USDT</b>",
-            f"{pe('dollar')} Чек: {money.usdt(wd.amount - wd.fee)} USDT · комиссия: {money.usdt(wd.fee)} USDT",
-            f"{pe('clock')} Создан: {at(wd.created_at, 'dt')}",
-            f"{pe('key')} clientChequeId: <code>wd-{wd.id}</code>" + (f" · chequeId: <code>{esc(wd.cheque_id)}</code>"
-                                                                      if wd.cheque_id else ""),
-            f"{pe('info')} Ответ xRocket: {esc((wd.error or '—')[:200])}",
-            f"{pe('list')} Последнее событие: {esc(last.text[:150])} · {at(last.created_at, 'dt')}" if last else "",
+        fields(
+            cf("Пользователь", ulink(u, wd.user_id), icon="profile"),
+            cf("Сумма", f"Списано: <b>{money.usdt(wd.amount)} USDT</b>",
+               f"Чек: {money.usdt(wd.amount - wd.fee)} USDT · комиссия: {money.usdt(wd.fee)} USDT", icon="wallet"),
+            cf("Когда", f"создан {at(wd.created_at, 'dt')}", icon="clock"),
+            cf("xRocket", f"clientChequeId: <code>wd-{wd.id}</code>"
+               + (f" · chequeId: <code>{esc(wd.cheque_id)}</code>" if wd.cheque_id else ""),
+               f"Ответ xRocket: {esc((wd.error or '—')[:200])}", icon="key"),
+            cf("Последнее событие", f"{esc(last.text[:150])} · {at(last.created_at, 'dt')}", icon="list") if last else "",
         ),
-        WD_NEXT.get(wd.status, ""),
+        "",
+        quote(WD_NEXT[wd.status]) if wd.status in WD_NEXT else "",
     ]) + note, kb(
         btn("Проверить в xRocket", f"wr:{wd.id}", "refresh", style="primary") if wd.status in ("unknown", "done") else None,
         btn("Вернуть средства", f"wr:rf:{wd.id}", "cross", style="danger") if refund else None,
         btn("Ссылка на чек", url=wd.link, icon="wallet") if wd.link else None,
-        [btn("Профиль", f"auv:{wd.user_id}", "profile"), btn("История вывода", f"aev:wd:{wd.id}", "list")],
+        btn("История вывода", f"aev:wd:{wd.id}", "list"),
         back("al", "Пополнения и выводы"),
     ), src)
 
@@ -219,22 +323,24 @@ async def deposit_screen(bot: Bot, s: AsyncSession, admin: User, dep: Deposit, s
            "paid": "Зачислено на баланс пользователя.", "expired": "Истёк без оплаты.",
            "failed": "xRocket отказал в создании счёта."}.get(dep.status, "")
     await show(bot, admin, "\n".join([
-        title(pe("down"), f"Пополнение #{dep.id} · {DEP_LABEL.get(dep.status, dep.status)}"),
+        title(pe("down"), f"Пополнение {alink('dep', dep.id, f'#{dep.id}')}") + f" · {DEP_LABEL.get(dep.status, dep.status)}",
         "",
-        quote(
-            f"{pe('profile')} Пользователь: {_who(u, dep.user_id)}",
-            f"{pe('swap')} Адрес {xrocket.net_name(dep.network)}: <code>{esc(dep.address)}</code>" if dep.address
-            else f"{pe('wallet')} Счёт-ссылка xRocket",
-            f"{pe('dollar')} Сумма: <b>{money.usdt(dep.amount)} USDT</b> · "
-            + (f"зачислено: <b>{money.usdt(dep.credit)} USDT</b>" if dep.status == "paid"
-               else f"ожидается: {money.usdt(dep.credit)} USDT"),
-            f"{pe('clock')} Создан: {at(dep.created_at, 'dt')}",
-            f"{pe('key')} clientInvoiceId: <code>dep-{dep.id}</code> · invoiceId: <code>{esc(dep.invoice_id or '—')}</code>",
+        fields(
+            cf("Пользователь", ulink(u, dep.user_id), icon="profile"),
+            cf("Способ", f"адрес {xrocket.net_name(dep.network)}: <code>{esc(dep.address)}</code>" if dep.address
+               else "счёт-ссылка xRocket", icon="swap"),
+            cf("Сумма", f"<b>{money.usdt(dep.amount)} USDT</b> · "
+               + (f"зачислено: <b>{money.usdt(dep.credit)} USDT</b>" if dep.status == "paid"
+                  else f"ожидается: {money.usdt(dep.credit)} USDT"), icon="dollar"),
+            cf("Когда", f"создан {at(dep.created_at, 'dt')}", icon="clock"),
+            cf("xRocket", f"clientInvoiceId: <code>dep-{dep.id}</code>",
+               f"invoiceId: <code>{esc(dep.invoice_id or '—')}</code>", icon="key"),
         ),
-        nxt,
+        "",
+        quote(nxt) if nxt else "",
     ]) + note, kb(
         btn("Проверить в xRocket", f"dpc:{dep.id}", "refresh", style="primary") if dep.status in ("new", "active") else None,
-        [btn("Профиль", f"auv:{dep.user_id}", "profile"), btn("История", f"aev:dep:{dep.id}", "list")],
+        btn("История", f"aev:dep:{dep.id}", "list"),
         back("al", "Пополнения и выводы"),
     ), src)
 
@@ -276,12 +382,18 @@ async def cb_events(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User):
     _, kind, oid = c.data.split(":")
     rows = await events.history(s, f"{kind}:{oid}")
     name, cb = REF_NAMES[kind]
-    lines = [f"• {at(e.created_at, 'dt')} · {esc(e.text[:200])}" + (f" {pe('bell')}" if e.alert else "") for e in rows]
+    lines = [f"{at(e.created_at, 'dt')} · {esc(e.text[:200])}" + (" · <b>админам</b>" if e.alert else "")
+             for e in rows]
     while len("\n".join(lines)) > 3300:  # a long history: the latest events fit into one message
         lines.pop(0)
-    await show(bot, user, title(pe("list"), f"История · {name} #{oid}") + "\nПоследние события, новые внизу.\n\n"
-               + (quote(*lines) if lines else "Событий нет (операция создана до журнала событий)."),
-               kb(back(f"{cb}:{oid}", "Назад")), c)
+    await show(bot, user, "\n".join([
+        title(pe("list"), f"История · {name} {alink(kind, oid, f'#{oid}')}"),
+        "",
+        "<blockquote>" + "\n".join(lines) + "</blockquote>" if lines
+        else "<i>Событий нет — операция создана до журнала событий.</i>",
+        "",
+        quote("Последние события, новые внизу. «админам» — ушло в админ-чат."),
+    ]), kb(back(f"{cb}:{oid}", "Назад")), c)
 
 
 # ---------- tickets ----------
@@ -306,17 +418,24 @@ async def cb_tickets(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User, st
 
 async def ticket_screen(bot: Bot, s: AsyncSession, admin: User, t: Ticket, src=None, note: str = ""):
     u = await s.get(User, t.user_id)
+    answered = await s.get(User, t.answered_by) if t.answered_by else None
     await show(bot, admin, "\n".join([
-        title(pe("support"), f"Обращение #{t.id} · {TICKET_STATUS[t.status]}"),
+        title(pe("support"), f"Обращение {alink('ticket', t.id, f'#{t.id}')}") + f" · {TICKET_STATUS[t.status]}",
         "",
-        quote(f"{pe('profile')} {_who(u, t.user_id)} · {at(t.created_at, 'dt')}",
-              f"{pe('fire')} Открытая сделка: #{t.deal_id}" if t.deal_id else ""),
-        esc(t.text),
-        *(["", f"<b>Ответ</b> (<code>{t.answered_by}</code>):", esc(t.answer)] if t.answer else []),
+        fields(
+            cf("Пользователь", ulink(u, t.user_id), icon="profile"),
+            cf("Когда", at(t.created_at, "dt"), icon="clock"),
+            cf("Открытая сделка", alink("deal", t.deal_id, f"#{t.deal_id}"), icon="fire") if t.deal_id else "",
+        ),
+        "",
+        section("support", "Текст"),
+        f"<blockquote>{esc(t.text)}</blockquote>",
+        *(["", section("pencil", "Ответ"), f"<blockquote>{esc(t.answer)}</blockquote>",
+           f"<i>{ulink(answered, t.answered_by)}</i>"] if t.answer else []),
     ]) + note, kb(
         [btn("Ответить", f"atr:{t.id}", "pencil", style="primary"),
          btn("Закрыть", f"atc:{t.id}", "ok") if t.status != "closed" else None],
-        [btn("Профиль", f"auv:{t.user_id}", "profile"), btn(f"Сделка #{t.deal_id}", f"adv:{t.deal_id}", "fire")
+        [btn(f"Сделка #{t.deal_id}", f"adv:{t.deal_id}", "fire")
          if t.deal_id else None],
         back("atl", "Обращения"),
     ), src)
@@ -424,8 +543,9 @@ async def cb_report(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User):
         _csv(f"payments_{suffix}.csv", ["type", "id", "created_at", "user_id", "status", "network", "amount_usdt", "fee_usdt",
                                         "net_usdt", "xrocket_id", "error"], sorted(pay_rows, key=lambda r: r[2])),
     ]
+    chat, topic = files_to(c)
     for f in files:
-        await bot.send_document(user.id, f, caption=f"{f.filename} · за {days} дн.")
+        await bot.send_document(chat, f, caption=f"{f.filename} · за {days} дн.", message_thread_id=topic)
     audit.log(s, user.id, "report", f"{days}d")
 
 
@@ -433,8 +553,18 @@ async def cb_report(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User):
 
 @router.callback_query(F.data == "aa")
 async def cb_audit(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User):
+    from bot.handlers.logchat import ACTIONS, target_text
     rows = (await s.scalars(select(Audit).order_by(Audit.id.desc()).limit(20))).all()
-    lines = [f"{at(r.created_at, 'dt')} <code>{r.actor_id}</code> {esc(r.action)} {esc(r.target)} "
-             f"{esc(r.details[:60])}" for r in rows]
-    await show(bot, user, title(pe("doc"), "Журнал действий") + "\n\n" + (quote(*lines) if lines else "Пусто"),
-               kb(back("a", "Админ-панель")), c)
+    people = {u.id: u for u in (await s.scalars(select(User).where(User.id.in_({r.actor_id for r in rows})))).all()}
+    lines = [f"{at(r.created_at, 'dt')} · {ulink(people.get(r.actor_id), r.actor_id)} · "
+             f"<b>{ACTIONS.get(r.action, ('', r.action))[1]}</b>"
+             + (f" · {await target_text(s, r.target)}" if r.target else "")
+             + (f" · <i>{esc(r.details[:60])}</i>" if r.details else "") for r in rows]
+    await show(bot, user, "\n".join([
+        title(pe("doc"), "Журнал действий админов"),
+        "",
+        "\n".join(lines) if lines else "<i>Пусто.</i>",
+        "",
+        quote("Последние 20, новые сверху. В админ-чате каждое действие приходит отдельным постом в тему "
+              "«Действия админов»."),
+    ]), kb(back("a", "Админ-панель")), c)

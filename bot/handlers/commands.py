@@ -12,7 +12,6 @@ from aiogram.types import (BotCommand, BotCommandScopeAllGroupChats, BotCommandS
                            Message)
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from bot.config import config
 from bot.handlers.admin import admin_screen
 from bot.handlers.admin_deals import deal_view
 from bot.handlers.api_user import api_screen
@@ -24,7 +23,7 @@ from bot.handlers.start import info_screen, main_menu
 from bot.handlers.team import joined_screen, team_screen
 from bot.handlers.wallet import op_screen, wallet_screen
 from bot.models import Deal, Ledger, Team, User
-from bot.services import teams
+from bot.services import admins, teams
 from bot.ui import BRAND, TAGLINE, esc, ok, warn
 
 router = Router()
@@ -39,7 +38,8 @@ COMMANDS = [
     ("support", "Написать оператору"),
     ("api", "API для сервисов"),
 ]
-ADMIN_COMMANDS = COMMANDS + [("admin", "Админ-панель"), ("deal", "Сделка по номеру: /deal 15")]
+ADMIN_COMMANDS = COMMANDS + [("admin", "Админ-панель"), ("deal", "Сделка по номеру: /deal 15"),
+                             ("user", "Пользователь: /user ID или @username"), ("find", "Поиск: ID, @ник, #сделка, карта")]
 GROUP_COMMANDS = [("help", "Как работать: инструкции Strait Pay")]
 
 
@@ -61,13 +61,22 @@ async def setup_commands(bot: Bot) -> None:
     with suppress(TelegramAPIError):  # groups (the community and team chats): /help with the guides
         await bot.set_my_commands([BotCommand(command=c, description=d) for c, d in GROUP_COMMANDS],
                                   scope=BotCommandScopeAllGroupChats())
-    for aid in config.admin_ids:
-        with suppress(TelegramAPIError):  # admin never opened the bot yet
+    for aid in admins.ids():
+        await admin_menu(bot, aid, True)
+
+
+async def admin_menu(bot: Bot, uid: int, on: bool) -> None:
+    """The «/» menu of one admin (or back to the general one when he stops being an admin)."""
+    with suppress(TelegramAPIError):  # he never opened the bot yet
+        if on:
             await bot.set_my_commands([BotCommand(command=c, description=d) for c, d in ADMIN_COMMANDS],
-                                      scope=BotCommandScopeChat(chat_id=aid))
+                                      scope=BotCommandScopeChat(chat_id=uid))
+        else:
+            await bot.delete_my_commands(scope=BotCommandScopeChat(chat_id=uid))
 
 
 START = re.compile(r"^(?:o(\d+))?(?:_?t(\d+))?$")
+ADMIN_LINK = re.compile(r"^a-([a-z]+)-(\d+)$")  # ui.alink: an object's admin card
 
 
 @router.message(CommandStart())
@@ -81,6 +90,15 @@ async def cmd_start(m: Message, bot: Bot, s: AsyncSession, user: User, is_admin:
     payload = (command.args or "").strip() if command and command.command == "start" else ""
     if payload == "om":
         return await merchant_screen(bot, s, user)
+    if link := ADMIN_LINK.match(payload):
+        from bot.handlers.admin_cmds import open_ref
+        if is_admin:
+            with suppress(TelegramAPIError):
+                await m.delete()  # the screen is the answer; the /start line goes
+            if await open_ref(bot, s, user, link[1], int(link[2])):
+                return None
+            return await admin_screen(bot, s, user, note=warn("Не найдено — возможно, запись удалена."))
+        return await main_menu(bot, s, user, is_admin)
     found = START.match(payload) if payload else None
     if not found or not any(found.groups()):
         return await main_menu(bot, s, user, is_admin)
@@ -144,10 +162,10 @@ async def cmd_deal(m: Message, bot: Bot, s: AsyncSession, user: User, command: C
     await state.set_state(None)
     arg = (command.args or "").strip().lstrip("#")
     d = await s.get(Deal, int(arg)) if arg.isdigit() else None
-    if d is not None and user.id in config.admin_ids and user.id not in (d.buyer_id, d.seller_id, d.operator_id):
+    if d is not None and admins.is_admin(user.id) and user.id not in (d.buyer_id, d.seller_id, d.operator_id):
         return await deal_view(bot, s, user, d)  # an admin follows any deal by its number: the full card
     if d is None or user.id not in (d.buyer_id, d.seller_id, d.operator_id):
-        return await main_menu(bot, s, user, user.id in config.admin_ids, note=warn("Сделка не найдена"))
+        return await main_menu(bot, s, user, admins.is_admin(user.id), note=warn("Сделка не найдена"))
     await deal_screen(bot, s, user, d)
 
 

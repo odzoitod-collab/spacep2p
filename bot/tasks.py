@@ -15,7 +15,7 @@ from bot.handlers import finance as finance_handlers
 from bot.handlers import wallet as wallet_handlers
 from bot.handlers.wallet import check_deposit, notify_withdrawal, reconcile, sync_withdrawal
 from bot.models import Deal, Deposit, Session, User, Withdrawal, now
-from bot.services import api, deals, events, money, orders, settings, xrocket
+from bot.services import api, deals, events, money, operators, orders, settings, xrocket
 from bot.ui import notify
 
 log = logging.getLogger(__name__)
@@ -164,16 +164,26 @@ async def order_timeouts(bot: Bot) -> None:
             events.add(s, f"deal:{d.id}", "check_timeout", ("Оператор принял Bybit-ордер, но не выдал реквизиты"
                        if d.operator_id else "Ни один оператор не принял Bybit-ордер") + f" на "
                        f"{money.fmt(d.amount_rub)} ₽ вовремя — заявка закрыта", alert=True)
+            if d.operator_id:
+                operators.log(s, d.operator_id, d, "timeout", "время на реквизиты вышло, заявка закрыта")
             await s.commit()
             await order_handlers.close_offers(bot, s, d, f"Ордер по заявке #{d.id} закрыт: время вышло",
                                               kinds=("operator",))
             await push(bot, s, d.buyer_id, d, f"Реквизиты под {money.fmt(d.amount_rub)} ₽ не успели выдать. "
                                               "Попробуйте ещё раз")
-            if d.operator_id:
-                await notify(bot, d.operator_id, f"{pe('warn')} Заявка #{d.id} закрыта: реквизиты Bybit-ордера не "
-                                                 "выданы вовремя.")
-            await notify(bot, d.seller_id, f"{pe('warn')} Заявка #{d.id} закрыта: оператор не успел обработать ваш "
-                                           "ордер. Отмените ордер на Bybit.")
+            if d.operator_id and d.bybit_url and d.seller_id:  # who failed: the merchant or the operator
+                await notify(bot, d.operator_id, "\n".join([
+                    f"{pe('warn')} <b>Заявка #{d.id} закрыта: реквизиты не выданы вовремя</b>",
+                    "",
+                    "Мерчант дал реквизиты в своём ордере? Если нет — ему засчитается пропуск "
+                    f"({settings.get('strike_limit')} подряд — пауза {settings.human('strike_sleep_hours')})."]),
+                    kb([btn("Не дал", f"opq:ans:{d.id}:0", "cross", style="danger"),
+                        btn("Дал, не успел я", f"opq:ans:{d.id}:1", "ok")]))
+            elif d.operator_id:
+                await notify(bot, d.operator_id, f"{pe('warn')} Заявка #{d.id} закрыта: реквизиты не выданы вовремя.")
+            if d.seller_id and d.bybit_url:  # an admin's own request has no merchant and no order to cancel
+                await notify(bot, d.seller_id, f"{pe('warn')} Заявка #{d.id} закрыта: оператор не успел обработать ваш "
+                                               "ордер. Отмените ордер на Bybit.")
         for did in searching:
             d = await orders.cancel(s, did, "cancelled", "no_merchant")
             if d is None:
@@ -190,13 +200,17 @@ async def order_timeouts(bot: Bot) -> None:
             d = await orders.release(s, did)
             if d is None:
                 continue
-            events.add(s, f"deal:{d.id}", "released", f"Мерчант {merchant} не выдал реквизиты вовремя, заявка "
-                       "передана другим", alert=True)
+            events.add(s, f"deal:{d.id}", "released", (f"Мерчант {merchant} не прислал ссылку на Bybit-ордер за "
+                       f"{settings.get('order_link_minutes')} мин — заявка не засчитана и передана другим" if bybit else
+                       f"Мерчант {merchant} не выдал реквизиты вовремя, заявка передана другим"), alert=not bybit,
+                       notice=bybit)
             await s.commit()
-            await notify(bot, merchant, f"{pe('warn')} Время на выдачу реквизитов по заявке #{d.id} вышло — она "
-                                        "передана другим мерчантам" + ("." if bybit else
-                                                                      f", заморозка {money.usdt(d.seller_debit)} USDT "
-                                                                      "снята."))
+            await notify(bot, merchant, (
+                f"{pe('warn')} <b>Заявка #{d.id} не засчитана:</b> ссылки на ордер не было "
+                f"{settings.get('order_link_minutes')} мин — она ушла другим мерчантам. Берите заявку, когда ордер "
+                "под неё уже готов." if bybit else
+                f"{pe('warn')} Время на выдачу реквизитов по заявке #{d.id} вышло — она передана другим мерчантам, "
+                f"заморозка {money.usdt(d.seller_debit)} USDT снята."))
             await order_handlers.broadcast(bot, s, d)
         # requests still searching reach merchants approved and chats connected since the last send
         for d in (await s.scalars(select(Deal).where(Deal.status == "searching", Deal.expires_at >= now()))).all():
@@ -241,6 +255,12 @@ async def payout_queue(bot: Bot) -> None:
 async def stats_topic(bot: Bot) -> None:
     async with Session() as s:
         await finance_handlers.publish(bot, s)
+
+
+async def channel_autopost(bot: Bot) -> None:
+    from bot.handlers import channel
+    async with Session() as s:
+        await channel.autopost(bot, s)
 
 
 async def chat_pin(bot: Bot) -> None:
@@ -320,9 +340,10 @@ def start(bot: Bot) -> list[asyncio.Task]:
             asyncio.create_task(loop(reconcile_withdrawals, bot, 300)),
             asyncio.create_task(loop(auto_offline, bot, 60)),
             asyncio.create_task(alert_loop(bot)),
-            asyncio.create_task(loop(api_webhooks, bot, 5)),
+            asyncio.create_task(loop(api_webhooks, bot, 2)),
             asyncio.create_task(loop(sync_chain_withdrawals, bot, 60)),
             asyncio.create_task(loop(order_timeouts, bot, 20)),
             asyncio.create_task(loop(payout_queue, bot, 30)),
             asyncio.create_task(loop(stats_topic, bot, 600)),
-            asyncio.create_task(loop(chat_pin, bot, 300))]
+            asyncio.create_task(loop(chat_pin, bot, 300)),
+            asyncio.create_task(loop(channel_autopost, bot, 600))]

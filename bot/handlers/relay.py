@@ -13,7 +13,7 @@ from aiogram.types import CallbackQuery, Message
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from bot.config import config
+from bot.services import admins
 from bot.emoji import back, btn, kb, pe
 from bot.models import Deal, Event, User, now
 from bot.services import events
@@ -29,6 +29,7 @@ MENTION = re.compile(r"(?<![\w@])@[A-Za-z][A-Za-z0-9_]{3,}")
 
 class Relay(StatesGroup):
     text = State()
+    chat = State()
 
 
 def forbidden(m: Message) -> bool:
@@ -48,14 +49,14 @@ def role(d: Deal | None, uid: int) -> str:
     if d is not None and uid in people(d):
         return ("Покупатель" if uid == d.buyer_id else "Оператор" if uid == d.operator_id and d.via_bybit
                 else "Мерчант")
-    return "Администрация" if uid in config.admin_ids else "Пользователь"
+    return "Администрация" if admins.is_admin(uid) else "Пользователь"
 
 
 def problem(d: Deal | None, sender: int, to: int) -> str:
     """Why `sender` may not write to `to` ("" = he may)."""
     if sender == to:
         return "Нельзя написать самому себе"
-    if sender in config.admin_ids or to in config.admin_ids:  # the administration and answers to it
+    if admins.is_admin(sender) or admins.is_admin(to):  # the administration and answers to it
         return ""
     if d is None:
         return "Писать можно участникам своих сделок"
@@ -72,7 +73,7 @@ async def _deal(s: AsyncSession, did: int) -> Deal | None:
 async def cb_choose(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User, state: FSMContext):
     """«Написать» on a deal: whom — the other people of the deal or the administration."""
     d = await _deal(s, int(c.data.split(":")[1]))
-    if d is None or (user.id not in people(d) and user.id not in config.admin_ids):
+    if d is None or (user.id not in people(d) and not admins.is_admin(user.id)):
         return await c.answer("Сделка не найдена", show_alert=True)
     await state.set_state(None)
     others = [uid for uid in people(d) if uid != user.id]
@@ -81,9 +82,10 @@ async def cb_choose(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User, sta
         "Сообщение придёт через бота с кнопкой «Ответить». Ссылки и @юзернеймы запрещены — такое сообщение "
         "не отправится.",
     ]), kb(*[btn(role(d, uid), f"dm:{d.id}:{uid}", "support") for uid in others],
-           btn("Администрации", f"dm:{d.id}:{config.admin_ids[0]}", "support")
-           if config.admin_ids and user.id not in config.admin_ids else None,
-           back(f"dl:{d.id}", "Назад к сделке")), c)
+           btn("Администрации", f"dm:{d.id}:{admins.ids()[0]}", "support")
+           if admins.ids() and not admins.is_admin(user.id) else None,
+           back(f"adv:{d.id}" if admins.is_admin(user.id) and user.id not in people(d) else f"dl:{d.id}",
+                "Назад к сделке")), c)
 
 
 @router.callback_query(F.data.regexp(r"^(?:dm:(\d+):(\d+)|amsg:(\d+))$"))
@@ -102,19 +104,19 @@ async def cb_write(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User, stat
 
 
 def _prompt(d: Deal | None, sender: int, to: int, target: User, err: str = "") -> str:
-    whom = role(d, to) if to not in config.admin_ids or sender in config.admin_ids else "Администрация"
-    if sender in config.admin_ids and to not in config.admin_ids:
+    whom = role(d, to) if not admins.is_admin(to) or admins.is_admin(sender) else "Администрация"
+    if admins.is_admin(sender) and not admins.is_admin(to):
         whom = f"{role(d, to)} · {esc(target.name or '—')} (<code>{to}</code>)"
     return "\n".join([
         title(pe("support"), "Сообщение" + (f" по сделке #{d.id}" if d else "")),
         quote(f"• Кому: <b>{whom}</b>", f"• До {MAX_LEN} символов, одним сообщением",
-              "" if sender in config.admin_ids else "• Ссылки и @юзернеймы запрещены — сообщение не отправится"),
+              "" if admins.is_admin(sender) else "• Ссылки и @юзернеймы запрещены — сообщение не отправится"),
         "Напишите текст сообщения:",
     ]) + (warn(err) if err else "")
 
 
 def _back(d: Deal | None, sender: int, to: int) -> str:
-    if sender in config.admin_ids:
+    if admins.is_admin(sender):
         return f"adv:{d.id}" if d else f"auv:{to}"
     return f"dl:{d.id}" if d else "menu"
 
@@ -128,7 +130,7 @@ async def msg_text(m: Message, bot: Bot, s: AsyncSession, user: User, state: FSM
     if target is None or problem(d, user.id, to):
         await state.set_state(None)
         return await show(bot, user, warn("Сообщение не отправлено: получатель недоступен"), kb(back("menu", "В меню")))
-    admin = user.id in config.admin_ids
+    admin = admins.is_admin(user.id)
     if not m.text or not m.text.strip() or len(m.text) > MAX_LEN:
         return await show(bot, user, _prompt(d, user.id, to, target, f"Нужен текст до {MAX_LEN} символов"),
                           kb(back(_back(d, user.id, to), "Отмена")))
@@ -151,7 +153,7 @@ async def msg_text(m: Message, bot: Bot, s: AsyncSession, user: User, state: FSM
         quote(esc(m.text)),
         "Ответить можно кнопкой ниже — сообщение придёт через бота.",
     ]), kb(btn("Ответить", f"dm:{did}:{reply_to}", "support", style="primary"),
-           btn(f"Сделка #{d.id}", f"adv:{d.id}" if to in config.admin_ids and to not in people(d) else f"dl:{d.id}",
+           btn(f"Сделка #{d.id}", f"adv:{d.id}" if admins.is_admin(to) and to not in people(d) else f"dl:{d.id}",
                "fire") if d else None,
            back("x", "Скрыть", "cross")))
     events.add(s, ref, "message", f"{sender_role} → {role(d, to)}"
@@ -162,7 +164,7 @@ async def msg_text(m: Message, bot: Bot, s: AsyncSession, user: User, state: FSM
 
 async def _after(bot: Bot, s: AsyncSession, user: User, d: Deal | None, to: int, note: str):
     """Back where the conversation started: the admin's deal or profile card, or the deal screen."""
-    if user.id in config.admin_ids and (d is None or user.id not in people(d)):
+    if admins.is_admin(user.id) and (d is None or user.id not in people(d)):
         from bot.handlers.admin import deal_view, user_screen
         if d is not None:
             return await deal_view(bot, s, user, d, note=note)
@@ -171,4 +173,90 @@ async def _after(bot: Bot, s: AsyncSession, user: User, d: Deal | None, to: int,
         from bot.handlers.deal import deal_screen
         return await deal_screen(bot, s, user, d, note=note)
     from bot.handlers.start import main_menu
-    await main_menu(bot, s, user, user.id in config.admin_ids, note=note)
+    await main_menu(bot, s, user, admins.is_admin(user.id), note=note)
+
+
+# ---------- the deal's chat: buyer, merchant, operator, administration ----------
+
+CHAT_SHOWN = 12  # latest messages on the chat screen
+
+
+def chat_people(d: Deal) -> list[int]:
+    """Who is in the chat and gets every message (the administration joins when it writes)."""
+    return people(d)
+
+
+def chat_role(d: Deal, uid: int) -> str:
+    return role(d, uid)
+
+
+async def chat_screen(bot: Bot, s: AsyncSession, user: User, d: Deal, state: FSMContext, src=None, note: str = ""):
+    """The chat of a deal: the latest messages and «write here» — every message the user sends now goes to the chat
+    until he leaves it with a button."""
+    from bot.models import DealMessage
+    from bot.ui import at, field, section, visible_len
+    await state.set_state(Relay.chat)
+    await state.update_data(chat_deal=d.id)
+    rows = list(reversed((await s.scalars(select(DealMessage).where(DealMessage.deal_id == d.id)
+                                          .order_by(DealMessage.id.desc()).limit(CHAT_SHOWN))).all()))
+    members = " · ".join(dict.fromkeys(chat_role(d, uid) for uid in chat_people(d)))
+    lines = [f"<b>{esc(r.role)}</b>{' (вы)' if r.sender_id == user.id else ''} · {at(r.created_at)}\n"
+             f"{esc(r.text)}" for r in rows]
+    head = [title(pe("support"), f"Чат сделки #{d.id}"), "", field("В чате", members + " · администрация"), ""]
+    tail = ["", quote("Пишите сюда сообщением — его получат все участники сделки. Ссылки и @юзернеймы запрещены: "
+                      "такое сообщение не уйдёт. Общайтесь только здесь.")]
+    while lines and visible_len("\n".join(head + ["\n\n".join(lines)] + tail) + note) > 1000:
+        lines.pop(0)  # the screen keeps its banner: the oldest messages go first
+    body = "<blockquote expandable>" + "\n\n".join(lines) + "</blockquote>" if lines else "<i>Пока сообщений нет.</i>"
+    admin_view = admins.is_admin(user.id) and user.id not in people(d)
+    await show(bot, user, "\n".join(head + [section("support", "Сообщения"), body] + tail) + note, kb(
+        [btn("Обновить", f"dch:{d.id}", "refresh"),
+         btn("Администрации", f"dm:{d.id}:{admins.ids()[0]}", "support") if not admin_view and admins.ids() else None],
+        back(f"adv:{d.id}" if admin_view else f"dl:{d.id}", "К сделке")), src)
+
+
+async def _chat_deal(s: AsyncSession, user: User, did: int) -> Deal | None:
+    d = await _deal(s, did)
+    if d is None or (user.id not in chat_people(d) and not admins.is_admin(user.id)):
+        return None
+    return d
+
+
+@router.callback_query(F.data.regexp(r"^dch:(\d+)$"))
+async def cb_chat(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User, state: FSMContext):
+    d = await _chat_deal(s, user, int(c.data.split(":")[1]))
+    if d is None:
+        return await c.answer("Чат недоступен", show_alert=True)
+    await chat_screen(bot, s, user, d, state, c)
+
+
+@router.message(Relay.chat)
+async def msg_chat(m: Message, bot: Bot, s: AsyncSession, user: User, state: FSMContext):
+    from bot.models import DealMessage
+    d = await _chat_deal(s, user, (await state.get_data()).get("chat_deal", 0))
+    if d is None:
+        await state.set_state(None)
+        return await show(bot, user, warn("Чат недоступен"), kb(back("menu", "В меню")))
+    admin = admins.is_admin(user.id)
+    text = (m.text or "").strip()
+    if not text or len(text) > MAX_LEN:
+        return await chat_screen(bot, s, user, d, state, note=warn(f"Только текст, до {MAX_LEN} символов"))
+    if not admin and forbidden(m):
+        events.add(s, f"deal:{d.id}", "message_blocked", f"{chat_role(d, user.id)} {user.id} пытался отправить в чат "
+                   f"ссылку или @юзернейм: {text[:200]}", user.id, alert=True)
+        return await chat_screen(bot, s, user, d, state, note=warn(
+            "Не отправлено: ссылки и @юзернеймы запрещены. Общайтесь только здесь."))
+    recent = await s.scalar(select(func.count(DealMessage.id)).where(
+        DealMessage.sender_id == user.id, DealMessage.created_at > now() - timedelta(hours=1)))
+    if not admin and recent >= PER_HOUR:
+        return await chat_screen(bot, s, user, d, state, note=warn("Слишком много сообщений за час — попробуйте позже"))
+    sender_role = chat_role(d, user.id)
+    s.add(DealMessage(deal_id=d.id, sender_id=user.id, role=sender_role[:40], text=text))
+    events.add(s, f"deal:{d.id}", "message", f"Чат · {sender_role}: {text[:300]}", user.id, notice=True)
+    await s.commit()
+    for uid in [x for x in chat_people(d) if x != user.id]:
+        await notify(bot, uid, "\n".join([
+            f"{pe('support')} <b>Чат сделки #{d.id}</b> · {sender_role}",
+            quote(esc(text)),
+        ]), kb(btn("Ответить в чат", f"dch:{d.id}", "support", style="primary"), back("x", "Скрыть", "cross")))
+    await chat_screen(bot, s, user, d, state)

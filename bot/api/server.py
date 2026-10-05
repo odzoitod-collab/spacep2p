@@ -1,4 +1,5 @@
 """Strait Pay merchant API over HTTP (aiohttp, runs in the bot process). Reference: docs/API.md."""
+import asyncio
 import hashlib
 import logging
 from decimal import Decimal, InvalidOperation
@@ -8,7 +9,7 @@ from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError
 from aiogram.types import BufferedInputFile
 from aiohttp import web
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
 from bot.api import docs as guides_site
@@ -121,6 +122,13 @@ async def docs(request: web.Request) -> web.Response:
     return web.Response(text=page, content_type="text/html", charset="utf-8")
 
 
+async def docs_static(request: web.Request) -> web.Response:
+    found = guides_site.static(request.match_info["name"])
+    if found is None:
+        raise web.HTTPNotFound()
+    return web.Response(body=found[0], content_type=found[1], headers={"Cache-Control": "public, max-age=86400"})
+
+
 async def docs_raw(request: web.Request) -> web.Response:
     return web.Response(text=DOCS.read_text(encoding="utf-8"), content_type="text/markdown", charset="utf-8")
 
@@ -137,13 +145,15 @@ async def me(request: web.Request) -> web.Response:
                    "daily_rub": str(client.daily_rub), "max_open_orders": client.max_open,
                    "requests_per_second": client.rps},
         "usage": {"open_orders": used["open_orders"], "today_rub": str(used["today_rub"])},
-        "balance": {"available_usdt": str(owner.balance), "frozen_usdt": str(owner.frozen)},
+        "balance": {"available_usdt": str(owner.balance), "frozen_usdt": str(owner.frozen),
+                    "withdrawable_usdt": str(money.withdrawable(owner))},
     })
 
 
 async def balance(request: web.Request) -> web.Response:
     _, _, owner, _ = ctx(request)
-    return web.json_response({"currency": "USDT", "available": str(owner.balance), "frozen": str(owner.frozen)})
+    return web.json_response({"currency": "USDT", "available": str(owner.balance), "frozen": str(owner.frozen),
+                              "withdrawable": str(money.withdrawable(owner))})
 
 
 async def rates(request: web.Request) -> web.Response:
@@ -160,8 +170,8 @@ async def liquidity(request: web.Request) -> web.Response:
         if lo <= hi:
             ranges.append({"min_rub": str(lo), "max_rub": str(hi), "bank": card.bank, "type": card.kind})
     # order merchants get every request, whatever the amount: any amount in the order range can be requested
-    om = await s.scalar(select(func.count(OrderMerchant.user_id)).where(
-        OrderMerchant.status == "approved", OrderMerchant.user_id != owner.id))
+    om = len([m for m in (await s.scalars(select(OrderMerchant).where(
+        OrderMerchant.status == "approved", OrderMerchant.user_id != owner.id))).all() if not orders.asleep(m)])
     lo = max(settings.dec("order_min_rub"), client.min_rub).quantize(Decimal("0.01"))
     hi = min(settings.dec("order_max_rub"), client.max_rub).quantize(Decimal("0.01"))
     on = bool(om) and lo <= hi
@@ -251,8 +261,31 @@ async def request_order(request: web.Request, amount: Decimal, sender_bank: str 
     return await order_response(s, d, 202)
 
 
+WAIT_MAX = 30  # seconds a long poll may hold
+
+
 async def get_order(request: web.Request) -> web.Response:
-    return await order_response(request[SESSION], await own_order(request))
+    """GET /v1/orders/{id}[?wait=N&since=<status or detail>]: with `wait` the answer comes as soon as the order's
+    status or detail differs from `since` (or after N ≤ 30 s) — no need to poll every second."""
+    s = request[SESSION]
+    d = await own_order(request)
+    try:
+        wait = min(max(int(request.query.get("wait", 0)), 0), WAIT_MAX)
+    except ValueError:
+        raise ApiError(422, "invalid_query", "wait must be an integer number of seconds (0–30)")
+    since = request.query.get("since") or None
+    if wait and since is not None:
+        until = asyncio.get_running_loop().time() + wait
+        oid = d.id
+        while d is not None and since in (api.STATUS[d.status], api.detail(d)) \
+                and asyncio.get_running_loop().time() < until:
+            await asyncio.sleep(1)
+            async with Session() as fresh:  # a short session per look: the request's own one holds no snapshot
+                d = await fresh.get(Deal, oid)
+        d = await s.get(Deal, oid, populate_existing=True)
+        if d is None:
+            raise ApiError(404, "not_found", "Order not found")
+    return await order_response(s, d)
 
 
 async def order_history(request: web.Request) -> web.Response:
@@ -387,6 +420,7 @@ def build_app(bot: Bot) -> web.Application:
     app.router.add_get("/", index)
     app.router.add_get("/docs", docs)
     app.router.add_get("/docs.md", docs_raw)
+    app.router.add_get("/docs/static/{name}", docs_static)
     app.router.add_get("/docs/{slug:[a-z]+}", docs)
     app.router.add_get("/v1/me", me)
     app.router.add_get("/v1/balance", balance)

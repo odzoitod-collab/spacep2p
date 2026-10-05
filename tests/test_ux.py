@@ -140,8 +140,9 @@ def test_buyer_dispute_goes_straight_to_evidence(go):
         assert "Доказательства по спору" in plain(b.session.last(BUYER))
         await b.run(msg(BUYER, "Сбер, 12:03, списание 10 000"))
         assert len((await get_deal(d.id)).dispute_files) == 1
-        await b.run(cb(ADMIN, f"adv:{d.id}"))
+        await b.run(cb(ADMIN, f"adv:{d.id}"), cb(ADMIN, f"dmc:{d.id}"))  # one «Написать», then whom
         assert f"dm:{d.id}:{BUYER}" in b.session.buttons(ADMIN) and f"dm:{d.id}:{SELLER}" in b.session.buttons(ADMIN)
+        assert f"adv:{d.id}" in b.session.buttons(ADMIN)  # and back to the admin's card, not the user's screen
     go(fn)
 
 
@@ -303,15 +304,15 @@ def test_manual_link_in_help_and_texts(go):
     async def fn(b):
         url = "https://telegra.ph/Strait-Pay--P2P-obmen-USDT--RUB-v-Telegram-09-27"
         await ready(b)
-        await b.run(cb(BUYER, "info"))
-        assert url in b.session.buttons(BUYER)  # «Инструкция» button in Help
-        assert f'<a href="{url}">инструкции</a>' in b.session.last(BUYER)  # and a link hidden in the text
+        await b.run(cb(BUYER, "info"), cb(BUYER, "info:g"))
+        assert url in b.session.buttons(BUYER)  # «Памятка продавца» among the guides
+        assert f'<a href="{url}">отдельной статье</a>' in b.session.last(BUYER)  # and a link hidden in the text
         for who, screen in ((SELLER, "sl"), (SELLER, "sl:add"), (BUYER, "om")):
             await b.run(cb(who, screen))
             assert f'href="{url}"' in b.session.last(who), screen
         await b.run(cb(ADMIN, "as:manual_url"), msg(ADMIN, "http://bad"))
         assert "https://" in plain(b.session.last(ADMIN))  # only https links
         await b.run(msg(ADMIN, "-"))
-        await b.run(cb(BUYER, "info"))
+        await b.run(cb(BUYER, "info:g"))
         assert url not in b.session.buttons(BUYER) and url not in b.session.last(BUYER)  # link removed everywhere
     go(fn)

@@ -20,7 +20,8 @@ from aiogram import Bot, Dispatcher  # noqa: E402
 from aiogram.client.default import DefaultBotProperties  # noqa: E402
 from aiogram.client.session.base import BaseSession  # noqa: E402
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError  # noqa: E402
-from aiogram.types import (Animation, CallbackQuery, Chat, ChatInviteLink, ChatMemberAdministrator, Document,  # noqa: E402
+from aiogram.types import (Animation, CallbackQuery, Chat, ChatInviteLink, ChatMemberAdministrator, ChatMemberLeft,  # noqa: E402
+                           Document,
                            File, ForumTopic, Message, MessageId, PhotoSize, Update)
 from aiogram.types import User as TgUser  # noqa: E402
 from sqlalchemy import text  # noqa: E402
@@ -69,6 +70,7 @@ class FakeSession(BaseSession):
         self.kinds: dict[int, str] = {}  # message_id -> photo | text, to mimic edit restrictions
         self.files: dict[str, bytes] = {}  # file_id -> content for bot.download(); default: a valid PDF
         self.forums: dict[int, set[int]] = {}  # forum chat id -> existing topic thread ids
+        self.outsiders: set[tuple[int, int]] = set()  # (chat, user): get_chat_member says he is not there
 
     async def make_request(self, bot, method, timeout=None):
         chat = getattr(method, "chat_id", None)
@@ -99,6 +101,8 @@ class FakeSession(BaseSession):
             return ChatInviteLink(invite_link=f"https://t.me/+inv{next(ids)}", creator=TgUser(id=123, is_bot=True,
                                   first_name="bot"), creates_join_request=False, is_primary=False, is_revoked=False,
                                   name=method.name, member_limit=method.member_limit)
+        if name == "GetChatMember" and (chat, method.user_id) in self.outsiders:
+            return ChatMemberLeft(user=TgUser(id=method.user_id, is_bot=False, first_name="x"))
         if name == "GetChatMember":
             return ChatMemberAdministrator(user=TgUser(id=method.user_id, is_bot=True, first_name="bot"),
                                            can_be_edited=False, is_anonymous=False, can_manage_chat=True,
@@ -291,6 +295,8 @@ async def reset_db(url: str) -> None:
     await models.init_db(url)
     async with models.Session() as s:
         await settings.put(s, "signup_review", "0")  # scenarios start from approved users; test_signup turns it on
+        await settings.put(s, "join_required", "0")  # the entry gate has its own tests
+        await settings.put(s, "withdraw_turnover", "0")  # so has the turnover rule (tests/test_turnover.py)
         await s.commit()
         await settings.load(s)
 
@@ -371,4 +377,8 @@ def check_telegram_limits(session: FakeSession) -> None:
 
 
 def plain(t: str) -> str:
-    return html.unescape(re.sub(r"<[^>]+>", "", t))
+    """Visible text; card fields (ui.cf) read as one line: "Label:\n ╰  value" -> "Label: value", a branch's lines
+    lose their corners."""
+    p = html.unescape(re.sub(r"<[^>]+>", "", t))
+    p = re.sub(r":\n ╰  ", ": ", p)
+    return re.sub(r"(?m)^[├╰] {2}", "", p)

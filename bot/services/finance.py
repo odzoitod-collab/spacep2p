@@ -1,7 +1,8 @@
 """The platform's money at a glance: what it holds, what it owes users, what is profit and can be taken out.
 
 Assets:       the xRocket app balance: every deposit lands there and every withdrawal is paid from it.
-Liabilities:  users' available balances + USDT frozen in deals + withdrawals debited but not paid yet.
+Liabilities:  users' available balances + team leaders' team balances + USDT frozen in deals + withdrawals debited
+              but not paid yet.
 Operators:    USDT of Bybit-order deals arrive on the operators' Bybit accounts while the buyers are credited in the
               bot: each operator owes them (services/operators.py) and repays to xRocket — a receivable, shown
               separately and not counted in the assets until it is repaid.
@@ -37,6 +38,7 @@ class Snapshot:
     bybit: dict[str, Decimal]  # 24h / 7d / all: USDT received through Bybit orders of completed deals
     op_debt: Decimal = Decimal(0)  # operators owe for accepted Bybit orders, not repaid yet
     team_paid: Decimal = Decimal(0)  # paid to team leaders, all time
+    users_team: Decimal = Decimal(0)  # team leaders' team balances, not moved to the main balance yet
 
     @property
     def assets(self) -> Decimal:
@@ -44,7 +46,7 @@ class Snapshot:
 
     @property
     def liabilities(self) -> Decimal:
-        return self.users_available + self.users_frozen + self.unpaid
+        return self.users_available + self.users_team + self.users_frozen + self.unpaid
 
     @property
     def free(self) -> Decimal:
@@ -82,6 +84,7 @@ async def snapshot(s: AsyncSession) -> Snapshot:
     return Snapshot(
         xrocket=rocket,
         users_available=await _sum(s, User.balance), users_frozen=await _sum(s, User.frozen),
+        users_team=await _sum(s, User.team_balance),
         unpaid=Decimal(unpaid), unpaid_n=unpaid_n, queued=Decimal(queued), queued_n=queued_n,
         profit=profit, volume=volume, users=await s.scalar(select(func.count(User.id))),
         online=await s.scalar(select(func.count(User.id)).where(User.is_online)), bybit=bybit,

@@ -8,18 +8,21 @@ from aiogram.fsm.strategy import FSMStrategy
 from aiogram.types import ErrorEvent
 
 from bot.emoji import btn, kb, pe
-from bot.handlers import (admin, admin_api, admin_chat, admin_deals, admin_ops, admin_orders, admin_people, api_user,
-                          commands, deal, fallback, finance, inline, logchat, market, operator, orders, relay, seller,
-                          signup, start, team, wallet)
+from bot.handlers import (admin, admin_api, admin_chat, admin_cmds, admin_deals, admin_ops, admin_orders, admin_people,
+                          api_user, channel, commands, community, deal, fallback, finance, inline, logchat, market, operator, orders, relay,
+                          seller, signup, start, team, wallet)
 from bot.middlewares import Context
 from bot.storage import DbStorage, UserIsolation
 from bot.ui import notify
 
 log = logging.getLogger(__name__)
-# signup.router first: a user who is not let in yet reaches nothing else; team.router early: it ends any other command
-# in a group; fallback must stay last
-ROUTERS = (logchat.router, signup.router, team.router, admin_chat.events_router, signup.admin_router, inline.router,
-           finance.router, commands.router, start.router, admin.router, admin_deals.router, admin_ops.router,
+# admin_cmds.router first: the admin chat's commands; signup.router: a user who is not let in yet reaches nothing else;
+# community.gate: the entry points of a user who has not joined the chat / channel yet;
+# team.router early: it ends any other command in a group (not the admin chat); fallback must stay last
+ROUTERS = (logchat.router, admin_cmds.router, signup.router, community.gate, community.router, team.router,
+           admin_chat.events_router, signup.admin_router,
+           inline.router, finance.router, admin_cmds.tail_router, commands.router, start.router, admin.router,
+           admin_deals.router, admin_ops.router, channel.router,
            admin_chat.router, admin_api.router, admin_orders.router, admin_people.router, relay.router, market.router,
            seller.router, deal.router, orders.router, operator.router, wallet.router, api_user.router,
            fallback.router)

@@ -14,7 +14,7 @@ from bot.emoji import back, btn, kb, pe
 from bot.models import Operator, OrderMerchant, Ticket, User, now
 from bot.services import deals, events, money, operators, settings
 from bot.handlers.wallet import withdraw_terms
-from bot.ui import BRAND, manual, ok, quote, show, title, warn
+from bot.ui import BRAND, field, manual, ok, quote, section, show, title, warn
 
 router = Router()
 TICKETS_PER_HOUR = 5
@@ -60,7 +60,9 @@ async def main_menu(bot: Bot, s: AsyncSession, user: User, is_admin: bool, src=N
         if is_op else None,
         [btn("Мои сделки", inline="сделки "), btn("Помощь", "info")],
         [btn("Команда", "tm"), btn(f"{BRAND} API", "api")],
-        btn("Чат", "chat") if settings.get("chat_id") else None,
+        [btn("Чат", "chat") if settings.get("chat_id") else None,
+         btn("Канал", url=settings.raw("channel_link")) if settings.get("channel_id") and settings.raw("channel_link")
+         else None],
         btn("Админ-панель", "a", wide=True) if is_admin else None,
     ), src)
 
@@ -91,33 +93,43 @@ async def cb_info(c: CallbackQuery, bot: Bot, user: User, state: FSMContext):
 
 
 async def info_screen(bot: Bot, user: User, src=None):
+    """«Помощь»: how it works and the terms — one message that fits under the banner; the guides open in the same
+    message (info:g)."""
     url = support_url()
     rate, pct = settings.buyer_terms(user)
-    text = "\n".join([
+    await show(bot, user, "\n".join([
         title(pe("info"), f"Помощь · {BRAND}"),
-        "<b>Коротко</b>",
-        quote(settings.get("tutorial")),
-        "<b>Инструкции</b> — нажмите на название, откроется статья:",
-        quote(*guides.lines()),
-        "<b>Условия</b>",
-        quote(f"• Курс: <b>{money.fmt(rate)} ₽</b> · комиссия покупателя <b>{money.fmt(pct, 3)}%</b>",
-              f"• Мерчант: <b>{settings.get('seller_pct')}%</b> по карте · ордера по курсу "
-              f"<b>{money.fmt(settings.dec('order_rate'))} ₽</b>",
-              f"• Оплата сделки: <b>{settings.get('deal_minutes')} мин</b> · спор через "
-              f"<b>{settings.get('confirm_minutes')} мин</b> без ответа продавца",
-              f"• Пополнение: <b>{settings.get('deposit_fee')}%</b>",
-              f"• Вывод: чеком {withdraw_terms('xrocket')} · на кошелёк {withdraw_terms('chain')}",
-              f"• Тимлиду: {settings.get('team_pct')}% от сделок своей команды"),
-        f"{pe('info')} Памятка продавца — в {manual('инструкции')}." if settings.get("manual_url") else "",
-        f"Проблема? Напишите оператору: номер сделки и ваш ID <code>{user.id}</code>." if url
-        else f"Ваш ID: <code>{user.id}</code>.",
-    ])
-    await show(bot, user, text, kb(
-        btn("Написать оператору", url=url, style="primary") if url else None,
-        [btn("Все инструкции", url=guides.index_url()) if guides.index_url() else None,
-         btn("Памятка продавца", url=settings.get("manual_url")) if settings.get("manual_url") else None],
-        back("menu", "В меню"),
-    ), src)
+        "",
+        section("edu", "Как это работает"),
+        settings.get("tutorial"),
+        "",
+        section("percent", "Условия"),
+        field("Курс", f"<b>{money.fmt(rate)} ₽</b> · комиссия {money.fmt(pct, 3)}%"),
+        field("Мерчанту", f"{settings.get('seller_pct')}% по карте · ордер по {money.fmt(settings.dec('order_rate'))} ₽"),
+        field("Сделка", f"оплата {settings.get('deal_minutes')} мин · спор через {settings.get('confirm_minutes')} мин"),
+        field("Кошелёк", f"пополнение {settings.get('deposit_fee')}% · вывод {withdraw_terms('xrocket')}"),
+        field("Тимлиду", f"{settings.get('team_pct')}% со сделок команды"),
+        "",
+        quote(f"Проблема? Напишите оператору: номер сделки и ваш ID <code>{user.id}</code>." if url
+              else f"Ваш ID: <code>{user.id}</code>."),
+    ]), kb(btn("Инструкции", "info:g", "edu", style="primary"),
+           btn("Написать оператору", url=url) if url else None,
+           back("menu", "В меню")), src)
+
+
+@router.callback_query(F.data == "info:g")
+async def cb_guides(c: CallbackQuery, bot: Bot, user: User):
+    """The guides: a link per topic, in the same message as «Помощь»."""
+    await show(bot, user, "\n".join([
+        title(pe("edu"), "Инструкции"),
+        "",
+        *guides.lines(),
+        "",
+        quote(f"Памятка продавца — в {manual('отдельной статье')}." if settings.get("manual_url")
+              else "Нажмите на название — откроется статья."),
+    ]), kb([btn("Все инструкции", url=guides.index_url()) if guides.index_url() else None,
+            btn("Памятка продавца", url=settings.get("manual_url")) if settings.get("manual_url") else None],
+           back("info", "Помощь")), c)
 
 
 @router.callback_query(F.data == "sup")

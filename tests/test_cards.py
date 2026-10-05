@@ -186,9 +186,13 @@ def test_banner_on_screens_and_text_fallback_for_long_ones(go):
             await s.commit()
         await b.run(await cb_main(BUYER, "info"))  # caption edit fails -> plain text message instead
         text_msg = [m for m in b.session.calls if type(m).__name__ == "SendMessage" and m.chat_id == BUYER][-1]
-        assert "Коротко" in text_msg.text and "Инструкции" in text_msg.text
-        await b.run(await cb_main(BUYER, "menu"))  # a press in the text message edits that message in place
-        assert names()[-1] == "EditMessageText" and "Strait Pay" in b.session.last(BUYER)
+        assert "Как это работает" in text_msg.text and "Условия" in text_msg.text
+        async with models.Session() as s:
+            long_screen = (await s.get(models.User, BUYER)).ui_msg_id
+        await b.run(await cb_main(BUYER, "menu"))  # a short screen again: the text message is replaced by a banner one
+        assert names()[-1] == "SendAnimation" and "Strait Pay" in b.session.last(BUYER)
+        gone = [m for m in b.session.calls if type(m).__name__ == "DeleteMessage" and m.chat_id == BUYER]
+        assert gone and gone[-1].message_id == long_screen
         await b.run(msg(BUYER, "/start"))  # a new screen carries the banner again, sent by file_id
         sends = [m for m in b.session.calls if type(m).__name__ == "SendAnimation"]
         assert sends[0].animation != "banner-file-id" and sends[-1].animation == "banner-file-id"  # uploaded once
@@ -263,4 +267,29 @@ def test_receipt_file_message_is_never_overwritten(go):
             id="c1", from_user=tg(SELLER), chat_instance="ci", data=f"dl:ok:{d.id}", message=receipt)))
         assert not [m for m in b.session.calls if getattr(m, "message_id", None) == 777
                     and type(m).__name__.startswith("Edit")]  # the receipt stays; the answer comes below it
+    go(fn)
+
+
+def test_a_button_on_a_text_notification_opens_the_screen_with_the_banner(go):
+    """«Заявка одобрена → Открыть главное меню»: the first screen already carries the banner (a text message cannot
+    get a picture by an edit: it is replaced)."""
+    from datetime import datetime
+
+    from aiogram.types import CallbackQuery, Chat, Message, Update
+
+    from bot.emoji import btn, kb
+    from bot.ui import notify
+    from tests.harness import ids, tg
+
+    async def fn(b):
+        await ready(b)
+        note = await notify(b.bot, BUYER, "Заявка одобрена", kb(btn("Открыть главное меню", "menu")))
+        press = Update(update_id=next(ids), callback_query=CallbackQuery(
+            id=str(next(ids)), from_user=tg(BUYER), chat_instance="ci", data="menu",
+            message=Message(message_id=note.message_id, date=datetime.now(), chat=Chat(id=BUYER, type="private"),
+                            text="Заявка одобрена")))
+        await b.run(press)
+        last = [m for m in b.session.calls if getattr(m, "chat_id", None) == BUYER][-1]
+        assert type(last).__name__ == "SendAnimation" and "Strait Pay" in last.caption
+        assert any(type(m).__name__ == "DeleteMessage" and m.message_id == note.message_id for m in b.session.calls)
     go(fn)

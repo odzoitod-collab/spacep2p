@@ -20,7 +20,8 @@ class Base(DeclarativeBase):
 class User(Base):
     __tablename__ = "users"
     __table_args__ = (CheckConstraint("balance >= 0", name="ck_users_balance_nonneg"),
-                      CheckConstraint("frozen >= 0", name="ck_users_frozen_nonneg"))
+                      CheckConstraint("frozen >= 0", name="ck_users_frozen_nonneg"),
+                      CheckConstraint("team_balance >= 0", name="ck_users_team_balance_nonneg"))
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)  # telegram id
     username: Mapped[str | None] = mapped_column(String(64))
     name: Mapped[str] = mapped_column(String(128), default="")
@@ -43,6 +44,14 @@ class User(Base):
     # new | pending | approved | rejected: with signup_review on, a new user fills an application (Signup) and uses
     # the bot after an admin approves it; users from before the review existed are approved
     access: Mapped[str] = mapped_column(String(10), default="new", server_default="approved")
+    # a team leader's earnings from his team (team_pct of members' deals): moved to `balance` by himself
+    team_balance: Mapped[Decimal] = mapped_column(USDT, default=Decimal(0), server_default=text("0"))
+    # joined the community chat / subscribed to the info channel (chat_member updates and checks): the entry gate
+    in_chat: Mapped[bool] = mapped_column(default=False, server_default=false())
+    in_channel: Mapped[bool] = mapped_column(default=False, server_default=false())
+    # deposited USDT not yet turned over: a deposit adds to it, USDT that went to buyers in completed deals take it
+    # off; only balance − deposit_lock can be withdrawn (services/money.withdrawable)
+    deposit_lock: Mapped[Decimal] = mapped_column(USDT, default=Decimal(0), server_default=text("0"))
 
 
 class Card(Base):
@@ -263,6 +272,38 @@ class OrderMerchant(Base):
     reason: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(default=now)
     decided_at: Mapped[datetime | None]
+    # took a Bybit-order request and gave no requisites, in a row (an operator said so); at strike_limit he sleeps
+    # until sleep_until and takes no requests; requisites given resets the count
+    strikes: Mapped[int] = mapped_column(default=0, server_default=text("0"))
+    sleep_until: Mapped[datetime | None]
+
+
+class DealMessage(Base):
+    """The deal's chat: the buyer, the merchant, the operator of a Bybit order and the administration. Every message
+    goes to all the others; links and @usernames never get in (handlers.relay)."""
+    __tablename__ = "deal_messages"
+    __table_args__ = (Index("ix_deal_messages_deal_id_id", "deal_id", "id"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    deal_id: Mapped[int] = mapped_column(index=True)
+    sender_id: Mapped[int] = mapped_column(BigInteger)
+    role: Mapped[str] = mapped_column(String(40))
+    text: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(default=now)
+
+
+class MerchantRating(Base):
+    """An operator's score (1–10) of the order merchant whose Bybit order he handled on a request: asked when he gave
+    the requisites or found none. The row is made when he is asked (score None) — only that operator may score,
+    once. The merchant's reputation is the average of his latest scores."""
+    __tablename__ = "merchant_ratings"
+    __table_args__ = (Index("ux_merchant_ratings_deal_merchant", "deal_id", "merchant_id", unique=True),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    deal_id: Mapped[int] = mapped_column(index=True)
+    merchant_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    operator_id: Mapped[int] = mapped_column(BigInteger)
+    score: Mapped[int | None]
+    gave: Mapped[bool] = mapped_column(default=True)  # the order had requisites
+    created_at: Mapped[datetime] = mapped_column(default=now)
 
 
 class OrderOffer(Base):
@@ -579,6 +620,23 @@ MIGRATIONS: list[tuple[int, list[str]]] = [
     (15, [
         # entry by application: everyone already in the bot keeps working; signups come from create_all
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS access VARCHAR(10) NOT NULL DEFAULT 'approved'",
+    ]),
+    (16, [
+        # a team leader's own balance; the entry gate (community chat, info channel); merchants' strikes and sleep
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS team_balance NUMERIC(20, 6) NOT NULL DEFAULT 0",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS in_chat BOOLEAN NOT NULL DEFAULT false",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS in_channel BOOLEAN NOT NULL DEFAULT false",
+        """DO $$ BEGIN
+            IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ck_users_team_balance_nonneg') THEN
+                ALTER TABLE users ADD CONSTRAINT ck_users_team_balance_nonneg CHECK (team_balance >= 0) NOT VALID;
+            END IF;
+        END $$""",
+        "ALTER TABLE IF EXISTS order_merchants ADD COLUMN IF NOT EXISTS strikes INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE IF EXISTS order_merchants ADD COLUMN IF NOT EXISTS sleep_until TIMESTAMP WITH TIME ZONE",
+    ]),
+    (17, [
+        # withdrawals only of what was turned over: users from before start with nothing locked
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS deposit_lock NUMERIC(20, 6) NOT NULL DEFAULT 0",
     ]),
 ]
 

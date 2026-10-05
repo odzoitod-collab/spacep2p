@@ -14,13 +14,13 @@ from aiogram.types import CallbackQuery, Message
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from bot.config import config
 from bot.emoji import back, btn, kb, pe
 from bot.handlers.deal import deal_screen, log as deal_log, push
 from bot.handlers.seller import BANKS, check_bank, check_holder, check_requisites, mask
-from bot.models import Card, Deal, OrderMerchant, OrderOffer, Team, User, now
+from bot.models import Card, Deal, Event, OrderMerchant, OrderOffer, Team, User, now
 from bot.services import deals, events, money, operators, orders, settings
-from bot.ui import (at, clean, close_kb, deep_link, esc, manual, notify, ok, person, quote, safe_text, show, title,
+from bot.ui import (at, clean, close_kb, deep_link, esc, field, manual, notify, ok, person, quote, safe_text, section,
+                    show, title,
                     warn)
 
 router = Router()
@@ -32,38 +32,30 @@ CLOSED = {"taken": "уже взята", "cancelled": "отменена поку�
 
 # ---------- the request as merchants and chats see it ----------
 
-def income(d: Deal) -> Decimal:
-    """What the merchant earns on a request: the RUB at the service rate minus the USDT he gives."""
-    return d.amount_rub / d.rate - d.seller_debit
-
-
 def request_facts(d: Deal) -> list[str]:
     return [f"• Сумма перевода: <b>{money.fmt(d.amount_rub)} ₽</b>",
             f"• Банк покупателя: <b>{esc(d.sender_bank)}</b>" if d.sender_bank else "",
-            f"• Курс ордера: <b>{money.fmt(d.merchant_rate)} ₽</b> за 1 USDT",
-            f"• Ордер: <b>{money.usdt(d.seller_debit)} USDT</b> = {money.fmt(d.amount_rub)} ₽ / "
-            f"{money.fmt(d.merchant_rate)}",
-            f"• По курсу сервиса {money.fmt(d.rate)} ₽: {money.usdt(d.amount_rub / d.rate)} USDT → доход "
-            f"мерчанта ≈ <b>+{money.usdt(income(d))} USDT</b>",
-            f"• Взять до {at(d.expires_at)} · на ответ {settings.get('order_take_minutes')} мин"]
+            f"• Курс площадки для ордера: <b>{money.fmt(d.merchant_rate)} ₽</b> за USDT",
+            f"• Зайти в ордер на: <b>{money.usdt(d.seller_debit)} USDT</b>",
+            f"• Взять до {at(d.expires_at)} · ссылка на ордер — за {settings.get('order_link_minutes')} мин"]
 
 
-def offer_text(d: Deal, u: User) -> str:
+def offer_text(d: Deal, u: User, rep_problem: str = "") -> str:
     covered = u.balance >= d.seller_debit
     return "\n".join([
-        f"{pe('bell')} <b>Заявка #{d.id} · {money.fmt(d.amount_rub)} ₽ · {money.usdt(d.seller_debit)} USDT</b>",
-        *filter(None, request_facts(d)),
-        "",
-        "<b>Как работать — выберите кнопкой</b>",
-        "• Bybit-ордер: баланс не нужен — пришлёте ссылку на ордер, оператор выдаст реквизиты",
-        f"• С баланса: заморозим {money.usdt(d.seller_debit)} USDT, реквизиты выдаёте сами "
-        f"(свободно {money.usdt(u.balance)} USDT" + ("" if covered else " — не хватает") + ")",
+        f"{pe('bell')} <b>Новая заявка #{d.id} · {money.fmt(d.amount_rub)} ₽</b>",
+        quote(*request_facts(d)),
+        quote(f"• Bybit-ордер недоступен: {rep_problem}" if rep_problem else
+              "• Bybit-ордер: баланс не нужен — пришлёте ссылку, оператор выдаст реквизиты. Нет ссылки за "
+              f"{settings.get('order_link_minutes')} мин — заявка уйдёт другим",
+              f"• С баланса: заморозим {money.usdt(d.seller_debit)} USDT, реквизиты выдаёте сами"
+              + ("" if covered else f" — свободно только {money.usdt(u.balance)}")),
         "Кто первым нажмёт «Взять», тот и работает заявку.",
     ])
 
 
-def offer_kb(d: Deal, u: User):
-    return kb(btn("Взять · Bybit-ордер", f"orq:take:{d.id}:b", "fire", style="success"),
+def offer_kb(d: Deal, u: User, rep_problem: str = ""):
+    return kb(None if rep_problem else btn("Взять · Bybit-ордер", f"orq:take:{d.id}:b", "fire", style="success"),
               btn("Взять · с баланса", f"orq:take:{d.id}:w", "wallet", style="primary")
               if u.balance >= d.seller_debit else None,
               back("x", "Скрыть", "cross"))
@@ -94,7 +86,10 @@ async def broadcast(bot: Bot, s: AsyncSession, d: Deal, first: bool = True) -> i
     done = await deals.completed_count(s, [u.id for _, u in merchants])
     sent = 0
     for _, u in sorted(merchants, key=lambda mu: -done[mu[1].id]):
-        m = await notify(bot, u.id, offer_text(d, u), offer_kb(d, u), silent=u.quiet)
+        problem = orders.bybit_problem((await orders.reputation(s, u.id))[0], d)
+        if problem and u.balance < d.seller_debit:
+            continue  # neither way is open to him for this request
+        m = await notify(bot, u.id, offer_text(d, u, problem), offer_kb(d, u, problem), silent=u.quiet)
         s.add(OrderOffer(deal_id=d.id, user_id=u.id, msg_id=m.message_id if m else None))
         sent += m is not None
     posted = set((await s.scalars(select(OrderOffer.user_id).where(OrderOffer.deal_id == d.id,
@@ -227,7 +222,8 @@ async def take_screen(bot: Bot, s: AsyncSession, user: User, deal_id: int, src=N
     lines.append("• Bybit-ордер: баланс не нужен — пришлёте ссылку на ордер, оператор выдаст реквизиты")
     lines.append(f"• С баланса: заморозим {money.usdt(d.seller_debit)} USDT (свободно {money.usdt(user.balance)}), "
                  "реквизиты выдаёте сами")
-    await show(bot, user, "\n".join(lines) + note, offer_kb(d, user), src)
+    problem = orders.bybit_problem((await orders.reputation(s, user.id))[0], d)
+    await show(bot, user, "\n".join(lines) + note, offer_kb(d, user, problem), src)
 
 
 @router.callback_query(F.data.regexp(r"^orq:take:(\d+)(?::([bw]))?$"))
@@ -248,7 +244,8 @@ async def cb_take(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User, state
         "Bybit-ордер" if d.via_bybit else f"с баланса, заморожено {money.usdt(d.seller_debit)} USDT"), notice=True)
     await s.commit()
     await close_offers(bot, s, d, f"Заявка #{d.id} {CLOSED['taken']}", keep=user.id)
-    await push(bot, s, d.buyer_id, d, f"Мерчант взял заявку #{d.id} и готовит реквизиты")
+    if not d.via_bybit:  # a Bybit-order take counts only with the link: the buyer hears about it then
+        await push(bot, s, d.buyer_id, d, f"Мерчант взял заявку #{d.id} и готовит реквизиты")
     await (link_screen if d.via_bybit else give_screen)(bot, s, user, d, state, c)
 
 
@@ -279,16 +276,16 @@ async def give_screen(bot: Bot, s: AsyncSession, user: User, d: Deal, state: FSM
     operator = d.status == "checking"
     await show(bot, user, _give_head(d) + ("Выдайте покупателю свои реквизиты — рубли придут на них, USDT покупателю "
                                            "зачислит площадка:" if operator and not d.bybit_url else
-                                           "Откройте ордер по ссылке, сверьте сумму и курс, зайдите в него и выдайте "
-                                           "покупателю реквизиты из ордера:" if operator else
+                                           "Откройте ордер, сверьте сумму и курс, зайдите в него и выдайте покупателю "
+                                           "реквизиты из ордера. Реквизитов нет или ссылка не та — «Проблема с "
+                                           "ордером»." if operator else
                                            "Выдайте реквизиты, на которые покупатель переведёт рубли:") + note, kb(
-        *[btn(f"{t.bank} {mask(t)} · {t.holder[:18]}", f"orq:tpl:{d.id}:{t.id}", "refresh", style="primary")
-          for t in templates],
+        btn("Открыть ордер Bybit", url=d.bybit_url, icon="shop", style="success") if operator and d.bybit_url else None,
+        *[btn(f"{t.bank} {mask(t)} · {t.holder[:18]}", f"orq:tpl:{d.id}:{t.id}", "refresh") for t in templates],
         [btn("Новая карта", f"orq:k:{d.id}:card", "card"), btn("Новый СБП", f"orq:k:{d.id}:sbp", "sbp")],
-        btn("Открыть ордер Bybit", url=d.bybit_url, icon="shop") if operator and d.bybit_url else None,
         btn("Вернуть в поиск", f"opq:back:{d.id}", "refresh") if operator and not d.bybit_url else
-        [btn("Отклонить ссылку", f"opq:rj:{d.id}", "cross"), btn("Вернуть другим", f"opq:back:{d.id}", "refresh")]
-        if operator else btn("Отказаться", f"orq:drop:{d.id}", "cross"),
+        btn("Проблема с ордером", f"opq:pr:{d.id}", "warn", style="danger") if operator
+        else btn("Отказаться", f"orq:drop:{d.id}", "cross"),
     ), src)
 
 
@@ -297,16 +294,17 @@ async def link_screen(bot: Bot, s: AsyncSession, user: User, d: Deal, state: FSM
     await state.set_state(OrderGive.link)
     await state.update_data(g_deal=d.id)
     await show(bot, user, "\n".join([
-        title(pe("shop"), f"Bybit-ордер для заявки #{d.id}"),
-        f"• Ссылка до {at(d.expires_at)}" + (f" · перевод из {esc(d.sender_bank)}" if d.sender_bank else ""),
+        title(pe("shop"), f"Bybit-ордер · заявка #{d.id}"),
+        f"{pe('clock')} <b>Ссылка — до {at(d.expires_at)}</b>, иначе заявка уйдёт другим мерчантам.",
         "",
-        quote(f"{pe('ruble')} Сумма ордера: <b>{money.fmt(d.amount_rub)} ₽</b>",
-              f"{pe('swap')} Курс: <b>{money.fmt(d.merchant_rate)} ₽</b> за USDT",
-              f"{pe('dollar')} Оператор зайдёт на: <b>{money.usdt(d.seller_debit)} USDT</b>",
-              f"{pe('up')} Ваш доход: ≈ +{money.usdt(income(d))} USDT"),
-        "1. Создайте на Bybit P2P ордер на продажу ровно на эту сумму и курс.",
-        "2. Пришлите сюда ссылку на ордер.",
-        "3. Оператор Strait Pay примет ордер, зайдёт в него и выдаст покупателю реквизиты — баланс в боте не нужен.",
+        quote(f"• Сумма ордера: <b>{money.fmt(d.amount_rub)} ₽</b>",
+              f"• Курс: <b>{money.fmt(d.merchant_rate)} ₽</b> за USDT · на <b>{money.usdt(d.seller_debit)} USDT</b>",
+              f"• Банк покупателя: {esc(d.sender_bank)}" if d.sender_bank else ""),
+        quote("1. Создайте на Bybit P2P ордер на продажу на эту сумму и курс — с вашими реквизитами.",
+              "2. Пришлите сюда ссылку на ордер.",
+              "3. Оператор зайдёт в ордер и выдаст покупателю реквизиты. Если реквизитов в ордере не окажется — "
+              f"это пропуск; {settings.get('strike_limit')} пропуска подряд — пауза "
+              f"{settings.human('strike_sleep_hours')}."),
     ]) + note, kb(btn("Отказаться", f"orq:drop:{d.id}", "cross")), src)
 
 
@@ -353,7 +351,7 @@ async def msg_link(m: Message, bot: Bot, s: AsyncSession, user: User, state: FSM
 
 # ---------- operators: accept a Bybit order, give its requisites ----------
 
-def operator_offer_text(d: Deal, merchant: User | None) -> str:
+def operator_offer_text(d: Deal, merchant: User | None, rep: str = "") -> str:
     return "\n".join(line for line in [
         f"{pe('bell')} <b>Bybit-ордер · заявка #{d.id} · {money.usdt(d.seller_debit)} USDT</b>",
         f"• Сумма ордера: <b>{money.fmt(d.amount_rub)} ₽</b>",
@@ -361,6 +359,7 @@ def operator_offer_text(d: Deal, merchant: User | None) -> str:
         f"• Зайти на: <b>{money.usdt(d.seller_debit)} USDT</b>",
         f"• Покупатель переводит из: {esc(d.sender_bank)}" if d.sender_bank else "",
         f"• Мерчант: {esc(merchant.name or '—') if merchant else '—'} (<code>{d.seller_id}</code>)",
+        f"• Репутация мерчанта: {rep}" if rep else None,
         f"• Принять до {at(d.expires_at)}",
         "",
         "Нажмите «Принять ордер» — ссылка на ордер придёт вам, у остальных операторов заявка пропадёт. "
@@ -372,11 +371,12 @@ async def notify_operators(bot: Bot, s: AsyncSession, d: Deal, merchant: User | 
     """Every operator gets «Принять ордер»; the first one who accepts gets the link, the others' messages close.
     Commits."""
     got = 0
+    rep = orders.rep_line(*await orders.reputation(s, d.seller_id)) if d.seller_id else ""
     for oid in await operators.ids(s):
         if oid == d.seller_id:
             continue  # an operator never checks his own order
         who = await s.get(User, oid)
-        m = await notify(bot, oid, operator_offer_text(d, merchant),
+        m = await notify(bot, oid, operator_offer_text(d, merchant, rep),
                          kb(btn("Принять ордер", f"opq:go:{d.id}", "ok", style="success"), back("x", "Скрыть", "cross")),
                          silent=bool(who and who.quiet))
         s.add(OrderOffer(deal_id=d.id, user_id=oid, msg_id=m.message_id if m else None, kind="operator"))
@@ -411,6 +411,7 @@ async def cb_operator_take(c: CallbackQuery, bot: Bot, s: AsyncSession, user: Us
                 await c.message.edit_text(f"{pe('info')} {esc(str(e))}", reply_markup=close_kb())
         return
     deal_log(s, d, "operator", f"Ордер принял оператор {person(user)}", notice=True)
+    operators.log(s, user.id, d, "accepted", f"заявка на {money.fmt(d.amount_rub)} ₽, ордер {d.bybit_url or '—'}")
     await s.commit()
     await close_offers(bot, s, d, f"Ордер по заявке #{d.id} принял другой оператор", keep=user.id,
                        kinds=("operator",))
@@ -429,6 +430,7 @@ async def cb_operator_back(c: CallbackQuery, bot: Bot, s: AsyncSession, user: Us
         await show(bot, user, f"{pe('ok')} Заявка #{d.id} снова в поиске мерчанта.", close_kb(), c)
         return await broadcast(bot, s, d)
     deal_log(s, d, "operator_back", f"Оператор {person(user)} вернул Bybit-ордер другим операторам", notice=True)
+    operators.log(s, user.id, d, "returned", "вернул ордер другим операторам")
     await s.commit()
     await show(bot, user, f"{pe('ok')} Ордер по заявке #{d.id} возвращён — его примет другой оператор.", close_kb(), c)
     await notify_operators(bot, s, d, await s.get(User, d.seller_id))
@@ -444,6 +446,7 @@ async def cb_operator_reject(c: CallbackQuery, bot: Bot, s: AsyncSession, user: 
     await state.clear()
     deal_log(s, d, "link_rejected", f"Оператор {person(user)} отклонил Bybit-ордер, мерчант пришлёт другой",
              notice=True)
+    operators.log(s, user.id, d, "rejected_link", "ссылка не та — мерчант пришлёт другую")
     await s.commit()
     await close_offers(bot, s, d, f"Ссылка по заявке #{d.id} отклонена", kinds=("operator",))
     await show(bot, user, f"{pe('ok')} Ссылка по заявке #{d.id} отклонена — мерчант пришлёт другую до {at(d.expires_at)}.",
@@ -454,6 +457,150 @@ async def cb_operator_reject(c: CallbackQuery, bot: Bot, s: AsyncSession, user: 
         f"• Пришлите другую ссылку до {at(d.expires_at)}"]),
         kb(btn("Прислать ссылку", f"orq:give:{d.id}", "shop", style="success"),
            btn("Отказаться", f"orq:drop:{d.id}", "cross")))
+
+
+@router.callback_query(F.data.regexp(r"^opq:pr:(\d+)$"))
+async def cb_operator_problem(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User):
+    """What is wrong with the merchant's order: no requisites in it (a miss for him), a wrong link, or not for me."""
+    d = await _mine(s, user, int(c.data.split(":")[2]))
+    if not d or not d.bybit_url:
+        return await c.answer("Ордер уже не у вас", show_alert=True)
+    m = await s.get(OrderMerchant, d.seller_id)
+    await show(bot, user, "\n".join([
+        title(pe("warn"), f"Проблема с ордером · заявка #{d.id}"),
+        "",
+        quote(f"• Мерчант дал реквизиты в ордере? Если нет — это его пропуск "
+              f"({(m.strikes if m else 0) + 1} из {settings.get('strike_limit')} подряд → пауза "
+              f"{settings.human('strike_sleep_hours')}), заявка уйдёт другим мерчантам.",
+              "• Другая причина (мерчант просит отменить, не отвечает) — «Искать другого мерчанта» без пропуска.",
+              "• Ссылка не та (другая сумма, закрытый ордер) — мерчант пришлёт другую.",
+              "• Не можете взять сами — ордер вернётся другим операторам.",
+              "Этот мерчант больше не сможет взять эту заявку."),
+    ]), kb(btn("Мерчант не дал реквизиты · пропуск", f"opq:nr:{d.id}", "cross", style="danger"),
+           btn("Искать другого мерчанта · без пропуска", f"opq:nm:{d.id}", "search"),
+           [btn("Ссылка не та", f"opq:rj:{d.id}", "pencil"), btn("Вернуть операторам", f"opq:back:{d.id}", "refresh")],
+           back(f"orq:give:{d.id}", "Назад")), c)
+
+
+@router.callback_query(F.data.regexp(r"^opq:(nr|nm):(\d+)$"))
+async def cb_no_requisites(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User, state: FSMContext):
+    """The operator puts the request back to the search for another merchant: «nr» — the merchant's order had no
+    requisites (a miss for him), «nm» — another reason, no miss. Either way this merchant cannot take this request
+    again, and the operator scores him."""
+    _, act, did = c.data.split(":")
+    d = await _mine(s, user, int(did))
+    if not d or not d.bybit_url or not d.seller_id:
+        return await c.answer("Ордер уже не у вас", show_alert=True)
+    merchant, miss = d.seller_id, act == "nr"
+    d = await orders.release(s, d.id)
+    count, sleep = await orders.strike(s, merchant) if miss else (0, None)
+    await state.clear()
+    deal_log(s, d, "no_requisites" if miss else "new_merchant",
+             f"Оператор {person(user)}: " + (f"в ордере мерчанта {merchant} нет реквизитов" if miss else
+                                             f"ищем другого мерчанта вместо {merchant}") + " — заявка снова в поиске",
+             notice=True)
+    operators.log(s, user.id, d, "no_requisites" if miss else "new_merchant",
+                  f"мерчант {merchant}" + (f": пропуск {count} из {settings.get('strike_limit')}"
+                                           + (" → пауза" if sleep else "") if miss else ", без пропуска"))
+    if miss:
+        _strike_event(s, merchant, d, count, sleep)
+    rating = await _ask_rating(s, d, merchant, user, gave=False)
+    await s.commit()
+    await close_offers(bot, s, d, f"Ордер по заявке #{d.id} закрыт", kinds=("operator",))
+    await show(bot, user, f"{pe('ok')} Заявка #{d.id} снова ищет мерчанта"
+               + (", мерчанту засчитан пропуск." if miss else ", без пропуска мерчанту."), close_kb(), c)
+    await _send_rating(bot, user, rating, merchant, d)
+    if miss:
+        await _tell_striked(bot, merchant, d, count, sleep)
+    else:
+        await notify(bot, merchant, f"{pe('info')} Оператор передал заявку #{d.id} другому мерчанту. Ордер на Bybit "
+                                    "по ней отмените.")
+    await push(bot, s, d.buyer_id, d, f"Ищем другого мерчанта для заявки #{d.id}")
+    await broadcast(bot, s, d)
+
+
+async def _ask_rating(s: AsyncSession, d: Deal, merchant: int, operator: User, gave: bool):
+    """A rating slot for this operator and merchant on this request (the operator may fill it once)."""
+    from bot.models import MerchantRating
+    row = await s.scalar(select(MerchantRating).where(MerchantRating.deal_id == d.id,
+                                                      MerchantRating.merchant_id == merchant))
+    if row is None:
+        row = MerchantRating(deal_id=d.id, merchant_id=merchant, operator_id=operator.id, gave=gave)
+        s.add(row)
+        await s.flush()
+    return row
+
+
+async def _send_rating(bot: Bot, operator: User, rating, merchant: int, d: Deal) -> None:
+    if rating.score is not None or rating.operator_id != operator.id:
+        return
+    await notify(bot, operator.id, "\n".join([
+        f"{pe('star')} <b>Оцените мерчанта · заявка #{d.id}</b>",
+        "",
+        quote("Насколько надёжно он сработал: ордер, реквизиты, скорость. 1 — плохо, 10 — отлично. После "
+              f"{settings.get('rep_min_count')} оценок из них складывается его репутация и лимиты."),
+    ]), kb(*[btn(str(n), f"opr:{rating.id}:{n}") for n in range(1, 11)], back("x", "Пропустить", "cross")))
+
+
+@router.callback_query(F.data.regexp(r"^opr:(\d+):(\d{1,2})$"))
+async def cb_rate(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User):
+    from bot.models import MerchantRating
+    _, rid, score = c.data.split(":")
+    row = await s.get(MerchantRating, int(rid), with_for_update=True, populate_existing=True)
+    if row is None or row.operator_id != user.id or not 1 <= int(score) <= 10:
+        return await c.answer("Эта оценка не ваша", show_alert=True)
+    if row.score is not None:
+        return await c.answer(f"Оценка уже стоит: {row.score} из 10", show_alert=True)
+    row.score = int(score)
+    rep, total = await orders.reputation(s, row.merchant_id)
+    events.add(s, f"om:{row.merchant_id}", "rated", f"Оценка оператора по заявке #{row.deal_id}: {score}/10 · "
+               f"репутация: {orders.rep_line(rep, total)}", row.merchant_id, notice=True)
+    d = await s.get(Deal, row.deal_id)
+    operators.log(s, user.id, d, "rated", f"мерчант {row.merchant_id}: {score}/10")
+    await s.commit()
+    await show(bot, user, f"{pe('ok')} Оценка {score}/10 сохранена. Репутация мерчанта: {orders.rep_line(rep, total)}.",
+               close_kb(), c)
+
+
+def _strike_event(s: AsyncSession, merchant: int, d: Deal, count: int, sleep) -> None:
+    events.add(s, f"om:{merchant}", "strike", f"Пропуск реквизитов по заявке #{d.id}: {count} из "
+               f"{settings.get('strike_limit')} подряд" + (f" — пауза до {sleep.astimezone(deals.MSK):%d.%m %H:%M} МСК"
+                                                           if sleep else ""), merchant, alert=bool(sleep), notice=not sleep)
+
+
+async def _tell_striked(bot: Bot, merchant: int, d: Deal, count: int, sleep) -> None:
+    limit = settings.get("strike_limit")
+    await notify(bot, merchant, "\n".join([
+        f"{pe('warn')} <b>Заявка #{d.id}: в вашем ордере не оказалось реквизитов</b>",
+        "",
+        quote(f"• Пропуск {count} из {limit} подряд" if not sleep else
+              f"• {limit} пропуска подряд — <b>пауза до {at(sleep, 'dt')}</b>: заявки не приходят и не берутся",
+              "• Заявка ушла другим мерчантам",
+              "• Берите только те заявки, под которые точно есть реквизиты. Выданные реквизиты обнуляют счётчик."),
+    ]), kb(btn("Ордерный кабинет", "om", "key"), back("x", "Скрыть", "cross")))
+
+
+@router.callback_query(F.data.regexp(r"^opq:ans:(\d+):([01])$"))
+async def cb_after_timeout(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User):
+    """After a Bybit order ran out of time with this operator: did the merchant give requisites?"""
+    _, _, did, gave = c.data.split(":")
+    d = await s.get(Deal, int(did))
+    if d is None or d.operator_id != user.id or not d.seller_id:
+        return await c.answer("Вопрос уже неактуален", show_alert=True)
+    if await s.scalar(select(Event.id).where(Event.ref == f"deal:{d.id}", Event.kind == "timeout_answer").limit(1)):
+        return await c.answer("Ответ уже записан", show_alert=True)
+    deal_log(s, d, "timeout_answer", f"Оператор {person(user)}: мерчант " + ("дал" if gave == "1" else "НЕ дал")
+             + " реквизиты", notice=True)
+    count, sleep = (0, None) if gave == "1" else await orders.strike(s, d.seller_id)
+    operators.log(s, user.id, d, "timeout", "мерчант дал реквизиты, не успел оператор" if gave == "1"
+                  else f"мерчант не дал реквизиты: пропуск {count} из {settings.get('strike_limit')}")
+    if gave != "1":
+        _strike_event(s, d.seller_id, d, count, sleep)
+    await s.commit()
+    await show(bot, user, f"{pe('ok')} Записано: " + ("мерчант дал реквизиты." if gave == "1" else
+                                                     "мерчанту засчитан пропуск."), close_kb(), c)
+    if gave != "1":
+        await _tell_striked(bot, d.seller_id, d, count, sleep)
 
 
 @router.callback_query(F.data.regexp(r"^orq:tpl:(\d+):(\d+)$"))
@@ -589,7 +736,7 @@ async def _confirm_give(bot, s: AsyncSession, user: User, d: Deal, state: FSMCon
               f"{pe('clock')} На оплату: <b>{minutes} мин</b>"),
     ]), kb(btn("Выдать реквизиты", f"orq:ok:{d.id}", "ok", style="success"),
            [btn("Другое время", f"orq:tm:{d.id}", "clock"), btn("Другие реквизиты", f"orq:give:{d.id}", "pencil")],
-           btn("Отклонить ссылку", f"opq:rj:{d.id}", "cross") if d.status == "checking" and d.bybit_url
+           btn("Проблема с ордером", f"opq:pr:{d.id}", "warn") if d.status == "checking" and d.bybit_url
            else btn("Вернуть в поиск", f"opq:back:{d.id}", "refresh") if d.status == "checking"
            else btn("Отказаться", f"orq:drop:{d.id}", "cross")), src)
 
@@ -611,11 +758,19 @@ async def cb_give_ok(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User, st
     who = (f"Оператор {person(user)} выдал реквизиты" if d.via_bybit else f"Мерчант {person(user)} выдал реквизиты")
     deal_log(s, d, "requisites", f"{who}: {data['g_bank']} •• {data['g_number'][-4:]}, {data['g_holder']}, "
                                  f"оплата {data['g_minutes']} мин", notice=True)
+    rating = None
+    if d.via_bybit and d.operator_id == user.id:
+        operators.log(s, user.id, d, "requisites", f"{data['g_bank']} •• {data['g_number'][-4:]}, "
+                                                   f"оплата {data['g_minutes']} мин")
+        if d.bybit_url and d.seller_id:
+            rating = await _ask_rating(s, d, d.seller_id, user, gave=True)
     await s.commit()
     await deal_screen(bot, s, user, d, c, ok("Реквизиты выданы покупателю. Ждите чек — придёт уведомлением."))
     await push(bot, s, d.buyer_id, d, f"Реквизиты по заявке #{d.id} готовы — переведите {money.fmt(d.amount_rub)} ₽")
     if d.via_bybit:
         await push(bot, s, d.seller_id, d, f"Оператор выдал покупателю реквизиты вашего ордера по заявке #{d.id}")
+    if rating is not None:  # last: the score is the operator's next step
+        await _send_rating(bot, user, rating, d.seller_id, d)
 
 
 @router.callback_query(F.data.regexp(r"^orq:drop:(\d+)$"))
@@ -687,34 +842,40 @@ async def merchant_screen(bot: Bot, s: AsyncSession, user: User, src=None, note:
                                                   Deal.status.in_(deals.FUNDED)).order_by(Deal.id))).all()
     searching = (await s.scalars(select(Deal).where(Deal.status == "searching", Deal.buyer_id != user.id,
                                                     Deal.expires_at >= now()).order_by(Deal.id).limit(5))).all()
-    active = m.status == "approved"
+    sleeping = orders.asleep(m)
+    active = m.status == "approved" and not sleeping
     cover = money.max_rub_fixed(user.balance, settings.dec("order_rate"))
-    await show(bot, user, "\n".join([
+    limit = settings.get("strike_limit")
+    rep, rated = await orders.reputation(s, user.id)
+    rep_limit = orders.bybit_problem(rep, Deal(amount_rub=settings.dec("order_max_rub")))
+    await show(bot, user, "\n".join(x for x in [
         title(pe("key"), "Ордерный кабинет"),
-        f"{pe('live')} <b>На линии: заявки приходят все</b>" if active
+        f"{pe('pause')} <b>Пауза до {at(m.sleep_until, 'dt')}</b>: {limit} раза подряд в ордере не было реквизитов"
+        if sleeping else f"{pe('live')} <b>На линии: заявки приходят все</b>" if active
         else f"{pe('pause')} <b>Приостановлено администрацией</b>",
-        "<b>Условия</b>",
-        quote(f"• Курс: <b>{money.fmt(settings.dec('order_rate'))} ₽</b> за USDT, без процента",
-              "• Bybit-ордер: без баланса, на любую сумму",
-              f"• С баланса: свободно <b>{money.usdt(user.balance)} USDT</b> — хватит на заявку до "
-              f"{money.fmt(cover)} ₽",
-              f"• В работе сейчас: {money.fmt(busy)} ₽ · по умолчанию на оплату {m.pay_minutes} мин"),
-        "<b>Результаты</b>",
-        quote(f"• Сегодня: <b>{today['n']}</b> · {money.fmt(today['rub'])} ₽ · <b>+{money.usdt(today['income'])} USDT</b>",
-              f"• 7 дней: <b>{week['n']}</b> · {money.fmt(week['rub'])} ₽ · <b>+{money.usdt(week['income'])} USDT</b>",
-              f"• Всего: {total['n']} · {money.fmt(total['rub'])} ₽ · +{money.usdt(total['income'])} USDT"
+        "",
+        section("percent", "Условия"),
+        field("Курс", f"<b>{money.fmt(settings.dec('order_rate'))} ₽</b> за USDT, без процента"),
+        field("Bybit-ордер", f"без баланса · ссылка за {settings.get('order_link_minutes')} мин после «Взять»"),
+        field("С баланса", f"свободно <b>{money.usdt(user.balance)} USDT</b> — заявка до {money.fmt(cover)} ₽"),
+        field("Пропуски реквизитов", f"<b>{m.strikes} из {limit}</b> подряд — потом пауза "
+              f"{settings.human('strike_sleep_hours')}") if m.strikes and not sleeping else None,
+        field("Репутация", orders.rep_line(rep, rated) + (f" — {rep_limit}" if rep_limit else "")),
+        field("В работе", f"{money.fmt(busy)} ₽ · на оплату по умолчанию {m.pay_minutes} мин"),
+        "",
+        section("up", "Результаты"),
+        field("Сегодня", f"{today['n']} · {money.fmt(today['rub'])} ₽ · <b>+{money.usdt(today['income'])} USDT</b>"),
+        field("7 дней", f"{week['n']} · {money.fmt(week['rub'])} ₽ · +{money.usdt(week['income'])} USDT"),
+        field("Всего", f"{total['n']} · {money.fmt(total['rub'])} ₽ · +{money.usdt(total['income'])} USDT"
               + (f" · успешных {total['success']}%" if total["success"] is not None else "")),
-        f"{pe('info')} Свободные заявки — кнопками ниже; новые приходят сюда сообщением с кнопкой «Взять»."
-        if active and searching else "",
-    ]) + note, kb(
+    ] if x is not None) + note, kb(
         *[btn(f"#{d.id} · {money.fmt(d.amount_rub)} ₽ · "
               + ({'assigned': 'прислать ссылку' if d.via_bybit else 'выдать реквизиты', 'checking': 'у оператора'}
                  .get(d.status, 'открыть')),
               f"dl:{d.id}", "fire", style="primary" if d.status == "assigned" else None) for d in working],
         *[btn(f"Свободна #{d.id} · {money.fmt(d.amount_rub)} ₽ · {money.usdt(d.seller_debit)} USDT", f"orq:see:{d.id}",
               "bell") for d in searching] if active else [],
-        btn(f"Оплата по умолчанию: {m.pay_minutes} мин", "om:pay", "clock", wide=True),
-        btn("Обновить", "om", "refresh"),
+        btn(f"Время на оплату · {m.pay_minutes} мин", "om:pay", "clock", wide=True),
         back("menu", "В меню"),
     ), src)
 
@@ -808,11 +969,4 @@ async def _submit(bot, s: AsyncSession, user: User, state: FSMContext, about: st
     text = f"Анкета ордерного мерчанта: {m.source} · {m.speed} · банки: {m.banks}"
     events.add(s, f"om:{user.id}", "submitted", text, user.id, alert=True)
     await s.commit()
-    for aid in config.admin_ids:  # also straight to the admins' chats with the bot
-        await notify(bot, aid, "\n".join([f"{pe('key')} <b>Новая анкета ордерного мерчанта</b>",
-                                          f"• Кто: {esc(user.name or '—')} @{esc(user.username or '—')} "
-                                          f"(<code>{user.id}</code>)",
-                                          f"• Откуда реквизиты: {esc(m.source)}", f"• Скорость: {esc(m.speed)}",
-                                          f"• Банки: {esc(m.banks)}"]),
-                     kb(btn("Открыть анкету", f"aom:{user.id}", "search", style="primary"), back("x", "Скрыть", "cross")))
     await merchant_screen(bot, s, user, src, ok("Анкета отправлена. Обычно рассматриваем в течение суток."))

@@ -28,7 +28,7 @@ def test_forum_topics_and_live_cards(go, monkeypatch):
         await b.deliver()
         created = {m.name for m in calls(b, "CreateForumTopic")}
         assert "💱 Сделки" in created and "👤 Пользователи" in created and "💳 Карты" in created
-        card = [m for m in calls(b, "SendMessage") if f"Сделка #{d.id}" in m.text][0]
+        card = [m for m in calls(b, "SendMessage") if f"Сделка #{d.id}" in plain(m.text)][0]
         assert "Ждём перевод" in plain(card.text) and "4111" not in card.text  # status, no requisites
         async with models.Session() as s:
             lm = await s.scalar(select(LogMessage).where(LogMessage.ref == f"deal:{d.id}"))
@@ -39,7 +39,8 @@ def test_forum_topics_and_live_cards(go, monkeypatch):
         await b.deliver()
         edit = calls(b, "EditMessageText")[-1]
         assert edit.message_id == lm.msg_id and "Чек у продавца" in plain(edit.text)  # the same card, new status
-        assert not [m for m in calls(b, "SendMessage") if f"Сделка #{d.id}" in m.text and m is not card]
+        assert not [m for m in calls(b, "SendMessage") if f"Сделка #{d.id}" in plain(m.text) and m is not card
+                    and m.message_thread_id == deals_thread]
 
         async with models.Session() as s:  # the seller says the money did not come
             deal = await s.get(Deal, d.id)
@@ -72,14 +73,14 @@ def test_plain_chat_rings_for_problems_by_reposting_the_card(go):
         d = await create_deal(b)
         await b.deliver()
         first = [m for m in b.session.calls if type(m).__name__ == "SendMessage" and m.chat_id == 1
-                 and f"Сделка #{d.id}" in m.text][0]
+                 and f"Сделка #{d.id}" in plain(m.text)][0]
         async with models.Session() as s:
             from bot.services import events
             events.add(s, f"deal:{d.id}", "dispute", "Спор открыт", alert=True)
             await s.commit()
         await b.deliver()
         cards = [m for m in b.session.calls if type(m).__name__ == "SendMessage" and m.chat_id == 1
-                 and f"Сделка #{d.id}" in m.text]
+                 and f"Сделка #{d.id}" in plain(m.text)]
         assert len(cards) == 2 and "нужно внимание" in plain(cards[-1].text)
         stub = [m for m in b.session.calls if type(m).__name__ == "EditMessageText" and m.chat_id == 1
                 and "обновлено ниже" in (m.text or "")]
@@ -108,17 +109,48 @@ def test_setts_sets_up_the_log_chat_from_the_group(go):
         created = [m.name for m in calls(b, "CreateForumTopic", group)]
         assert len(created) == len(logchat.TOPICS) and "⚠️ Требует внимания" in created and "🔑 API: заявки и клиенты" in created
         abouts = [m for m in calls(b, "SendMessage", group) if m.message_thread_id]
-        assert len(abouts) == len(logchat.TOPICS)  # every topic starts with what it is for
-        assert "Лог-чат Strait Pay настроен" in plain(calls(b, "SendMessage", group)[-1].text)
+        assert len(abouts) == len(logchat.TOPICS)  # every topic starts with what it is for, pinned
+        assert len(calls(b, "PinChatMessage", group)) == len(logchat.TOPICS)
+        assert all("Что приходит само" in plain(m.text) for m in abouts)
+        done = plain(calls(b, "SendMessage", group)[-1].text)
+        assert "Админ-чат Strait Pay настроен" in done and f"Тем: {len(logchat.TOPICS)}" in done
+        assert f"новых {len(logchat.TOPICS)}" in done
         assert logchat.targets() == [group]
 
-        await b.run(group_msg(ADMIN, group, "/setts"))  # again: nothing duplicated
+        await b.run(group_msg(ADMIN, group, "/setts"))  # again: nothing duplicated, the pins are not re-sent
         assert len(calls(b, "CreateForumTopic", group)) == len(logchat.TOPICS)
+        assert len([m for m in calls(b, "SendMessage", group) if m.message_thread_id]) == len(logchat.TOPICS)
+        assert f"без изменений {len(logchat.TOPICS)}" in plain(calls(b, "SendMessage", group)[-1].text)
         await ready(b)
         await b.deliver()  # logs now go to the new group, into topics
-        assert [m for m in calls(b, "SendMessage", group) if "Пользователь #" in m.text and m.message_thread_id]
+        assert [m for m in calls(b, "SendMessage", group) if "Пользователь #" in plain(m.text) and m.message_thread_id]
 
         plain_group = -100888
         await b.run(group_msg(ADMIN, plain_group, "/setts"))
         assert "включить" in plain(calls(b, "SendMessage", plain_group)[-1].text)  # how to enable topics
+    go(fn)
+
+
+def test_a_new_layout_makes_fresh_topics_with_pins_on_start(go):
+    async def fn(b):
+        from bot.models import Setting
+        from bot.services import settings
+        group = -100999
+        b.session.forums[group] = {5}
+        async with models.Session() as s:
+            await settings.put(s, "log_chat", str(group))
+            s.add(Setting(key=f"topic:{group}:deals", value="5"))  # a topic of an old layout
+            s.add(LogMessage(chat_id=group, ref="deal:1", thread_id=5, msg_id=77))
+            await s.commit()
+        await logchat.ensure_topics(b.bot)
+        made = calls(b, "CreateForumTopic", group)
+        assert len(made) == len(logchat.TOPICS)  # «Сделки» too: the old one is left for the admin to delete
+        assert len(calls(b, "PinChatMessage", group)) == len(logchat.TOPICS)
+        async with models.Session() as s:
+            assert await s.scalar(select(LogMessage).where(LogMessage.chat_id == group)) is None  # new cards
+            assert (await s.get(Setting, f"topic:{group}:deals")).value != "5"
+        logchat._topics.clear()
+        await logchat.ensure_topics(b.bot)  # the next start: nothing new
+        assert len(calls(b, "CreateForumTopic", group)) == len(logchat.TOPICS)
+        assert len(calls(b, "SendMessage", group)) == len(logchat.TOPICS)
     go(fn)

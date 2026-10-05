@@ -128,7 +128,7 @@ def test_messages_through_the_bot_with_reply_and_no_links(go):
         await ready(b)
         d = await create_deal(b)
         await b.run(cb(BUYER, f"dl:{d.id}"))
-        assert f"dmc:{d.id}" in b.session.buttons(BUYER)
+        assert f"dch:{d.id}" in b.session.buttons(BUYER)  # the deal's chat; a private line stays behind dmc
         await b.run(cb(BUYER, f"dmc:{d.id}"))
         assert f"dm:{d.id}:{SELLER}" in b.session.buttons(BUYER) and f"dm:{d.id}:{ADMIN}" in b.session.buttons(BUYER)
         await b.run(cb(BUYER, f"dm:{d.id}:{SELLER}"), msg(BUYER, "Перевёл, проверьте пожалуйста"))
@@ -207,9 +207,11 @@ def test_help_in_chats_and_guides(go):
         reply = b.session.last(-100123)
         assert 'href="https://straitpay.best/docs/buy"' in reply and 'href="https://straitpay.best/docs/team"' in reply
         assert "Кто такой тимлид" in plain(reply)
-        await b.run(cb(BUYER, "info"))
+        await b.run(cb(BUYER, "info"), cb(BUYER, "info:g"))  # the guides open in the same message
         text = b.session.last(BUYER)
         assert 'href="https://straitpay.best/docs/orders"' in text and "https://straitpay.best/docs/help" in \
             b.session.buttons(BUYER)
+        assert type([m for m in b.session.calls if getattr(m, "chat_id", None) == BUYER][-1]).__name__ == \
+            "EditMessageCaption"
     go(fn)
 

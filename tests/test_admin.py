@@ -1,17 +1,16 @@
 """Admin workspace: profile by Telegram ID, safe balance adjustments, operation cards, alert outbox."""
 import asyncio
-from datetime import datetime, timedelta
+from datetime import timedelta
 from decimal import Decimal as D
 
 from aiogram.exceptions import TelegramRetryAfter
 from aiogram.methods import SendMessage
-from aiogram.types import CallbackQuery, Chat, Message, Update
 from sqlalchemy import func, select
 
 from bot import models, tasks, ui
 from bot.models import Adjustment, Event, Ledger, User, Withdrawal
 from bot.services import settings, xrocket
-from tests.harness import cb, ids, msg, plain, tg
+from tests.harness import cb, msg, plain
 from tests.test_scenarios import ADMIN, BUYER, PDF, SELLER, create_deal, ready, user
 
 ADMIN2 = 2
@@ -38,8 +37,8 @@ def test_profile_splits_buys_and_sells_with_outcomes(go):
         await b.run(cb(ADMIN, f"auv:{SELLER}"))
         assert "Продажи: 1 завершено на 10 000 ₽" in plain(b.session.last(ADMIN))
         buttons = b.session.buttons(ADMIN)
-        for data in (f"aud:{SELLER}", f"auh:{SELLER}", f"auc:{SELLER}", f"aus:{SELLER}", f"aadj:{SELLER}",
-                     f"auv:{SELLER}", f"aub:{SELLER}:1"):
+        for data in (f"aud:{SELLER}", f"auh:{SELLER}", f"auc:{SELLER}", f"auw:{SELLER}", f"aadj:{SELLER}",
+                     f"dm:0:{SELLER}", f"aub:{SELLER}:1"):
             assert data in buttons, data
     go(fn)
 
@@ -176,16 +175,6 @@ def test_csv_reports(go):
     go(fn)
 
 
-def test_group_click_without_private_chat_explains(go):
-    async def fn(b):
-        await ready(b)
-        b.session.blocked.add(ADMIN)
-        group_click = Update(update_id=next(ids), callback_query=CallbackQuery(
-            id=str(next(ids)), from_user=tg(ADMIN), chat_instance="g", data="a",
-            message=Message(message_id=5, date=datetime.now(), chat=Chat(id=-100500, type="supergroup"), text="x")))
-        await b.run(group_click)
-        assert any("Откройте личный чат с ботом" in a for a in b.session.alerts())
-    go(fn)
 
 
 def test_pacing_retries_after_flood_limit():

@@ -7,15 +7,15 @@ from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
 from aiogram.types import CallbackQuery
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from bot.config import config
+from bot.services.admins import IsAdmin
 from bot.emoji import back, btn, kb, pe
 from bot.handlers import logchat
 from bot.models import Setting, User, now
 from bot.services import finance, money
-from bot.ui import MSK, clean, paced, show, title
+from bot.ui import MSK, clean, field, mark, paced, quote, section, show, title
 
 router = Router()
-router.callback_query.filter(F.from_user.id.in_(config.admin_ids))
+router.callback_query.filter(IsAdmin())
 
 
 def _u(v) -> str:
@@ -25,42 +25,42 @@ def _u(v) -> str:
 def render(sn: finance.Snapshot) -> str:
     free = sn.free
     lines = [
-        title(pe("stats"), "Финансы Strait Pay"),
-        f"обновлено {now().astimezone(MSK):%d.%m %H:%M} МСК",
+        title(pe("stats"), "Финансы Strait Pay") + f" · {now().astimezone(MSK):%d.%m %H:%M} МСК",
         "",
-        "<b>Что есть</b>",
-        f"• xRocket — сюда пополнения, отсюда выводы: <b>{_u(sn.xrocket)}</b>",
-        f"• Долг операторов за Bybit-ордера: <b>{money.usdt(sn.op_debt)} USDT</b> — вернут на xRocket "
-        "(в «есть» не входит, пока не погашен)" if sn.op_debt else "",
-        f"• Пришло через Bybit-ордера: 24 ч {money.usdt(sn.bybit['24h'])} · 7 д {money.usdt(sn.bybit['7d'])} · "
-        f"всего {money.usdt(sn.bybit['all'])} USDT" if sn.bybit["all"] else "",
+        section("wallet", "Что есть"),
+        field("xRocket — сюда пополнения, отсюда выводы", f"<b>{_u(sn.xrocket)}</b>"),
+        field("Долг операторов за Bybit-ордера", f"<b>{money.usdt(sn.op_debt)} USDT</b> — вернут на xRocket "
+              "(в «есть» не входит, пока не погашен)") if sn.op_debt else None,
+        field("Пришло через Bybit-ордера", f"24 ч {money.usdt(sn.bybit['24h'])} · 7 д {money.usdt(sn.bybit['7d'])} · "
+              f"всего {money.usdt(sn.bybit['all'])} USDT") if sn.bybit["all"] else None,
         "",
-        "<b>Что должны пользователям</b>",
-        f"• Балансы: <b>{money.usdt(sn.users_available)} USDT</b>",
-        f"• В сделках: <b>{money.usdt(sn.users_frozen)} USDT</b>",
-        f"• Выводы в пути: <b>{money.usdt(sn.unpaid)} USDT</b> ({sn.unpaid_n})" if sn.unpaid_n else "",
-        f"• Итого: <b>{money.usdt(sn.liabilities)} USDT</b>",
+        section("people", "Что должны пользователям"),
+        field("Балансы", f"<b>{money.usdt(sn.users_available)} USDT</b>"),
+        field("В сделках", f"<b>{money.usdt(sn.users_frozen)} USDT</b>"),
+        field("Командные балансы тимлидов", f"<b>{money.usdt(sn.users_team)} USDT</b>") if sn.users_team else None,
+        field("Выводы в пути", f"<b>{money.usdt(sn.unpaid)} USDT</b> ({sn.unpaid_n})") if sn.unpaid_n else None,
+        field("Итого", f"<b>{money.usdt(sn.liabilities)} USDT</b>"),
         "",
-        (f"🟢 <b>Можно забрать: {money.usdt(free)} USDT</b>" if free >= 0 else
-         f"🔴 <b>Не хватает: {money.usdt(-free)} USDT</b> — активов меньше, чем денег пользователей"),
-        f"• С учётом долга операторов: {money.usdt(free + sn.op_debt)} USDT" if sn.op_debt else "",
+        (f"{mark('🟢')} <b>Можно забрать: {money.usdt(free)} USDT</b>" if free >= 0 else
+         f"{mark('🔴')} <b>Не хватает: {money.usdt(-free)} USDT</b> — активов меньше, чем денег пользователей"),
+        field("С учётом долга операторов", f"{money.usdt(free + sn.op_debt)} USDT") if sn.op_debt else None,
         "",
-        "<b>Прибыль площадки</b>",
-        f"• 24 ч <b>+{money.usdt(sn.profit['24h'])}</b> · 7 д +{money.usdt(sn.profit['7d'])} · "
-        f"30 д +{money.usdt(sn.profit['30d'])} · всего +{money.usdt(sn.profit['all'])} USDT",
-        f"• Выплачено тимлидам (уже вычтено): {money.usdt(sn.team_paid)} USDT" if sn.team_paid else "",
+        section("up", "Прибыль площадки"),
+        field("24 ч", f"<b>+{money.usdt(sn.profit['24h'])}</b> · 7 д +{money.usdt(sn.profit['7d'])} · "
+              f"30 д +{money.usdt(sn.profit['30d'])} · всего +{money.usdt(sn.profit['all'])} USDT"),
+        field("Выплачено тимлидам (уже вычтено)", f"{money.usdt(sn.team_paid)} USDT") if sn.team_paid else None,
         "",
-        "<b>Оборот</b>",
-        f"• Сделок за 24 ч: {sn.volume['24h'][0]} на {money.fmt(sn.volume['24h'][1])} ₽",
-        f"• За 7 д: {sn.volume['7d'][0]} на {money.fmt(sn.volume['7d'][1])} ₽",
-        f"• Пользователей: {sn.users} · мерчантов на смене: {sn.online}",
+        section("swap", "Оборот"),
+        field("Сделок за 24 ч", f"{sn.volume['24h'][0]} на {money.fmt(sn.volume['24h'][1])} ₽"),
+        field("За 7 д", f"{sn.volume['7d'][0]} на {money.fmt(sn.volume['7d'][1])} ₽"),
+        field("Пользователей", f"{sn.users} · мерчантов на смене: {sn.online}"),
     ]
     if sn.queued_n:
         short = sn.queued - (sn.xrocket or 0)
-        lines += ["", f"⚠️ В очереди на вывод {sn.queued_n} на {money.usdt(sn.queued)} USDT"
+        lines += ["", f"{pe('warn')} <b>В очереди на вывод {sn.queued_n} на {money.usdt(sn.queued)} USDT</b>"
                       + (f" — пополните xRocket минимум на {money.usdt(short)} USDT" if short > 0 else "")]
-    lines += ["", "«Можно забрать» = что есть − что должны пользователям; прибыль уже внутри."]
-    return re.sub(r"\n{3,}", "\n\n", "\n".join(lines))
+    lines += ["", quote("«Можно забрать» = что есть − что должны пользователям; прибыль уже внутри.")]
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(line for line in lines if line is not None))
 
 
 @router.callback_query(F.data == "afin")

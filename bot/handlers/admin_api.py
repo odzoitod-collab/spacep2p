@@ -10,15 +10,16 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.config import config
+from bot.services.admins import IsAdmin
 from bot.emoji import back, btn, kb, pe
 from bot.handlers.seller import parse_rub
 from bot.models import ApiApplication, ApiClient, Deal, User, now
 from bot.services import api, audit, deals, events, money, settings
-from bot.ui import at, esc, notify, ok, quote, show, title, warn
+from bot.ui import alink, at, card, cf, esc, notify, ok, quote, show, title, ulink, verdict, warn
 
 router = Router()
-router.message.filter(F.from_user.id.in_(config.admin_ids))
-router.callback_query.filter(F.from_user.id.in_(config.admin_ids))
+router.message.filter(IsAdmin())
+router.callback_query.filter(IsAdmin())
 
 APP_STATUS = {"pending": "на рассмотрении", "approved": "одобрена", "rejected": "отклонена"}
 # field -> (title, kind): rub = RUB amount, int = whole number
@@ -84,23 +85,23 @@ async def cb_apps(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User):
 async def app_screen(bot: Bot, s: AsyncSession, admin: User, a: ApiApplication, src=None, note: str = ""):
     u = await s.get(User, a.user_id)
     stats = await deals.completed_count(s, [a.user_id])
+    decided = await s.get(User, a.admin_id) if a.admin_id else None
     await show(bot, admin, "\n".join([
-        title(pe("pencil"), f"Заявка на API #{a.id} · {APP_STATUS[a.status]}"),
+        title(pe("pencil"), f"Заявка на API {alink('apa', a.id, f'#{a.id}')}") + f" · {APP_STATUS[a.status]}",
         "",
-        quote(f"{pe('profile')} {_who(u, a.user_id)} · сделок в боте: {stats[a.user_id]}",
-              f"{pe('shop')} Проект: <b>{esc(a.project)}</b>",
-              f"{pe('search')} Ссылка: {esc(a.url)}",
-              f"{pe('people')} Трафик: {esc(a.traffic)}",
-              f"{pe('stats')} Оборот в месяц: {esc(a.volume)}",
-              f"{pe('clock')} Подана {at(a.created_at, 'dt')}"
-              + (f" · решение {at(a.decided_at, 'dt')} (<code>{a.admin_id}</code>)" if a.decided_at else "")),
-        esc(a.about) if a.about else "",
-        f"Причина отказа: <i>{esc(a.reason)}</i>" if a.reason else "",
+        card(cf("Заявитель", f"{ulink(u, a.user_id)} · сделок в боте: {stats[a.user_id]}", icon="profile"),
+             cf("Проект", f"<b>{esc(a.project)}</b>", esc(a.url), icon="shop"),
+             cf("Трафик", esc(a.traffic), icon="people"),
+             cf("Оборот в месяц", esc(a.volume), icon="stats"),
+             cf("Подана", at(a.created_at, "dt") + (f" · решение {at(a.decided_at, 'dt')} · {ulink(decided, a.admin_id)}"
+                                                    if a.decided_at else ""), icon="clock"),
+             cf("О проекте", esc(a.about), icon="info") if a.about else "",
+             cf("Причина отказа", f"<i>{esc(a.reason)}</i>", icon="cross") if a.reason else ""),
     ]) + note, kb(
         [btn("Одобрить", f"aap:ok:{a.id}", "ok", style="success"), btn("Отклонить", f"aap:no:{a.id}", "cross",
                                                                           style="danger")]
         if a.status == "pending" else None,
-        btn("Профиль", f"auv:{a.user_id}", "profile"), back("aapi", "API")), src)
+        back("aapi", "API")), src)
 
 
 @router.callback_query(F.data.regexp(r"^aap:(\d+)$"))
@@ -130,7 +131,8 @@ async def cb_approve(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User):
     await notify(bot, a.user_id, f"{pe('ok')} <b>Заявка на Strait Pay API одобрена.</b> Откройте раздел API, "
                                  "выпустите токен и задайте вебхук.", kb(btn("Открыть API", "api", "key", style="success"),
                                                                          back("x", "Скрыть", "cross")))
-    await client_screen(bot, s, user, client, c, ok("Одобрена. Лимиты по умолчанию — поправьте при необходимости."))
+    await client_screen(bot, s, user, client, c, "\n\n" + verdict("ok", "Одобрено", user)
+                        + "\n" + quote("Лимиты по умолчанию — поправьте при необходимости."))
 
 
 @router.callback_query(F.data.regexp(r"^aap:no:(\d+)$"))
@@ -138,8 +140,9 @@ async def cb_reject_ask(c: CallbackQuery, bot: Bot, user: User, state: FSMContex
     aid = int(c.data.split(":")[2])
     await state.set_state(AdmApi.reason)
     await state.set_data({"app": aid})
-    await show(bot, user, f"{title(pe('cross'), f'Отказ по заявке #{aid}')}\n\nНапишите причину (5–500 символов) — "
-                          "её увидит заявитель.", kb(back(f"aap:{aid}", "Отмена")), c)
+    await show(bot, user, f"{pe('cross')} <b>Отказ по заявке на API #{aid}</b>\n\n"
+                          + quote("Напишите причину следующим сообщением (5–500 символов) — её увидит заявитель."),
+               kb(back(f"aap:{aid}", "Отмена")), c)
 
 
 @router.message(AdmApi.reason, F.text)
@@ -158,7 +161,7 @@ async def msg_reject(m: Message, bot: Bot, s: AsyncSession, user: User, state: F
     events.add(s, f"apa:{a.id}", "rejected", f"Отклонена ({user.name}): {reason}", a.user_id, notice=True)
     await s.commit()
     await notify(bot, a.user_id, f"{pe('cross')} <b>Заявка на Strait Pay API отклонена.</b>\nПричина: {esc(reason)}")
-    await app_screen(bot, s, user, a, note=ok("Отклонена, заявитель уведомлён"))
+    await app_screen(bot, s, user, a, note="\n\n" + verdict("cross", "Отклонено", user))
 
 
 # ---------- clients ----------
@@ -171,27 +174,24 @@ async def client_screen(bot: Bot, s: AsyncSession, admin: User, cl: ApiClient, s
         func.coalesce(func.sum(Deal.amount_rub).filter(Deal.status == "completed"), 0),
     ).where(Deal.api_client_id == cl.id))).one()
     await show(bot, admin, "\n".join([
-        title(pe("key"), f"API-клиент #{cl.id} · {esc(cl.project)}"),
-        f"{pe('ok') if cl.status == 'active' else pe('pause')} <b>{'активен' if cl.status == 'active' else 'приостановлен'}</b>",
+        title(pe("key"), f"API-клиент {alink('apc', cl.id, f'#{cl.id}')} · {esc(cl.project)}")
+        + f" · {'активен' if cl.status == 'active' else 'приостановлен'}",
         "",
-        quote(f"{pe('profile')} Владелец: {_who(u, cl.user_id)}",
-              f"{pe('key')} Токен: " + (f"…{cl.token_hint}, выпущен {at(cl.token_at, 'dt')}" if cl.token_hash else "нет"),
-              f"{pe('bell')} Вебхук: {esc(cl.webhook_url or '—')}",
-              f"{pe('dollar')} Баланс владельца: {money.usdt(u.balance)} USDT"),
-        "<b>Условия</b>",
-        quote(*terms_lines(cl)),
-        "<b>Лимиты</b>",
-        quote(*[f"{t}: <b>{money.fmt(getattr(cl, k)) if kind == 'rub' else getattr(cl, k)}</b>"
-                for k, (t, kind) in LIMITS.items()],
-              f"Сегодня: {money.fmt(used['today_rub'])} ₽ · неоплаченных сейчас: {used['open_orders']}"),
-        quote(f"{pe('stats')} Заказов всего: {total}, успешных: {success} на {money.fmt(Decimal(volume))} ₽"),
+        card(cf("Владелец", f"{ulink(u, cl.user_id)} · баланс {money.usdt(u.balance)} USDT", icon="profile"),
+             cf("Доступ", "токен: " + (f"…{cl.token_hint}, выпущен {at(cl.token_at, 'dt')}" if cl.token_hash else "нет"),
+                f"вебхук: {esc(cl.webhook_url or '—')}", icon="key"),
+             cf("Условия", *terms_lines(cl), icon="percent"),
+             cf("Лимиты", *[f"{t}: <b>{money.fmt(getattr(cl, k)) if kind == 'rub' else getattr(cl, k)}</b>"
+                            for k, (t, kind) in LIMITS.items()],
+                f"сегодня: {money.fmt(used['today_rub'])} ₽ · неоплаченных сейчас: {used['open_orders']}", icon="lock"),
+             cf("Заказы", f"всего {total}, успешных {success} на {money.fmt(Decimal(volume))} ₽", icon="stats")),
     ]) + note, kb(
         [btn("Курс клиента", f"acl:t:{cl.id}:rate", "swap"), btn("Процент клиента", f"acl:t:{cl.id}:pct", "percent")],
         *[btn(f"Изменить: {t}", f"acl:l:{cl.id}:{k}", "pencil") for k, (t, _) in LIMITS.items()],
         [btn("Приостановить", f"acl:st:{cl.id}:0", "pause", style="danger") if cl.status == "active"
          else btn("Возобновить", f"acl:st:{cl.id}:1", "ok", style="success"),
          btn("Отозвать токен", f"acl:rv:{cl.id}", "cross") if cl.token_hash else None],
-        [btn("Профиль", f"auv:{cl.user_id}", "profile"), back("aapi", "API")]), src)
+        back("aapi", "API")), src)
 
 
 @router.callback_query(F.data.regexp(r"^acl:(\d+)$"))

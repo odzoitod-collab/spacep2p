@@ -8,17 +8,18 @@ from aiogram.types import CallbackQuery, Message
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from bot.config import config
+from bot.services.admins import IsAdmin
 from bot.emoji import back, btn, kb, pe
 from bot.handlers.deal import CLOSE_REASONS, REASONS, STATUS, card_of, push
 from bot.handlers.seller import parse_rub
 from bot.models import ApiClient, Deal, Event, User
 from bot.services import audit, deals, events, money, orders
-from bot.ui import at, esc, notify, ok, person, quote, show, title, warn
+from bot.ui import alink, at, cf, esc, notify, ok, person, quote, show, title, ulink, warn
+from bot.ui import card as fields
 
 router = Router()
-router.message.filter(F.from_user.id.in_(config.admin_ids))
-router.callback_query.filter(F.from_user.id.in_(config.admin_ids))
+router.message.filter(IsAdmin())
+router.callback_query.filter(IsAdmin())
 HISTORY = 8
 EXTEND = 15
 
@@ -42,59 +43,49 @@ async def card_text(s: AsyncSession, d: Deal) -> str:
         if not uid:
             return empty
         u = users.get(uid)
-        return f"{esc(person(u))} · сделок {done[uid]}" + (" · ЗАБАНЕН" if u and u.is_banned else "")
+        return f"{ulink(u, uid)} · сделок {done[uid]}" + (" · <b>ЗАБАНЕН</b>" if u and u.is_banned else "")
 
     icon, label = STATUS[d.status]
     frozen = deals.frozen(d) and d.seller_id and d.status in deals.FUNDED
-    times = [f"создана {at(d.created_at, 'dt')}"]
-    if d.status in deals.UNPAID:
-        times.append(f"срок этапа до {at(d.expires_at, 'dt')}")
-    if d.paid_at:
-        times.append(f"чек {at(d.paid_at, 'dt')}")
-    if d.closed_at:
-        times.append(f"закрыта {at(d.closed_at, 'dt')}")
     rows = (await s.scalars(select(Event).where(Event.ref == f"deal:{d.id}").order_by(Event.id.desc())
                             .limit(HISTORY))).all()
     files = d.dispute_files or []
-    lines = [
-        title(pe("fire"), f"Сделка #{d.id}"),
-        f"{pe(icon)} <b>{label}</b> · {kind_of(d)}" + (f" · API «{esc(client.project)}»" if client else ""),
-        "<b>Участники</b>",
-        quote(f"• Создал (покупатель): {who(d.buyer_id, '—')}",
-              f"• Принял (мерчант): {who(d.seller_id, 'ещё никто')}",
-              f"• Оператор: {who(d.operator_id, 'не назначен')}" if d.via_bybit else ""),
-        "<b>Деньги</b>",
-        quote(f"• Сумма: <b>{money.fmt(d.amount_rub)} ₽</b>",
-              f"• Покупатель получит: <b>{money.usdt(d.buyer_credit)} USDT</b> · курс {money.fmt(d.buyer_rate or d.rate)} ₽ "
-              f"· {money.fmt(d.platform_pct, 3)}%",
-              f"• Мерчант отдаёт: {money.usdt(d.seller_debit)} USDT" + (
-                  f" по {money.fmt(d.merchant_rate)} ₽" if d.merchant_rate else f" · {money.fmt(d.seller_pct, 3)}%")
-              + (" · заморожено" if frozen else " · через Bybit-ордер" if d.via_bybit and d.bybit_url else ""),
-              f"• Площадке: {money.usdt(d.platform_fee)} USDT" + (
-                  f" · тимлиду {money.usdt(d.team_fee)} USDT" if d.team_fee else "")),
-        "<b>Реквизиты</b>",
-        quote(f"• {esc(card.bank)} · <code>{esc(card.requisites)}</code> · {esc(card.holder)}" if card
-              else "• Ещё не выданы",
-              f"• Банк покупателя: {esc(d.sender_bank)}" if d.sender_bank else "",
-              f'• Ордер Bybit: <a href="{esc(d.bybit_url)}">{esc(d.bybit_url[:50])}</a>' if d.bybit_url else ""),
-        "<b>Сроки</b>",
-        quote("• " + " · ".join(times)),
-    ]
-    if d.dispute_reason or files or d.receipt_file_id:
-        by = {r: sum(1 for f in files if (f[2] if len(f) > 2 else "seller") == r) for r in ("buyer", "seller")}
-        lines += ["<b>Чек и спор</b>", quote(
-            f"• Чек: {'есть' if d.receipt_file_id else 'нет'} · материалов: покупатель {by['buyer']}, продавец "
-            f"{by['seller']}",
-            f"• Причина спора: {REASONS.get(d.dispute_reason, d.dispute_reason)}"
-            + (f" — пришло {money.fmt(d.dispute_amount_rub)} ₽" if d.dispute_amount_rub else "") if d.dispute_reason
-            else "")]
-    if d.close_reason:
-        lines.append(f"Итог: <b>{CLOSE_REASONS.get(d.close_reason, d.close_reason)}</b>"
-                     + (f" — <i>{esc(d.resolution)}</i>" if d.resolution else ""))
-    if rows:
-        lines += ["<b>История</b> (последние события)",
-                  quote(*[f"• {at(e.created_at)} · {esc(e.text[:160])}" for e in reversed(rows)])]
-    return "\n".join(lines)
+    by = {r: sum(1 for f in files if (f[2] if len(f) > 2 else "seller") == r) for r in ("buyer", "seller")}
+    history = [f"{at(e.created_at, 'dt')} · {esc(e.text[:160])}" for e in reversed(rows)]
+    return "\n".join([
+        title(pe("fire"), f"Сделка {alink('deal', d.id, f'#{d.id}')}") + f" · {label}",
+        "",
+        fields(
+            cf("Тип", kind_of(d) + (f" · API «{esc(client.project)}»" if client else ""), icon=icon),
+            cf("Участники", f"Создал (покупатель): {who(d.buyer_id, '—')}",
+               f"Принял (мерчант): {who(d.seller_id, 'ещё никто')}",
+               f"Оператор: {who(d.operator_id, 'не назначен')}" if d.via_bybit else "", icon="people"),
+            cf("Деньги", f"сумма <b>{money.fmt(d.amount_rub)} ₽</b> → покупателю <b>{money.usdt(d.buyer_credit)} USDT</b>",
+               f"курс {money.fmt(d.buyer_rate or d.rate)} ₽ · комиссия {money.fmt(d.platform_pct, 3)}%",
+               f"мерчант отдаёт {money.usdt(d.seller_debit)} USDT" + (
+                   f" по {money.fmt(d.merchant_rate)} ₽" if d.merchant_rate else f" · {money.fmt(d.seller_pct, 3)}%")
+               + (" · заморожено" if frozen else " · через Bybit-ордер" if d.via_bybit and d.bybit_url else ""),
+               f"площадке {money.usdt(d.platform_fee)} USDT" + (
+                   f" · тимлиду {money.usdt(d.team_fee)} USDT" if d.team_fee else ""), icon="ruble"),
+            cf("Реквизиты", f"{esc(card.bank)} · <code>{esc(card.requisites)}</code> · {esc(card.holder)}" if card
+               else "ещё не выданы",
+               f"банк покупателя: {esc(d.sender_bank)}" if d.sender_bank else "",
+               f'<a href="{esc(d.bybit_url)}">ордер Bybit</a>' if d.bybit_url else "", icon="card"),
+            cf("Сроки", f"создана {at(d.created_at, 'dt')}",
+               f"срок этапа до {at(d.expires_at, 'dt')}" if d.status in deals.UNPAID else "",
+               f"чек {at(d.paid_at, 'dt')}" if d.paid_at else "",
+               f"закрыта {at(d.closed_at, 'dt')}" if d.closed_at else "", icon="clock"),
+            cf("Чек и спор", f"чек: {'есть' if d.receipt_file_id else 'нет'} · материалов: покупатель {by['buyer']}, "
+               f"продавец {by['seller']}",
+               f"причина спора: {REASONS.get(d.dispute_reason, d.dispute_reason)}"
+               + (f" — пришло {money.fmt(d.dispute_amount_rub)} ₽" if d.dispute_amount_rub else "")
+               if d.dispute_reason else "", icon="flag") if d.dispute_reason or files or d.receipt_file_id else "",
+            cf("Итог", f"<b>{CLOSE_REASONS.get(d.close_reason, d.close_reason)}</b>"
+               + (f" — <i>{esc(d.resolution)}</i>" if d.resolution else ""), icon="ok") if d.close_reason else "",
+        ),
+        "",
+        "<blockquote expandable><b>История</b>\n" + "\n".join(history) + "</blockquote>" if history else "",
+    ]).rstrip()
 
 
 def card_kb(d: Deal, *extra):
@@ -112,13 +103,10 @@ def card_kb(d: Deal, *extra):
         if d.status in deals.UNPAID else None,
         [btn("Изменить сумму", f"adm:amt:{d.id}", "pencil") if d.status in deals.OPEN else None,
          btn(f"Продлить +{EXTEND} мин", f"adm:ext:{d.id}", "clock") if d.status in deals.UNPAID else None],
-        [btn("Покупатель", f"auv:{d.buyer_id}", "profile"),
-         btn("Мерчант", f"auv:{d.seller_id}", "profile") if d.seller_id else None],
-        btn("Оператор", f"auv:{operator}", "profile") if operator else None,
-        [btn("Написать покупателю", f"dm:{d.id}:{d.buyer_id}", "support") if not d.api_client_id else None,
-         btn("Написать мерчанту", f"dm:{d.id}:{d.seller_id}", "support") if d.seller_id else None],
-        btn("Написать оператору", f"dm:{d.id}:{operator}", "support") if operator else None,
-        [btn("Вся история", f"aev:deal:{d.id}", "list"), btn("Обновить", f"adv:{d.id}", "refresh")],
+        # the people are links in the card; one «Написать» chooses whom
+        [btn("Чат сделки", f"dch:{d.id}", "support"),
+         btn("Написать лично", f"dmc:{d.id}", "support") if d.seller_id or operator or not d.api_client_id else None],
+        btn("Вся история", f"aev:deal:{d.id}", "list"),
         *extra)
 
 

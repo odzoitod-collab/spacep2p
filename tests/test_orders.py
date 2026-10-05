@@ -29,7 +29,8 @@ async def merchant(b, uid, balance=D(1000)):
     await b.run(msg(uid, "/start"), cb(uid, "om"), cb(uid, "om:apply"), msg(uid, "свои карты и команда"),
                 cb(uid, "om:sp:0"), msg(uid, "Сбер, Т-Банк"), cb(uid, "om:skip"))
     assert "Анкета отправлена" in plain(b.session.last(uid))
-    assert any(f"aom:{uid}" in (b_ or "") for b_ in b.session.buttons(ADMIN))  # straight to the admin's chat
+    await b.deliver()  # the card in the admin chat (here: the admin's private chat) with the decision on it
+    assert f"aom:ok:{uid}" in b.session.buttons(ADMIN) and f"aom:{uid}" in b.session.buttons(ADMIN)
     await b.run(cb(ADMIN, f"aom:{uid}"), cb(ADMIN, f"aom:ok:{uid}"))
     async with models.Session() as s:
         if balance:
@@ -62,7 +63,7 @@ async def deal(did):
 
 
 def offers(b, uid):
-    return [t for t in b.session.texts(uid) if re.search(r"Заявка #\d+ · [\d ]+ ₽ · ", plain(t))]
+    return [t for t in b.session.texts(uid) if re.search(r"Новая заявка #\d+ · [\d ]+ ₽", plain(t))]
 
 
 async def give(b, uid, did, minutes=15):
@@ -80,8 +81,9 @@ def test_full_order_requisites_flow(go):
         assert "Ищем ордерного мерчанта" in plain(b.session.last(BUYER))
         assert offers(b, M1) and f"orq:take:{d.id}:b" in b.session.buttons(M1)
         offer = plain(offers(b, M1)[-1])
-        for part in ("Сумма перевода: 52 000 ₽", "Курс ордера: 104 ₽", "Ордер: 500 USDT",
-                     "520 USDT → доход мерчанта ≈ +20 USDT"):
+        assert "Доход" not in offer and "доход" not in offer  # the merchant's earnings are not ours to say
+        for part in ("Сумма перевода: 52 000 ₽", "Курс площадки для ордера: 104 ₽", "Зайти в ордер на: 500 USDT",
+                     "ссылка на ордер — за 2 мин"):
             assert part in offer, part
 
         assert f"orq:take:{d.id}:w" in b.session.buttons(M1)  # 1000 USDT cover it: both ways are offered
@@ -168,7 +170,7 @@ def test_every_merchant_gets_every_request_and_picks_the_way(go):
         big = await request(b, "52000")
         assert offers(b, M1)  # no amount limits: the request comes anyway
         assert f"orq:take:{big.id}:b" in b.session.buttons(M1) and f"orq:take:{big.id}:w" not in b.session.buttons(M1)
-        assert "не хватает" in plain(offers(b, M1)[-1])
+        assert "свободно только 100" in plain(offers(b, M1)[-1])
         await b.run(cb(M1, f"orq:take:{big.id}:w"))  # an old button or a forged one: refused with the reason
         assert any("нужно 500 USDT свободных" in a for a in b.session.alerts())
         assert (await deal(big.id)).status == "searching"
@@ -255,7 +257,7 @@ def test_admin_commissions_and_order_rate(go):
         await merchant(b, M1)
         await b.run(cb(ADMIN, "a"), cb(ADMIN, "acm"))
         text = plain(b.session.last(ADMIN))
-        assert "Комиссии и проценты" in text and "статичная карта: 5%" in text and "фиксированный курс 104 ₽" in text
+        assert "Комиссии и проценты" in text and "статичная карта: 5%" in text and "курс 104 ₽ за USDT" in text
         assert "acs:order_seller_pct" not in b.session.buttons(ADMIN) and "acs:order_rate" in b.session.buttons(ADMIN)
         await b.run(cb(ADMIN, "acs:order_rate"), msg(ADMIN, "102"))
         assert "Сохранено: 104 ₽ → 102 ₽" in plain(b.session.last(ADMIN)) and "Комиссии и проценты" in plain(
@@ -268,7 +270,7 @@ def test_admin_commissions_and_order_rate(go):
         static = await create_deal(b, amount="10000")
         assert (static.seller_pct, static.seller_debit, static.buyer_credit) == (D("5.5"), D("94.5"), D(94))
         order = await request(b, "10200", buyer=OTHER)
-        assert "Курс ордера: 102 ₽" in plain(offers(b, M1)[-1])
+        assert "Курс площадки для ордера: 102 ₽" in plain(offers(b, M1)[-1])
         await b.run(cb(M1, f"orq:take:{order.id}:w"))
         assert (await deal(order.id)).seller_debit == D(100)  # 10 200 / 102
 
@@ -452,17 +454,31 @@ def test_api_bybit_order_statuses_history_and_liquidity(go):
                     await api.enqueue_changes(s)
                 return await (await c.get(f"/v1/orders/{order['id']}", headers=auth(token))).json()
 
+            assert (order["detail"], order["flow"]["type"]) == ("searching_merchant", "order_requisites")
             await b.run(cb(M1, f"orq:take:{order['id']}:b"))
-            assert (await status())["status"] == "merchant_assigned"
+            got = await status()
+            assert (got["status"], got["detail"]) == ("merchant_assigned", "waiting_bybit_order")
+            assert got["flow"] == {"type": "order_requisites", "via": "bybit_order", "operator_assigned": False}
             await b.run(msg(M1, LINK))
             got = await status()
             assert got["status"] == "requisites_check" and got["stage"]["title"] == "Проверка реквизитов"
-            assert got["requisites"] is None and got["search_expires_at"]
+            assert got["requisites"] is None and got["search_expires_at"] and got["detail"] == "waiting_operator"
             await b.run(cb(OP, f"opq:go:{order['id']}"))
+            got = await status()
+            assert got["detail"] == "operator_checking_order" and got["flow"]["operator_assigned"]
+            assert got["status_text"] == "Оператор проверяет ордер и выдаёт реквизиты"
+            # a long poll answers at once when the order already differs from what the client saw
+            fast = await (await c.get(f"/v1/orders/{order['id']}?wait=30&since=waiting_operator",
+                                      headers=auth(token))).json()
+            assert fast["detail"] == "operator_checking_order"
             await give(b, OP, order["id"])
             got = await status()
             assert got["status"] == "awaiting_payment" and got["next_action"] == "pay_and_upload_receipt"
             assert got["requisites"]["number"] == "5536913812345672" and got["stage"]["step"] == 2
+            held = await (await c.get(f"/v1/orders/{order['id']}?wait=1&since=awaiting_payment",
+                                      headers=auth(token))).json()
+            assert held["status"] == "awaiting_payment"  # nothing changed: answered after the wait
+            assert (await c.get(f"/v1/orders/{order['id']}?wait=x&since=a", headers=auth(token))).status == 422
             hist = await (await c.get(f"/v1/orders/{order['id']}/history", headers=auth(token))).json()
             assert [h["status"] for h in hist["history"]] == ["searching_requisites", "merchant_assigned",
                                                               "requisites_check", "awaiting_payment"]

@@ -86,6 +86,41 @@ def next_action(d: Deal, status: str) -> str | None:
     return None if status in FINAL else "wait"
 
 
+# what exactly happens inside a status: the public status stays stable, `detail` tells the step
+DETAIL_TEXT = {
+    "searching_merchant": "Ищем ордерного мерчанта под сумму",
+    "waiting_bybit_order": "Мерчант взял заявку и создаёт Bybit-ордер",
+    "merchant_preparing_requisites": "Мерчант взял заявку и выдаёт реквизиты",
+    "waiting_operator": "Ордер мерчанта ждёт оператора",
+    "operator_checking_order": "Оператор проверяет ордер и выдаёт реквизиты",
+    "awaiting_payment": "Реквизиты выданы — ждём перевод и чек",
+    "verifying": "Чек у продавца — он проверяет поступление",
+    "dispute": "Спор: решает поддержка Strait Pay",
+    "success": "Готово: USDT зачислены на баланс",
+    "cancelled": "Заказ отменён",
+    "expired": "Время на оплату вышло",
+}
+
+
+def detail(d: Deal) -> str:
+    if d.status == "searching":
+        return "searching_merchant"
+    if d.status == "assigned":
+        return "waiting_bybit_order" if d.via_bybit else "merchant_preparing_requisites"
+    if d.status == "checking":
+        return "operator_checking_order" if d.operator_id else "waiting_operator"
+    return STATUS[d.status]
+
+
+def flow(d: Deal) -> dict:
+    """How the requisites come: a merchant's own card, a merchant's balance, or a Bybit order an operator handles."""
+    if not d.is_order:
+        return {"type": "static_card", "via": None, "operator_assigned": False}
+    return {"type": "order_requisites", "via": "bybit_order" if d.via_bybit else ("merchant_balance" if d.seller_id
+                                                                                  else None),
+            "operator_assigned": bool(d.operator_id)}
+
+
 def order_json(d: Deal, card: Card | None) -> dict:
     status = STATUS[d.status]
     step = STAGE.get(status)
@@ -104,6 +139,9 @@ def order_json(d: Deal, card: Card | None) -> dict:
         "close_reason": d.close_reason,
         "requisites": None,
         "order_requisites": d.is_order,
+        "detail": detail(d),
+        "status_text": DETAIL_TEXT[detail(d)],
+        "flow": flow(d),
         "next_action": next_action(d, status),
         "stage": {"step": step[0] if step else STAGES, "of": STAGES, "title": step[1] if step else
                   {"success": "Готово", "cancelled": "Отменён", "expired": "Время вышло"}[status]},

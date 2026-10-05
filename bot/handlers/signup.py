@@ -21,12 +21,13 @@ from aiogram.types import CallbackQuery, Message
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from bot.config import config
+from bot.services.admins import IsAdmin
 from bot.emoji import back, btn, kb, pe
 from bot.handlers import logchat
 from bot.models import LogMessage, Signup, Team, User, now
 from bot.services import audit, deals, events, settings, teams
-from bot.ui import BRAND, TAGLINE, at, clean, doc, esc, notify, ok, quote, safe_text, show, title, warn
+from bot.ui import (BRAND, TAGLINE, alink, at, card, cf, clean, doc, esc, files_to, mark, notify, ok, quote, safe_text,
+                    show, stamp, title, verdict, warn)
 
 log = logging.getLogger(__name__)
 ROLES = {"seller": "P2P-продавец", "buyer": "Покупатель"}
@@ -38,17 +39,19 @@ REJECT_DEFAULT = "заявка не подходит под условия се�
 class Gated(Filter):
     """The user still waits to be let in (or fills the application)."""
 
-    async def __call__(self, event, user: User | None = None, is_admin: bool = False) -> bool:
-        return (user is not None and not is_admin and user.access != "approved"
-                and settings.get("signup_review") == "1")
+    async def __call__(self, event, user: User | None = None, is_admin: bool = False, s=None) -> bool:
+        if user is None or is_admin or user.access == "approved" or settings.get("signup_review") != "1":
+            return False
+        from bot.services import operators
+        return not (s is not None and await operators.is_operator(s, user.id))  # staff: let in whatever they applied
 
 
 router = Router()
 router.message.filter(Gated())
 router.callback_query.filter(Gated())
 admin_router = Router()  # decisions: in the log chat's topic or in the admin panel
-admin_router.message.filter(F.from_user.id.in_(config.admin_ids))
-admin_router.callback_query.filter(F.from_user.id.in_(config.admin_ids))
+admin_router.message.filter(IsAdmin())
+admin_router.callback_query.filter(IsAdmin())
 
 
 class SignupForm(StatesGroup):
@@ -112,11 +115,10 @@ def _support():
 async def cmd_start(m: Message, bot: Bot, s: AsyncSession, user: User, state: FSMContext,
                     command: CommandObject | None = None):
     """/start t<team> (or o<deal>_t<team>) from a team link: he joins the team right away, the entry still waits."""
-    payload = (command.args or "") if command else ""
-    if "t" in payload:
-        tid = payload.rsplit("t", 1)[-1]
-        if tid.isdigit() and (team := await s.get(Team, int(tid))):
-            await teams.join(s, user, team)
+    from bot.handlers.commands import START
+    found = START.match((command.args or "").strip() if command else "")
+    if found and found[2] and (team := await s.get(Team, int(found[2]))):
+        await teams.join(s, user, team)
     await gate_screen(bot, s, user, state)
 
 
@@ -257,22 +259,25 @@ async def msg_any(m: Message, bot: Bot, s: AsyncSession, user: User, state: FSMC
 # ---------- the application card in the log chat ----------
 
 async def card_text(s: AsyncSession, su: Signup) -> str:
+    """The application card (admin chat and panel); the decision line is drawn from the data, so every copy of the
+    card shows who decided."""
     u = await s.get(User, su.user_id)
     team = await s.get(Team, u.team_id) if u and u.team_id else None
-    status = {"pending": f"{logchat.WAIT} на рассмотрении", "approved": f"{logchat.GOOD} одобрена",
-              "rejected": f"{logchat.BAD} отклонена"}[su.status]
-    lines = [f"📝 <b>Заявка на вход #{su.id}</b> · {status}", "",
-             f"• Кто: {await logchat.who(s, su.user_id)}",
-             f"• Роль: <b>{ROLES[su.role]}</b>",
-             f"• Оборот в день: <b>{esc(su.turnover)}</b>",
-             f"• Скриншот: {'прикреплён' if su.proof else 'не нужен (покупатель)'}",
-             f"• Подана: {at(su.created_at, 'dt')}"]
-    if team:
-        lines.append(f"• Пришёл по ссылке команды «{esc(team.name)}»")
+    status = {"pending": f"{mark(logchat.WAIT)} на рассмотрении", "approved": f"{mark(logchat.GOOD)} одобрена",
+              "rejected": f"{mark(logchat.BAD)} отклонена"}[su.status]
+    lines = [f"{pe('pencil')} <b>Заявка на вход {alink('signup', su.id, f'#{su.id}')}</b> · {status}", "",
+             card(cf("Кто", await logchat.who(s, su.user_id), icon="profile"),
+                  cf("Роль", f"<b>{ROLES[su.role]}</b>", icon="shop"),
+                  cf("Оборот в день", f"<b>{esc(su.turnover)}</b>", icon="ruble"),
+                  cf("Скриншот", "прикреплён" if su.proof else "не нужен (покупатель)", icon="clip"),
+                  cf("Пришёл", f"по ссылке команды {alink('team', team.id, f'«{esc(team.name)}»')}" if team else "",
+                     icon="people"),
+                  cf("Причина отказа", esc(su.reason or REJECT_DEFAULT), icon="info") if su.status == "rejected" else ""),
+             "", stamp(su.created_at)]
     if su.status != "pending":
-        lines.append(f"• Решение: {await logchat.who(s, su.admin_id)} · {at(su.decided_at, 'dt')}")
-    if su.status == "rejected":
-        lines.append(f"• Причина: {esc(su.reason or REJECT_DEFAULT)}")
+        admin = await s.get(User, su.admin_id) if su.admin_id else None
+        lines += ["", verdict("ok" if su.status == "approved" else "cross",
+                              "Одобрено" if su.status == "approved" else "Отклонено", admin)]
     return clean("\n".join(lines))
 
 
@@ -334,10 +339,14 @@ async def decide(bot: Bot, s: AsyncSession, admin: User, sid: int, approve: bool
                  "• «Ордерные реквизиты» — заявки покупателей под точную сумму"] if su.role == "seller" else
                 ["• «RUB ⇄ USDT» — введите сумму в рублях, бот сам подберёт реквизиты",
                  "• «Кошелёк» — пополнение и вывод USDT через xRocket"])
+        from bot.handlers.community import missing
+        join = ("Последний шаг — вступить в чат и подписаться на инфо-канал: бот даст ссылки. "
+                if missing(u) else "")
         await notify(bot, u.id, "\n".join([
             f"{pe('ok')} <b>Заявка одобрена — добро пожаловать в {BRAND}</b>",
+            "",
             quote(f"• Роль: <b>{ROLES[su.role]}</b>", *hint),
-            f"Как всё устроено — {doc('start', 'короткая инструкция')}. Нажмите кнопку, чтобы начать.",
+            f"{join}Как всё устроено — {doc('start', 'короткая инструкция')}. Нажмите кнопку, чтобы начать.",
         ]), kb(btn("Открыть главное меню", "menu", "shop", style="success")))
     else:
         await notify(bot, u.id, "\n".join([
@@ -364,7 +373,6 @@ async def signup_card(bot: Bot, s: AsyncSession, admin: User, su: Signup, src=No
         [btn("Одобрить", f"sua:ok:{su.id}", "ok", style="success"),
          btn("Отклонить", f"sua:no:{su.id}", "cross", style="danger")] if su.status == "pending" else None,
         btn("Отклонить с причиной", f"asu:rs:{su.id}", "pencil") if su.status == "pending" else None,
-        btn("Профиль", f"auv:{su.user_id}", "profile"),
         back("asu", "Заявки на вход")), src)
 
 
@@ -381,7 +389,7 @@ async def cb_list(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User, state
         title(pe("pencil"), "Заявки на вход" + (": все" if show_all else "")),
         quote(f"• Ждут решения: <b>{pending}</b>",
               f"• Вход по заявке: <b>{settings.human('signup_review')}</b> — меняется в «Настройки → Правила»"),
-        "Заявки приходят и в лог-чат, в ветку «📝 Заявки на вход» — решать можно прямо там." if rows else
+        "Заявки приходят и в админ-чат, в тему «Заявки на вход» — решать можно прямо там." if rows else
         f"{pe('ok')} Новых заявок нет.",
     ]), kb(*[btn(f"#{r.id} · {ROLES[r.role]} · {(users[r.user_id].name if r.user_id in users else '')[:16]} · "
                  f"{r.turnover[:14]}", f"asu:{r.id}", "profile",
@@ -405,9 +413,10 @@ async def cb_proof(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User):
     await c.answer()
     if su and su.proof:
         send = bot.send_photo if su.proof.startswith("photo:") else bot.send_document
+        chat, topic = files_to(c)
         with suppress(TelegramAPIError):
-            await send(user.id, su.proof.removeprefix("photo:"), caption=f"Заявка на вход #{su.id}: скриншот",
-                       reply_markup=kb(back("x", "Скрыть", "cross")))
+            await send(chat, su.proof.removeprefix("photo:"), caption=f"Заявка на вход #{su.id}: скриншот",
+                       reply_markup=kb(back("x", "Скрыть", "cross")), message_thread_id=topic)
 
 
 @admin_router.callback_query(F.data.regexp(r"^asu:rs:(\d+)$"))

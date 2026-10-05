@@ -9,7 +9,7 @@ from sqlalchemy import text
 from bot import models, tasks
 from bot.app import build_dispatcher
 from bot.config import config
-from bot.handlers import commands
+from bot.handlers import commands, logchat
 from bot.services import api, settings, xrocket
 
 
@@ -28,11 +28,16 @@ async def main() -> None:
             raise SystemExit(1)
     async with models.Session() as s:
         await settings.load(s)
-    xrocket.rocket = xrocket.XRocket(config.xrocket_token, config.xrocket_base_url)
+    xrocket.rocket = xrocket.XRocket(xrocket.token(config.xrocket_token), config.xrocket_base_url)
 
     bot = Bot(config.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    logging.getLogger().addHandler(logchat.ErrorTopic(bot))  # the bot's errors -> the admin chat's «Ошибки бота»
     dp = build_dispatcher()
     await commands.setup_commands(bot)
+    try:  # the admin chat's topics in the current layout, with their pins; never blocks the start
+        await logchat.ensure_topics(bot)
+    except Exception:  # noqa: BLE001
+        logging.exception("admin chat topics not set up")
     background = tasks.start(bot)
     runner = None
     if config.api_enabled:

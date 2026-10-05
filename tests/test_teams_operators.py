@@ -94,8 +94,10 @@ def test_team_leader_link_chat_and_one_percent_of_member_deals(go):
         await b.run(msg(LEAD, "/start"), cb(LEAD, "tm"), cb(LEAD, "tm:apply"), msg(LEAD, "Альфа"),
                     msg(LEAD, "Опыт два года, приведу 10 человек"))
         assert "Заявка отправлена" in plain(b.session.last(LEAD))
-        assert "atm:1" in b.session.buttons(ADMIN)
+        await b.deliver()  # the application card with the decision right on it
+        assert {"atm:ok:1", "atm:no:1", "atm:1"} <= set(b.session.buttons(ADMIN))
         await b.run(cb(ADMIN, "atm:1"), cb(ADMIN, "atm:ok:1"))
+        assert "Одобрено · U1" in plain(b.session.last(ADMIN))  # the verdict and who took it
         assert "https://t.me/straitpay_bot?start=t1" in plain(b.session.last(LEAD))
 
         await b.run(group_msg(OTHER, TEAM_CHAT, "/team"))  # not a leader: refused
@@ -125,7 +127,15 @@ def test_team_leader_link_chat_and_one_percent_of_member_deals(go):
         await b.run(cb(BUYER, f"dl:rc:{d.id}"), msg(BUYER, document=PDF), cb(MEMBER, f"dl:ok2:{d.id}"))
         d = await deal(d.id)
         assert (d.status, d.team_id, d.team_fee) == ("completed", 1, D("1.04"))  # 1% of 10 400 ₽ / 100
-        assert (await user(LEAD)).balance == D("1.04")
+        leader = await user(LEAD)
+        assert (leader.team_balance, leader.balance) == (D("1.04"), 0)  # onto the team balance, not the main one
+        await b.run(cb(LEAD, "tm"))
+        assert "Командный баланс: 1.04 USDT" in plain(b.session.last(LEAD)) and "tm:out" in b.session.buttons(LEAD)
+        await b.run(cb(LEAD, "tm:out"), cb(LEAD, "tm:out"))  # the second tap: nothing left to move
+        leader = await user(LEAD)
+        assert (leader.team_balance, leader.balance) == (0, D("1.04")) and "пуст" in b.session.alerts()[-1]
+        await b.run(cb(ADMIN, f"auh:{LEAD}"))
+        assert "Журнал сходится" in plain(b.session.last(ADMIN))
         async with models.Session() as s:
             platform = sum((r.delta for r in (await s.scalars(select(Ledger).where(
                 Ledger.user_id.is_(None), Ledger.ref == f"deal:{d.id}"))).all()), D(0))
@@ -146,7 +156,7 @@ def test_requests_go_to_the_community_chat_and_outsiders_are_asked_to_apply(go):
         d = await request(b)
         post = posts(b, CHAT)[-1]
         assert urls(post) == [f"https://t.me/straitpay_bot?start=o{d.id}"]
-        for part in ("Сумма перевода: 52 000 ₽", "Ордер: 500 USDT", "доход мерчанта ≈ +20 USDT"):
+        for part in ("Сумма перевода: 52 000 ₽", "Курс площадки для ордера: 104 ₽", "Зайти в ордер на: 500 USDT"):
             assert part in plain(post.text)
         await b.run(msg(OTHER, f"/start o{d.id}"))  # not an order merchant
         assert "Брать заявки могут ордерные мерчанты" in plain(b.session.last(OTHER))
@@ -189,7 +199,7 @@ def test_withdrawal_fee_is_one_and_a_half_percent(go):
             await money.add(s, BUYER, D(100), "deposit", "dep:0")
             await s.commit()
         await b.run(cb(BUYER, "w"), cb(BUYER, "w:out"))
-        assert "Чек xRocket</b> — мгновенно, комиссия 1.5%" in b.session.last(BUYER)
+        assert "Чек xRocket: мгновенно · 1.5%" in plain(b.session.last(BUYER))
         await b.run(cb(BUYER, "w:wd"), msg(BUYER, "100"))
         assert "Сумма чека: 98.5 USDT" in plain(b.session.last(BUYER))
         await b.run(cb(BUYER, "w:go"))

@@ -14,12 +14,11 @@ from aiogram.types import CallbackQuery, Message
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from bot.config import config
 from bot.emoji import back, btn, kb, pe
 from bot.models import Event, Team, User, now
 from bot.services import deals, events, money, settings, teams
-from bot import guides
-from bot.ui import at, clean, deep_link, esc, notify, ok, quote, show, title, warn
+from bot import guides, ui
+from bot.ui import at, clean, deep_link, esc, field, ok, quote, section, show, title, warn
 
 log = logging.getLogger(__name__)
 router = Router()
@@ -51,10 +50,12 @@ async def team_screen(bot: Bot, s: AsyncSession, user: User, src=None, note: str
         leader = await s.get(User, member.leader_id)
         return await show(bot, user, "\n".join([
             title(pe("people"), f"Команда «{esc(member.name)}»"),
-            quote(f"• Тимлид: {esc(leader.name or '—')}" + (f" @{esc(leader.username)}" if leader.username else ""),
-                  f"• Участников: {await teams.members(s, member)}",
-                  "• Чат команды: " + ("подключён" if member.chat_id else "тимлид ещё не подключил")),
-            "В чат команды приходят заявки покупателей — берите их кнопкой «Взять заявку в боте».",
+            "",
+            field("Тимлид", esc(leader.name or "—") + (f" @{esc(leader.username)}" if leader.username else "")),
+            field("Участников", str(await teams.members(s, member))),
+            field("Чат команды", "подключён" if member.chat_id else "тимлид ещё не подключил"),
+            "",
+            quote("В чат команды приходят заявки покупателей — берите их кнопкой «Взять заявку в боте»."),
         ]) + note, kb(btn("Вступить в чат команды", "tm:chat", "people", style="success") if member.chat_id else None,
                       btn("Ордерные реквизиты", "om", "key"), back("menu", "В меню")), src)
     lines = [title(pe("people"), "Команды Strait Pay"),
@@ -97,22 +98,46 @@ async def leader_screen(bot: Bot, s: AsyncSession, user: User, team: Team, src=N
     await show(bot, user, "\n".join([
         title(pe("people"), f"Команда «{esc(team.name)}» · тимлид"),
         "" if active else f"{pe('pause')} <b>Команда приостановлена администрацией</b>",
-        "<b>Команда</b>",
-        quote(f"• Участников: <b>{members}</b>", chat_line,
-              f"• Ваш процент: <b>{money.fmt(teams.pct(team), 3)}%</b> от каждой сделки участника"),
-        "<b>Реферальная ссылка</b>",
+        "",
+        section("people", "Команда"),
+        field("Участников", f"<b>{members}</b>"),
+        chat_line.removeprefix("• ").replace("Чат: ", "<b>Чат:</b> ", 1),
+        field("Ваш процент", f"<b>{money.fmt(teams.pct(team), 3)}%</b> от каждой сделки участника"),
+        "",
+        section("key", "Реферальная ссылка"),
         f"<code>{esc(link)}</code>",
-        "Кто запустит бота по ней — попадёт в команду и получит приглашение в ваш чат.",
-        "<b>Доход тимлида</b>",
-        quote(f"• Сегодня: <b>+{money.usdt(day[2])} USDT</b> · {day[0]} сделок на {money.fmt(day[1])} ₽",
-              f"• 7 дней: +{money.usdt(week[2])} USDT · {week[0]} на {money.fmt(week[1])} ₽",
-              f"• Всего: +{money.usdt(total[2])} USDT · {total[0]} на {money.fmt(total[1])} ₽"),
-        "" if team.chat_id else "<b>Как подключить чат</b>\n" + quote(
+        "",
+        section("up", "Доход тимлида"),
+        field("Командный баланс", f"<b>{money.usdt(user.team_balance)} USDT</b> — переведите на основной и выводите"),
+        field("Сегодня", f"<b>+{money.usdt(day[2])} USDT</b> · {day[0]} сделок на {money.fmt(day[1])} ₽"),
+        field("7 дней", f"+{money.usdt(week[2])} USDT · {week[0]} на {money.fmt(week[1])} ₽"),
+        field("Всего", f"+{money.usdt(total[2])} USDT · {total[0]} на {money.fmt(total[1])} ₽"),
+        "",
+        quote("Кто запустит бота по ссылке — попадёт в команду и получит приглашение в ваш чат.") if team.chat_id
+        else section("support", "Как подключить чат") + "\n" + quote(
             "1. Создайте группу и добавьте в неё бота администратором",
             "2. Права бота: «Приглашать пользователей» и «Закреплять сообщения»",
             "3. Отправьте в группе команду /team — бот привяжет чат к команде"),
-    ]) + note, kb(btn("Скопировать ссылку", icon="key", copy=link, style="primary"),
-                  btn("Участники", "tm:m", "list"), btn("Обновить", "tm", "refresh"), back("menu", "В меню")), src)
+    ]).replace("\n\n\n", "\n\n") + note, kb(
+        btn(f"На основной баланс · {money.usdt(user.team_balance)} USDT", "tm:out", "wallet", style="success")
+        if user.team_balance > 0 else None,
+        btn("Скопировать ссылку", icon="key", copy=link, style="primary"),
+        btn("Участники", "tm:m", "list"), back("menu", "В меню")), src)
+
+
+@router.callback_query(F.data == "tm:out")
+async def cb_team_out(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User):
+    """The leader's team earnings -> his main balance (from there: «Кошелёк» → «Вывести»)."""
+    u = await money.lock(s, user.id)
+    amount = u.team_balance
+    if amount <= 0:
+        return await c.answer("Командный баланс пуст", show_alert=True)
+    await money.team_to_balance(s, u.id, amount)
+    team = await teams.led_by(s, u.id)
+    events.add(s, f"team:{team.id}" if team else f"user:{u.id}", "team_out",
+               f"Тимлид перевёл {money.usdt(amount)} USDT с командного баланса на основной", u.id, notice=True)
+    await s.commit()
+    await team_screen(bot, s, u, c, ok(f"{money.usdt(amount)} USDT на основном балансе — вывести можно в «Кошелёк»."))
 
 
 @router.callback_query(F.data == "tm:m")
@@ -213,19 +238,12 @@ async def f_about(m: Message, bot: Bot, s: AsyncSession, user: User, state: FSMC
     await s.flush()
     events.add(s, f"team:{team.id}", "submitted", f"Заявка на команду «{team.name}»: {about[:200]}", user.id, alert=True)
     await s.commit()
-    for aid in config.admin_ids:
-        await notify(bot, aid, "\n".join([f"{pe('people')} <b>Новая заявка на команду</b>",
-                                          f"• Команда: <b>{esc(team.name)}</b>",
-                                          f"• Тимлид: {esc(user.name or '—')} @{esc(user.username or '—')} "
-                                          f"(<code>{user.id}</code>)",
-                                          f"• О себе: {esc(about[:300])}"]),
-                     kb(btn("Открыть заявку", f"atm:{team.id}", "search", style="primary"), back("x", "Скрыть", "cross")))
     await team_screen(bot, s, user, note=ok("Заявка отправлена. Обычно рассматриваем в течение суток."))
 
 
 # ---------- /team in a group: the leader connects his chat ----------
 
-@router.message(Command("team"), F.chat.type.in_({"group", "supergroup"}))
+@router.message(Command("team"), F.chat.type.in_({"group", "supergroup"}), lambda _: ui.place.get() is None)
 async def cmd_team(m: Message, bot: Bot, s: AsyncSession):
     team = await teams.led_by(s, m.from_user.id)
     if team is None or team.status != "approved":
@@ -245,7 +263,7 @@ async def cmd_team(m: Message, bot: Bot, s: AsyncSession):
                    "с кнопкой «Взять заявку в боте». Участники получают личную ссылку в чат в разделе «Команда».")
 
 
-@router.message(Command("help"), F.chat.type.in_({"group", "supergroup"}))
+@router.message(Command("help"), F.chat.type.in_({"group", "supergroup"}), lambda _: ui.place.get() is None)
 async def cmd_group_help(m: Message, bot: Bot):
     """/help in the community or a team chat: the guides with links and a way into the bot."""
     await m.answer(clean("\n".join([
@@ -260,6 +278,7 @@ async def cmd_group_help(m: Message, bot: Bot):
         btn("Все инструкции", url=guides.index_url()) if guides.index_url() else None))
 
 
-@router.message(F.chat.type.in_({"group", "supergroup"}))
+@router.message(F.chat.type.in_({"group", "supergroup"}), lambda _: ui.place.get() is None)
 async def group_other(m: Message):
-    """Any other command that got through to a group (e.g. /team@another_bot): ignored, groups have no screens."""
+    """Any other command that got through to a group (e.g. /team@another_bot): ignored, groups have no screens.
+    Not the admin chat: an admin's commands and answers there go on to the admin routers."""
