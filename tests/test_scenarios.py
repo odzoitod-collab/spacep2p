@@ -163,8 +163,20 @@ def test_no_limits_on_new_deals_and_cancellations(go):
         async with models.Session() as s:
             assert await s.scalar(select(func.count(Deal.id)).where(Deal.status == "cancelled")) == 6
         d = await create_deal(b, "1000")
-        await b.run(cb(BUYER, "buy:0"))  # one open deal at a time: its screen is the buyer's current step
-        assert f"dl:{d.id}" in b.session.buttons(BUYER) and f"сделка #{d.id}" in plain(b.session.last(BUYER))
+        await b.run(cb(BUYER, "buy:0"))  # an open deal does not stop a new purchase: it is listed, the amount asked
+        assert f"dl:{d.id}" in b.session.buttons(BUYER) and "Открытых сделок: 1" in plain(b.session.last(BUYER))
+        async with models.Session() as s:
+            from bot.services import settings
+            await settings.put(s, "buyer_max_open", "2")
+            await s.commit()
+        await b.run(msg(BUYER, "52000"), cb(BUYER, "orb:go"))  # a second one: a request for requisites
+        async with models.Session() as s:
+            assert await s.scalar(select(func.count(Deal.id)).where(Deal.status.in_(("waiting_payment",
+                                                                                     "searching")))) == 2
+        await b.run(cb(BUYER, "buy:0"), msg(BUYER, "52000"), cb(BUYER, "orb:go"))  # the third: over the limit
+        assert any("2 неоплаченных сделок" in a for a in b.session.alerts())
+        await b.run(cb(BUYER, "menu"))
+        assert sum(1 for x in b.session.buttons(BUYER) if x and x.startswith("dl:")) == 2  # both in the menu
     go(fn)
 
 

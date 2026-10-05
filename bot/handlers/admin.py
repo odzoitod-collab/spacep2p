@@ -172,16 +172,17 @@ SETTING_ICONS = ["percent", "clock", "wallet", "lock", "info", "key"]  # one per
 # short names for the overview: every setting in one line of its section
 SHORT = {"rate": "курс", "order_rate": "ордер", "seller_pct": "карта", "platform_pct": "площадка",
          "deposit_fee": "пополнение", "withdraw_pct": "вывод", "withdraw_fee": "чек +", "chain_withdraw_fee": "кошелёк +",
-         "team_pct": "тимлиду", "deal_minutes": "оплата", "confirm_minutes": "спор через",
+         "team_pct": "тимлиду", "deal_minutes": "оплата", "buyer_max_open": "сделок сразу", "confirm_minutes": "спор через",
          "escalate_minutes": "автоспор", "late_hold_minutes": "залог", "late_minutes": "поздний чек",
          "online_minutes": "смена", "deposit_min": "пополнение от", "withdraw_min": "вывод от",
-         "chain_withdraw_min": "на кошелёк от", "adjust_approval_usdt": "второй админ от", "withdraw_turnover": "вывод прокрученного", "receipt_images": "чеки",
-         "log_all": "лог", "signup_review": "вход", "join_required": "чат и канал", "support": "поддержка",
+         "chain_withdraw_min": "на кошелёк от", "adjust_approval_usdt": "второй админ от", "withdraw_turnover": "прокрутка", "receipt_images": "чеки",
+         "log_all": "лог", "signup_review": "вход", "join_required": "чат и канал", "support": "поддержка", "manager": "менеджер",
          "tutorial": "«как это работает»", "manual_url": "памятка", "docs_url": "инструкции", "chat_id": "чат",
          "channel_id": "канал", "channel_autopost_hours": "автопост", "order_min_rub": "от", "order_max_rub": "до", "order_search_minutes": "поиск",
          "order_take_minutes": "реквизиты", "order_link_minutes": "ссылка", "order_pay_minutes": "оплата от",
          "order_check_minutes": "оператору", "strike_limit": "пропусков", "strike_sleep_hours": "пауза",
-         "rep_min_count": "оценок", "rep_low": "без Bybit <", "rep_mid": "лимит <", "rep_mid_max_rub": "до"}
+         "rep_min_count": "оценок", "rep_low": "без Bybit <", "rep_mid": "лимит <", "rep_mid_max_rub": "до",
+         "late_hold_minutes": "залог", "escalate_minutes": "автоспор"}
 
 
 def _brief(key: str) -> str:
@@ -198,13 +199,13 @@ async def settings_screen(bot: Bot, user: User, src=None, note: str = ""):
     lines = [
         title(pe("settings"), "Настройки"),
         "",
-        f"10 000 ₽ → покупателю {money.usdt(q.buyer_credit)} USDT · площадке: карта {money.usdt(q.platform_fee)}, "
-        f"ордер {money.usdt(qo.platform_fee)}",
+        f"10 000 ₽ → {money.usdt(q.buyer_credit)} USDT · площадке {money.usdt(q.platform_fee)} / "
+        f"{money.usdt(qo.platform_fee)}",
     ]
     for (name, keys), icon in zip(settings.GROUPS, SETTING_ICONS):
         lines += ["", section(icon, name),
                   " · ".join(f"{SHORT.get(k, k)} <b>{esc(_brief(k))}</b>" for k in keys)]
-    lines += ["", quote("Открытые сделки сохраняют условия. Изменить — раздел кнопкой ниже.")]
+    lines += ["", quote("Изменить — раздел кнопкой ниже.")]
     await show(bot, user, "\n".join(lines) + note, kb(
         *[btn(name, f"asg:{i}", "pencil") for i, (name, _) in enumerate(settings.GROUPS)],
         back("a", "Админ-панель"),
@@ -555,7 +556,8 @@ def _role_line(label: str, data: tuple) -> str:
 WD_LABEL = {"queued": "ждёт средств xRocket", "cancelled": "отменён пользователем", "pending": "отправляется",
             "sending": "отправляется", "sent": "в сети", "unknown": "требует проверки",
             "done": "выполнен", "failed": "не выполнен"}
-DEP_LABEL = {"new": "создаётся", "active": "ждёт оплаты", "paid": "зачислен", "expired": "истёк", "failed": "не создан"}
+DEP_LABEL = {"new": "создаётся", "active": "ждёт оплаты", "paid": "зачислен", "expired": "истёк", "failed": "не создан",
+             "cancelled": "отменён пользователем"}
 
 
 async def user_screen(bot: Bot, s: AsyncSession, admin: User, u: User, src=None, note: str = "", found=None):

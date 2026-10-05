@@ -2,6 +2,7 @@
 Bybit order or from the balance, giving requisites or the order link), operators (accepting a Bybit order, giving its
 requisites) and the broadcast of requests — to every merchant and into the community and team chats.
 Money and state transitions live in services/orders.py."""
+import re
 from contextlib import suppress
 from datetime import timedelta
 from decimal import Decimal
@@ -16,11 +17,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.emoji import back, btn, kb, pe
 from bot.handlers.deal import deal_screen, log as deal_log, push
-from bot.handlers.seller import BANKS, check_bank, check_holder, check_requisites, mask
-from bot.models import Card, Deal, Event, OrderMerchant, OrderOffer, Team, User, now
+from bot.handlers.seller import BANKS, check_bank, check_holder, check_requisites
+from bot.models import Deal, Event, OrderMerchant, OrderOffer, Team, User, now
 from bot.services import deals, events, money, operators, orders, settings
-from bot.ui import (at, clean, close_kb, deep_link, esc, field, manual, notify, ok, person, quote, safe_text, section,
-                    show, title,
+from bot.ui import (at, clean, close_kb, deep_link, esc, field, manual, mark, notify, ok, person, quote, safe_text,
+                    section, show, title,
                     warn)
 
 router = Router()
@@ -61,13 +62,86 @@ def offer_kb(d: Deal, u: User, rep_problem: str = ""):
               back("x", "Скрыть", "cross"))
 
 
+CLOSED_TEXT = {"completed": "Выполнена — покупатель получил USDT", "cancelled": "Закрыта", "void": "Закрыта администрацией",
+               "expired": "Закрыта: покупатель не оплатил вовремя"}
+
+
+def _steps(d: Deal) -> list[tuple[str, str]]:
+    """The way of this request, step by step: (step, what it is waiting for when it is the current one)."""
+    take = ("Мерчант взял заявку", "ждём мерчанта")
+    if d.via_bybit and d.status != "searching":
+        mid = [("Ссылка на Bybit-ордер получена", f"ждём ссылку до {d.expires_at.astimezone(deals.MSK):%H:%M} МСК"
+                if d.status == "assigned" else ""),
+               ("Оператор выдал реквизиты", "оператор проверяет ордер" if d.operator_id else "ждём оператора")]
+    else:
+        mid = [("Реквизиты выданы", "мерчант готовит реквизиты")]
+    return [take, *mid, ("Покупатель оплатил", "ждём перевод и чек"), ("Оплата подтверждена", "чек на проверке")]
+
+
+def _done(d: Deal) -> int:
+    """How many steps of _steps(d) are behind."""
+    order = {"searching": 0, "assigned": 1, "waiting_payment": None, "paid": None, "dispute": None, "completed": None}
+    n = len(_steps(d))
+    if d.status == "checking":
+        return 2
+    if d.status == "waiting_payment":
+        return n - 2
+    if d.status in ("paid", "dispute"):
+        return n - 1
+    if d.status == "completed":
+        return n
+    return order.get(d.status) or 0
+
+
 def chat_text(d: Deal) -> str:
-    return "\n".join([
-        f"{pe('bell')} <b>Новая заявка #{d.id} · {money.fmt(d.amount_rub)} ₽</b>",
-        *filter(None, request_facts(d)),
-        "",
-        "Взять — кнопкой ниже: в боте выберете Bybit-ордер (без баланса) или работу с баланса бота.",
-    ])
+    """The post of a request in the community and team chats: the request, then its way — what is done, what it is
+    waiting for now. The bot edits it as the request moves on."""
+    closed = d.status in CLOSED_TEXT or d.status == "void"
+    head = (f"{pe('ok') if d.status == 'completed' else pe('cross')} <b>Заявка #{d.id} · {money.fmt(d.amount_rub)} ₽"
+            f"</b> · {CLOSED_TEXT.get(d.status, 'закрыта')}" if closed else
+            f"{pe('bell')} <b>{'Новая заявка' if d.status == 'searching' else 'Заявка'} #{d.id} · "
+            f"{money.fmt(d.amount_rub)} ₽</b>")
+    lines = [head, quote(*request_facts(d)[:-1]) if not closed else ""]
+    if d.status == "searching":
+        lines += [f"{pe('clock')} <b>Ищем мерчанта</b> до {at(d.expires_at)} · ссылка на ордер — за "
+                  f"{settings.get('order_link_minutes')} мин",
+                  "Взять — кнопкой ниже: в боте выберете Bybit-ордер (без баланса) или работу с баланса."]
+    elif not closed or d.status == "completed":
+        steps, done = _steps(d), _done(d)
+        lines.append(section("list", "Ход заявки"))
+        for i, (step, wait) in enumerate(steps):
+            mark_ = "✅" if i < done else "⏳" if i == done else "▫️"
+            lines.append(f"{mark(mark_)} {step}" + (f" — <i>{wait}</i>" if i == done and wait else ""))
+        if d.status == "dispute":
+            lines.append(f"{pe('flag')} <b>Спор</b> — решает администрация")
+    return "\n".join(x for x in lines if x)
+
+
+def chat_markup(bot_link: str, d: Deal):
+    return kb(btn("Взять заявку в боте", url=bot_link, icon="fire", style="success")) if d.status == "searching" \
+        else None
+
+
+_posted: dict[tuple[int, int], str] = {}  # (chat, message) -> the text last put there: unchanged posts are not edited
+
+
+async def sync_chat_posts(bot: Bot, s: AsyncSession, d: Deal) -> None:
+    """Every chat post of this request shows its current state (the take button only while it is searching)."""
+    rows = (await s.execute(select(OrderOffer.user_id, OrderOffer.msg_id).where(
+        OrderOffer.deal_id == d.id, OrderOffer.kind == "chat", OrderOffer.msg_id.is_not(None)))).all()
+    for chat, mid in rows:
+        team = await s.scalar(select(Team.id).where(Team.chat_id == chat))
+        text = clean(chat_text(d))
+        if _posted.get((chat, mid)) == text:
+            continue
+        markup = chat_markup(await deep_link(bot, f"o{d.id}" + (f"_t{team}" if team else "")), d)
+        try:
+            await safe_text(lambda t: bot.edit_message_text(chat_id=chat, message_id=mid, text=t, reply_markup=markup,
+                                                            disable_web_page_preview=True), text)
+        except TelegramAPIError as e:
+            if "not modified" not in str(e):
+                continue
+        _posted[(chat, mid)] = text
 
 
 async def chats(s: AsyncSession) -> list[tuple[int, int | None]]:
@@ -100,9 +174,10 @@ async def broadcast(bot: Bot, s: AsyncSession, d: Deal, first: bool = True) -> i
             continue
         payload = f"o{d.id}" + (f"_t{team}" if team else "")
         try:
-            markup = kb(btn("Взять заявку в боте", url=await deep_link(bot, payload), icon="fire", style="success"))
+            markup = chat_markup(await deep_link(bot, payload), d)
             m = await safe_text(lambda t: bot.send_message(chat, t, reply_markup=markup, disable_web_page_preview=True),
                                 clean(chat_text(d)))
+            _posted[(chat, m.message_id)] = clean(chat_text(d))
             in_chats += 1
         except TelegramAPIError as e:
             m = None
@@ -119,8 +194,10 @@ async def broadcast(bot: Bot, s: AsyncSession, d: Deal, first: bool = True) -> i
 
 
 async def close_offers(bot: Bot, s: AsyncSession, d: Deal, text: str, keep: int | None = None,
-                       kinds: tuple[str, ...] = ("merchant", "chat", "operator")) -> None:
-    """Remove the buttons from every copy of this request (merchants, chats, operators), except `keep`'s."""
+                       kinds: tuple[str, ...] = ("merchant", "operator")) -> None:
+    """Remove the buttons from every copy of this request sent to merchants and operators, except `keep`'s. The chat
+    posts are not closed: they show the request's way (sync_chat_posts)."""
+    kinds = tuple(k for k in kinds if k != "chat")
     for uid, mid, kind in await orders.forget_offers(s, d.id, kinds):
         if uid == keep:
             continue
@@ -131,6 +208,7 @@ async def close_offers(bot: Bot, s: AsyncSession, d: Deal, text: str, keep: int 
                                                             reply_markup=None if kind == "chat" else close_kb()),
                             clean(body))
     await s.commit()
+    await sync_chat_posts(bot, s, d)
 
 
 # ---------- buyer: a request for requisites under the exact amount (the amount comes from handlers/market) ----------
@@ -186,10 +264,39 @@ async def request_cancelled(bot: Bot, s: AsyncSession, d: Deal) -> None:
 # ---------- merchant: take a request (from an offer, the cabinet or a chat link) ----------
 
 class OrderGive(StatesGroup):
-    bank = State()
     number = State()
-    holder = State()
     link = State()
+
+
+BANK_ALIASES = {"сбер": "Сбербанк", "тинькофф": "Т-Банк", "тинек": "Т-Банк", "тиньк": "Т-Банк", "т-банк": "Т-Банк",
+                "т банк": "Т-Банк", "тбанк": "Т-Банк", "альфа": "Альфа-Банк", "втб": "ВТБ", "райф": "Райффайзен",
+                "озон": "Озон Банк", "газпром": "Газпромбанк", "совком": "Совкомбанк"}
+NUMBER = re.compile(r"\+?\d[\d\s()\-]{8,}\d")
+
+
+def parse_requisites(raw: str) -> tuple[tuple[str, str, str, str] | None, str]:
+    """One message «card number or SBP phone + bank» (the recipient's name optional, on its own line) ->
+    ((kind, number, bank, holder), "") or (None, what is wrong)."""
+    found = NUMBER.search(raw)
+    if not found:
+        return None, "Не вижу номера карты или телефона"
+    digits = re.sub(r"\D", "", found.group())
+    kind = "card" if len(digits) >= 16 else "sbp"
+    number, err = check_requisites(kind, digits)
+    if not number:
+        return None, err
+    lines = [" ".join(x.split()) for x in (raw[:found.start()] + "\n" + raw[found.end():]).splitlines()]
+    lines = [x for x in (y.strip(" ,;:—-") for y in lines) if x.strip(".")]
+    if not lines:
+        return None, "Добавьте банк получателя"
+    lines[0] = lines[0].strip(".")
+    low = lines[0].lower()
+    bank = next((v for k, v in BANK_ALIASES.items() if low.startswith(k)), None) or \
+        next((b for b in BANKS if low == b.lower()), None) or check_bank(lines[0])
+    if not bank:
+        return None, "Название банка — от 2 до 40 символов"
+    holder = check_holder(" ".join(lines[1:])) or "" if len(lines) > 1 else ""
+    return (kind, number, bank, holder), ""
 
 
 def link_line(d: Deal) -> str:
@@ -270,19 +377,22 @@ async def _mine(s: AsyncSession, user: User, did: int) -> Deal | None:
 
 
 async def give_screen(bot: Bot, s: AsyncSession, user: User, d: Deal, state: FSMContext, src=None, note: str = ""):
-    await state.set_state(None)
+    """Requisites in one message: a card number or an SBP phone and the bank — nothing to pick, no old cards."""
+    await state.set_state(OrderGive.number)
     await state.update_data(g_deal=d.id)
-    templates = await orders.last_requisites(s, user.id)
     operator = d.status == "checking"
-    await show(bot, user, _give_head(d) + ("Выдайте покупателю свои реквизиты — рубли придут на них, USDT покупателю "
-                                           "зачислит площадка:" if operator and not d.bybit_url else
-                                           "Откройте ордер, сверьте сумму и курс, зайдите в него и выдайте покупателю "
-                                           "реквизиты из ордера. Реквизитов нет или ссылка не та — «Проблема с "
-                                           "ордером»." if operator else
-                                           "Выдайте реквизиты, на которые покупатель переведёт рубли:") + note, kb(
+    await show(bot, user, _give_head(d) + "\n".join([
+        "Откройте ордер, сверьте сумму и курс, зайдите в него и пришлите реквизиты из ордера. Реквизитов нет или "
+        "ссылка не та — «Проблема с ордером»." if operator and d.bybit_url else
+        "Пришлите свои реквизиты — рубли придут на них, USDT покупателю зачислит площадка." if operator else
+        "Пришлите реквизиты, на которые покупатель переведёт рубли.",
+        "",
+        quote("<b>Одним сообщением: номер карты или телефон СБП и банк</b>",
+              "• <code>2200 7001 2345 6781 Сбербанк</code>",
+              "• <code>+7 900 123-45-67 Т-Банк</code>",
+              "ФИО получателя — по желанию, второй строкой."),
+    ]) + note, kb(
         btn("Открыть ордер Bybit", url=d.bybit_url, icon="shop", style="success") if operator and d.bybit_url else None,
-        *[btn(f"{t.bank} {mask(t)} · {t.holder[:18]}", f"orq:tpl:{d.id}:{t.id}", "refresh") for t in templates],
-        [btn("Новая карта", f"orq:k:{d.id}:card", "card"), btn("Новый СБП", f"orq:k:{d.id}:sbp", "sbp")],
         btn("Вернуть в поиск", f"opq:back:{d.id}", "refresh") if operator and not d.bybit_url else
         btn("Проблема с ордером", f"opq:pr:{d.id}", "warn", style="danger") if operator
         else btn("Отказаться", f"orq:drop:{d.id}", "cross"),
@@ -603,64 +713,8 @@ async def cb_after_timeout(c: CallbackQuery, bot: Bot, s: AsyncSession, user: Us
         await _tell_striked(bot, d.seller_id, d, count, sleep)
 
 
-@router.callback_query(F.data.regexp(r"^orq:tpl:(\d+):(\d+)$"))
-async def cb_template(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User, state: FSMContext):
-    _, _, did, cid = c.data.split(":")
-    d = await _mine(s, user, int(did))
-    t = await s.get(Card, int(cid))
-    if not d or not t or t.user_id != user.id:
-        return await c.answer("Заявка уже не у вас", show_alert=True)
-    await state.update_data(g_deal=d.id, g_kind=t.kind, g_bank=t.bank, g_number=t.requisites, g_holder=t.holder)
-    await _confirm_give(bot, s, user, d, state, await _default_minutes(s, user), c)
-
-
-@router.callback_query(F.data.regexp(r"^orq:k:(\d+):(card|sbp)$"))
-async def cb_kind(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User, state: FSMContext):
-    _, _, did, kind = c.data.split(":")
-    d = await _mine(s, user, int(did))
-    if not d:
-        return await c.answer("Заявка уже не у вас", show_alert=True)
-    await state.update_data(g_deal=d.id, g_kind=kind)
-    await state.set_state(OrderGive.bank)
-    rows = [[btn(b, f"orq:b:{d.id}:{i + j}", "bank") for j, b in enumerate(BANKS[i:i + 2])]
-            for i in range(0, len(BANKS), 2)]
-    await show(bot, user, _give_head(d) + "Банк получателя — выберите или напишите:",
-               kb(*rows, back(f"orq:give:{d.id}", "Назад")), c)
-
-
-async def _ask_number(bot, user, state: FSMContext, d: Deal, bank: str, src=None, err: str = ""):
-    await state.update_data(g_bank=bank)
-    await state.set_state(OrderGive.number)
-    kind = (await state.get_data())["g_kind"]
-    await show(bot, user, _give_head(d) + f"Банк: <b>{esc(bank)}</b>\n\n" + (
-        "Номер карты (16–19 цифр):" if kind == "card" else "Телефон для СБП (+7…):") + (warn(err) if err else ""),
-        kb(back(f"orq:give:{d.id}", "Назад")), src)
-
-
-@router.callback_query(OrderGive.bank, F.data.regexp(r"^orq:b:(\d+):(\d+)$"))
-async def cb_bank(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User, state: FSMContext):
-    _, _, did, i = c.data.split(":")
-    d = await _mine(s, user, int(did))
-    if not d or int(i) >= len(BANKS):
-        return await c.answer("Заявка уже не у вас", show_alert=True)
-    await _ask_number(bot, user, state, d, BANKS[int(i)], c)
-
-
 async def _deal_from_state(s, user, state) -> Deal | None:
     return await _mine(s, user, (await state.get_data()).get("g_deal", 0))
-
-
-@router.message(OrderGive.bank, F.text)
-async def msg_bank(m: Message, bot: Bot, s: AsyncSession, user: User, state: FSMContext):
-    d = await _deal_from_state(s, user, state)
-    if not d:
-        await state.clear()
-        return await show(bot, user, warn("Заявка уже не у вас"), close_kb())
-    bank = check_bank(m.text)
-    if not bank:
-        return await show(bot, user, _give_head(d) + "Банк получателя:" + warn("Название от 2 до 40 символов"),
-                          kb(back(f"orq:give:{d.id}", "Назад")))
-    await _ask_number(bot, user, state, d, bank)
 
 
 @router.message(OrderGive.number, F.text)
@@ -669,28 +723,11 @@ async def msg_number(m: Message, bot: Bot, s: AsyncSession, user: User, state: F
     if not d:
         await state.clear()
         return await show(bot, user, warn("Заявка уже не у вас"), close_kb())
-    data = await state.get_data()
-    value, err = check_requisites(data["g_kind"], m.text)
-    if not value:
-        return await _ask_number(bot, user, state, d, data["g_bank"], err=err)
-    await state.update_data(g_number=value)
-    await state.set_state(OrderGive.holder)
-    await show(bot, user, _give_head(d) + "ФИО получателя так, как его увидит покупатель при переводе "
-                                          "(например, <code>Иван Иванович И.</code>):",
-               kb(back(f"orq:give:{d.id}", "Назад")))
-
-
-@router.message(OrderGive.holder, F.text)
-async def msg_holder(m: Message, bot: Bot, s: AsyncSession, user: User, state: FSMContext):
-    d = await _deal_from_state(s, user, state)
-    if not d:
-        await state.clear()
-        return await show(bot, user, warn("Заявка уже не у вас"), close_kb())
-    fio = check_holder(m.text)
-    if not fio:
-        return await show(bot, user, _give_head(d) + "ФИО получателя:" + warn("Буквами, минимум 2 слова"),
-                          kb(back(f"orq:give:{d.id}", "Назад")))
-    await state.update_data(g_holder=fio)
+    got, err = parse_requisites(m.text)
+    if not got:
+        return await give_screen(bot, s, user, d, state, note=warn(err))
+    kind, number, bank, holder = got
+    await state.update_data(g_kind=kind, g_bank=bank, g_number=number, g_holder=holder)
     await state.set_state(None)
     await _confirm_give(bot, s, user, d, state, await _default_minutes(s, user))
 
@@ -732,7 +769,7 @@ async def _confirm_give(bot, s: AsyncSession, user: User, d: Deal, state: FSMCon
         "Проверьте — покупатель переведёт именно сюда:",
         quote(f"{pe('bank')} {esc(data['g_bank'])} · {'СБП' if data['g_kind'] == 'sbp' else 'карта'}",
               f"{pe('key')} <code>{esc(data['g_number'])}</code>",
-              f"{pe('profile')} {esc(data['g_holder'])}",
+              f"{pe('profile')} {esc(data['g_holder'])}" if data["g_holder"] else "",
               f"{pe('clock')} На оплату: <b>{minutes} мин</b>"),
     ]), kb(btn("Выдать реквизиты", f"orq:ok:{d.id}", "ok", style="success"),
            [btn("Другое время", f"orq:tm:{d.id}", "clock"), btn("Другие реквизиты", f"orq:give:{d.id}", "pencil")],
@@ -756,7 +793,7 @@ async def cb_give_ok(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User, st
         return await c.answer(str(e), show_alert=True)
     await state.clear()
     who = (f"Оператор {person(user)} выдал реквизиты" if d.via_bybit else f"Мерчант {person(user)} выдал реквизиты")
-    deal_log(s, d, "requisites", f"{who}: {data['g_bank']} •• {data['g_number'][-4:]}, {data['g_holder']}, "
+    deal_log(s, d, "requisites", f"{who}: {data['g_bank']} •• {data['g_number'][-4:]}, {data['g_holder'] or 'без ФИО'}, "
                                  f"оплата {data['g_minutes']} мин", notice=True)
     rating = None
     if d.via_bybit and d.operator_id == user.id:

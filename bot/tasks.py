@@ -102,7 +102,9 @@ async def escalate_unanswered_deals(bot: Bot) -> None:
 async def poll_deposits(bot: Bot) -> None:
     """Every open invoice is checked each run (read-only API calls, xRocket allows it)."""
     async with Session() as s:
-        deps = (await s.scalars(select(Deposit).where(Deposit.status.in_(("active", "new")))
+        deps = (await s.scalars(select(Deposit).where(
+            Deposit.status.in_(("active", "new"))  # and a cancelled one for a day: a late payment is still credited
+            | ((Deposit.status == "cancelled") & (Deposit.created_at > now() - timedelta(hours=25))))
                                 .order_by(Deposit.id).limit(300))).all()
         for dep in deps:
             try:
@@ -257,6 +259,18 @@ async def stats_topic(bot: Bot) -> None:
         await finance_handlers.publish(bot, s)
 
 
+async def chat_posts(bot: Bot) -> None:
+    """The requests' posts in the chats follow their status: taken, link received, requisites, paid, done."""
+    from bot.models import OrderOffer
+    async with Session() as s:
+        ids = (await s.scalars(select(Deal.id).where(
+            Deal.id.in_(select(OrderOffer.deal_id).where(OrderOffer.kind == "chat")),
+            Deal.created_at > now() - timedelta(days=1),
+            Deal.status.in_(deals.OPEN) | (Deal.closed_at > now() - timedelta(hours=1))))).all()
+        for did in ids:
+            await order_handlers.sync_chat_posts(bot, s, await s.get(Deal, did))
+
+
 async def channel_autopost(bot: Bot) -> None:
     from bot.handlers import channel
     async with Session() as s:
@@ -346,4 +360,5 @@ def start(bot: Bot) -> list[asyncio.Task]:
             asyncio.create_task(loop(payout_queue, bot, 30)),
             asyncio.create_task(loop(stats_topic, bot, 600)),
             asyncio.create_task(loop(chat_pin, bot, 300)),
-            asyncio.create_task(loop(channel_autopost, bot, 600))]
+            asyncio.create_task(loop(channel_autopost, bot, 600)),
+            asyncio.create_task(loop(chat_posts, bot, 5))]

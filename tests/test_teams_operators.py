@@ -122,7 +122,8 @@ def test_team_leader_link_chat_and_one_percent_of_member_deals(go):
         assert f"orq:take:{d.id}:w" in b.session.buttons(MEMBER)
         await b.run(cb(MEMBER, f"orq:take:{d.id}:w"))
         edited = [m for m in b.session.calls if type(m).__name__ == "EditMessageText" and m.chat_id == TEAM_CHAT]
-        assert edited and "уже взята" in plain(edited[-1].text)
+        assert edited and "✅ Мерчант взял заявку" in plain(edited[-1].text)  # the post follows the request
+        assert edited[-1].reply_markup is None  # no take button once it is taken
         await give(b, MEMBER, d.id)
         await b.run(cb(BUYER, f"dl:rc:{d.id}"), msg(BUYER, document=PDF), cb(MEMBER, f"dl:ok2:{d.id}"))
         d = await deal(d.id)

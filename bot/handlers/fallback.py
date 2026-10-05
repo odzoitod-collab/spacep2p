@@ -16,8 +16,9 @@ router = Router()
 @router.message()
 async def any_message(m: Message, bot: Bot, s: AsyncSession, user: User, is_admin: bool, state: FSMContext):
     await state.set_state(None)
-    d = await deals.open_deal_of(s, user.id)
-    if (m.document or m.photo) and d and d.status == "waiting_payment" and d.buyer_id == user.id:
+    waiting = [d for d in await deals.open_deals_of(s, user.id) if d.status == "waiting_payment"]
+    d = waiting[0] if len(waiting) == 1 else None  # with several unpaid deals the receipt must be attached to one
+    if (m.document or m.photo) and d:
         # e.g. input state was lost on restart: a PDF during an unpaid deal is its receipt
         return await process_receipt(bot, s, user, d, m, state)
     await main_menu(bot, s, user, is_admin, note=warn(

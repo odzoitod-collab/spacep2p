@@ -104,3 +104,45 @@ def test_bought_usdt_go_out_at_once_even_next_to_a_locked_deposit(go):
         await b.run(cb(BUYER, "w:wd"), msg(BUYER, "94"), cb(BUYER, "w:go"))
         assert b.rocket.cheques and (await user(BUYER)).balance == D(100)  # all the bought USDT left at once
     go(fn)
+
+
+def test_a_deposit_can_be_cancelled_and_a_late_payment_is_still_credited(go):
+    from bot import tasks
+    from bot.models import Deposit
+
+    async def fn(b):
+        await ready(b)
+        b.rocket.invoice_status = "active"  # not paid yet
+        await b.run(cb(BUYER, "w:dep"), msg(BUYER, "50"))
+        assert "w:dc:1" in b.session.buttons(BUYER)
+        await b.run(cb(BUYER, "w:dc:1"), cb(BUYER, "w:dc:1"))
+        assert "Пополнение #1 отменено" in plain(b.session.last(BUYER))
+        assert "уже оплачено или закрыто" in b.session.alerts()[-1]  # the second tap changes nothing
+        await b.run(cb(BUYER, "w"))
+        assert "w:dp:1" not in b.session.buttons(BUYER)  # no longer «ждёт оплаты»
+        await tasks.poll_deposits(b.bot)
+        async with models.Session() as s:
+            assert (await s.get(Deposit, 1)).status == "cancelled"
+        b.rocket.invoice_status = "paid"  # he paid after all
+        await tasks.poll_deposits(b.bot)
+        async with models.Session() as s:
+            assert (await s.get(Deposit, 1)).status == "paid"
+        assert (await user(BUYER)).balance == D("97.0225")  # what came (98.5) minus the fee: nothing lost
+    go(fn)
+
+
+def test_command_menu_is_short_and_has_the_manager(go):
+    from bot.handlers.commands import COMMANDS
+
+    async def fn(b):
+        assert [c for c, _ in COMMANDS] == ["start", "buy", "sell", "wallet", "deals", "help", "manager"]
+        await ready(b)
+        await b.run(cb(ADMIN, "as:manager"), msg(ADMIN, "@strait_manager"))
+        await b.run(msg(BUYER, "/manager"))
+        assert "@strait_manager" in plain(b.session.last(BUYER))
+        assert "https://t.me/strait_manager" in b.session.buttons(BUYER)
+        await b.run(cb(BUYER, "menu"))
+        assert "https://t.me/strait_manager" in b.session.buttons(BUYER)  # «Вопросы менеджеру» in the menu
+        await b.run(cb(BUYER, "info"))
+        assert "Вопросы — менеджеру @strait_manager" in plain(b.session.last(BUYER))
+    go(fn)

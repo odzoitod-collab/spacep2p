@@ -14,7 +14,7 @@ from bot.emoji import back, btn, kb, pe
 from bot.models import Operator, OrderMerchant, Ticket, User, now
 from bot.services import deals, events, money, operators, settings
 from bot.handlers.wallet import withdraw_terms
-from bot.ui import BRAND, field, manual, ok, quote, section, show, title, warn
+from bot.ui import BRAND, esc, field, manual, ok, quote, section, show, title, warn
 
 router = Router()
 TICKETS_PER_HOUR = 5
@@ -29,8 +29,15 @@ def support_url() -> str | None:
     return f"https://t.me/{sup}" if sup else None
 
 
+def manager_url() -> str | None:
+    """The manager for questions (settings: manager); the support account if no manager is set."""
+    nick = settings.get("manager") or settings.get("support")
+    return f"https://t.me/{nick}" if nick else None
+
+
 async def main_menu(bot: Bot, s: AsyncSession, user: User, is_admin: bool, src=None, note: str = "") -> None:
-    active = await deals.open_deal_of(s, user.id)
+    open_ = await deals.open_deals_of(s, user.id)
+    active = open_[0] if open_ else None
     todo = await deals.seller_todo(s, user.id)
     need_check = [d for d in todo if d.status == "paid"]
     om = await s.get(OrderMerchant, user.id)
@@ -49,7 +56,8 @@ async def main_menu(bot: Bot, s: AsyncSession, user: User, is_admin: bool, src=N
         lines += [f"{pe('info')} <b>RUB ⇄ USDT</b> — купить за рубли · <b>USDT ⇄ RUB</b> — продавать на свою "
                   f"карту. Подробно — в {manual('инструкции')}."]
     await show(bot, user, "\n".join(lines) + note, kb(
-        btn(f"Сделка #{active.id}: {deal_hint(active)}", f"dl:{active.id}", "fire", style="primary") if active else None,
+        *[btn(f"Сделка #{d.id}: {deal_hint(d)}", f"dl:{d.id}", "fire", style="primary") for d in open_[:3]],
+        btn(f"Ещё открытых сделок: {len(open_) - 3}", inline="сделки ") if len(open_) > 3 else None,
         btn(f"Проверить оплату ({len(need_check)})", f"dl:{need_check[0].id}", "bell", style="danger")
         if need_check else None,
         btn(f"Кошелёк · {money.usdt(user.balance)} USDT", "w", style="primary"),
@@ -63,6 +71,7 @@ async def main_menu(bot: Bot, s: AsyncSession, user: User, is_admin: bool, src=N
         [btn("Чат", "chat") if settings.get("chat_id") else None,
          btn("Канал", url=settings.raw("channel_link")) if settings.get("channel_id") and settings.raw("channel_link")
          else None],
+        btn("Вопросы менеджеру", url=manager_url()) if manager_url() else None,
         btn("Админ-панель", "a", wide=True) if is_admin else None,
     ), src)
 
@@ -110,10 +119,11 @@ async def info_screen(bot: Bot, user: User, src=None):
         field("Кошелёк", f"пополнение {settings.get('deposit_fee')}% · вывод {withdraw_terms('xrocket')}"),
         field("Тимлиду", f"{settings.get('team_pct')}% со сделок команды"),
         "",
-        quote(f"Проблема? Напишите оператору: номер сделки и ваш ID <code>{user.id}</code>." if url
-              else f"Ваш ID: <code>{user.id}</code>."),
+        quote(f"Вопросы — менеджеру @{esc(settings.get('manager') or settings.get('support'))}: номер сделки и ваш ID "
+              f"<code>{user.id}</code>." if manager_url() else f"Ваш ID: <code>{user.id}</code>."),
     ]), kb(btn("Инструкции", "info:g", "edu", style="primary"),
-           btn("Написать оператору", url=url) if url else None,
+           [btn("Менеджер", url=manager_url()) if manager_url() else None,
+            btn("Поддержка", url=url) if url and url != manager_url() else None],
            back("menu", "В меню")), src)
 
 

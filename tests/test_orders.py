@@ -67,8 +67,8 @@ def offers(b, uid):
 
 
 async def give(b, uid, did, minutes=15):
-    await b.run(cb(uid, f"orq:k:{did}:card"), cb(uid, f"orq:b:{did}:0"), msg(uid, "5536 9138 1234 5672"),
-                msg(uid, "Петров Пётр П."), cb(uid, f"orq:t:{did}:{minutes}"), cb(uid, f"orq:ok:{did}"))
+    await b.run(cb(uid, f"orq:give:{did}"), msg(uid, "5536 9138 1234 5672 Сбербанк\nПетров Пётр П."),
+                cb(uid, f"orq:t:{did}:{minutes}"), cb(uid, f"orq:ok:{did}"))
 
 
 def test_full_order_requisites_flow(go):
@@ -106,9 +106,10 @@ def test_full_order_requisites_flow(go):
         assert (await user(BUYER)).balance == D("488.8") and (await user(M1)).balance == D(500)
         assert (await user(M1)).frozen == 0
 
-        d2 = await request(b, "10400")  # the merchant gives the same requisites again with one tap
+        d2 = await request(b, "10400")  # no old cards and no card/SBP choice: one message with the requisites
         await b.run(cb(M1, f"orq:take:{d2.id}:w"))
-        assert any(x.startswith(f"orq:tpl:{d2.id}:") for x in b.session.buttons(M1) if x)
+        assert not [x for x in b.session.buttons(M1) if x and x.startswith(("orq:tpl", "orq:k"))]
+        assert "Одним сообщением" in plain(b.session.last(M1))
     go(fn)
 
 
@@ -228,11 +229,15 @@ def test_order_cabinet_default_time_and_two_tap_template(go):
         assert "Сегодня: 1 · 52 000 ₽ · +20 USDT" in text and "Результаты" in text  # 520 − 500 at 104 ₽
         d2 = await request(b, "10400")
         await b.run(cb(M1, f"orq:take:{d2.id}:w"))
-        tpl = next(x for x in b.session.buttons(M1) if x and x.startswith(f"orq:tpl:{d2.id}:"))
-        await b.run(cb(M1, tpl))  # tap 1: the saved requisites, default time — straight to the check screen
-        assert "На оплату: 20 мин" in plain(b.session.last(M1)) and f"orq:ok:{d2.id}" in b.session.buttons(M1)
-        await b.run(cb(M1, f"orq:ok:{d2.id}"))  # tap 2
-        assert (await deal(d2.id)).status == "waiting_payment"
+        await b.run(msg(M1, "+7 (900) 123-45-67, тинькофф"))  # one message, default time — the check screen
+        text = plain(b.session.last(M1))
+        assert "Т-Банк · СБП" in text and "+79001234567" in text and "На оплату: 20 мин" in text
+        assert f"orq:ok:{d2.id}" in b.session.buttons(M1)
+        await b.run(cb(M1, f"orq:ok:{d2.id}"))  # one tap
+        d2 = await deal(d2.id)
+        assert d2.status == "waiting_payment"
+        buyer = plain(b.session.last(BUYER))
+        assert "+79001234567" in buyer and "None" not in buyer  # no name given: no empty name line
     go(fn)
 
 
@@ -338,7 +343,7 @@ def test_bybit_order_flow_without_balance(go):
         await b.run(cb(OP2, f"opq:go:{d.id}"))
         assert any("уже принял другой оператор" in a for a in b.session.alerts())
         assert (await deal(d.id)).operator_id == OP
-        await b.run(cb(M1, f"orq:k:{d.id}:card"))  # the merchant cannot give the requisites himself
+        await b.run(cb(M1, f"orq:give:{d.id}"))  # the merchant cannot give the requisites himself
         assert any("уже не у вас" in a for a in b.session.alerts())
         await give(b, OP, d.id)
         d = await deal(d.id)
@@ -484,3 +489,15 @@ def test_api_bybit_order_statuses_history_and_liquidity(go):
                                                               "requisites_check", "awaiting_payment"]
             assert (await c.post(f"/v1/orders/{order['id']}/cancel", headers=auth(token))).status == 200
     go(fn)
+
+
+def test_requisites_in_one_message():
+    from bot.handlers.orders import parse_requisites
+    assert parse_requisites("2200 7001 2345 6781 Сбербанк")[0][1] == "2200700123456781"
+    assert parse_requisites("2200 7001 2345 6789 Сбербанк")[0] is None  # a typo in the card: Luhn
+    assert parse_requisites("5536 9138 1234 5672 Сбер") == (("card", "5536913812345672", "Сбербанк", ""), "")
+    assert parse_requisites("Альфа-Банк 5536913812345672\nИванов Иван") == \
+        (("card", "5536913812345672", "Альфа-Банк", "Иванов Иван"), "")
+    assert parse_requisites("89001234567 Почта Банк") == (("sbp", "+79001234567", "Почта Банк", ""), "")
+    assert parse_requisites("+7 900 123-45-67")[1] == "Добавьте банк получателя"
+    assert parse_requisites("Сбербанк")[1] == "Не вижу номера карты или телефона"

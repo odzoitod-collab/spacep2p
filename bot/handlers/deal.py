@@ -176,7 +176,7 @@ def deal_text(d: Deal, card: Card, viewer_id: int, note: str = "") -> str:
             quote(
                 f"{pe('bank')} {esc(card.bank)} · {kind_label(card)}",
                 f"{pe('key')} <code>{esc(card.requisites)}</code>",
-                f"{pe('profile')} {esc(card.holder)}",
+                f"{pe('profile')} {esc(card.holder)}" if card.holder else "",
                 f"{pe('ruble')} Ровно: <code>{exact(d.amount_rub)}</code> ₽",
             ),
             f"{pe('clock')} Оплатите до <b>{at(d.expires_at)}</b> (осталось {minutes_left(d)} мин).",
@@ -962,8 +962,8 @@ async def dispute_text(s: AsyncSession, d: Deal) -> str:
         quote(
             f"{pe('profile')} Покупатель: {who(buyer)}",
             f"{pe('profile')} Продавец: {who(seller)}",
-            f"{pe('card')} {esc(card.bank)} <code>{esc(card.requisites)}</code> · {esc(card.holder)}"
-            + (" · ордерные реквизиты" if d.is_order else "") if card else
+            f"{pe('card')} {esc(card.bank)} <code>{esc(card.requisites)}</code>"
+            + (f" · {esc(card.holder)}" if card.holder else "") + (" · ордерные реквизиты" if d.is_order else "") if card else
             f"{pe('card')} Реквизиты ещё не выданы" + (f" · перевод из {esc(d.sender_bank)}" if d.sender_bank else ""),
             f"{pe('ruble')} Сумма: <b>{money.fmt(d.amount_rub)} ₽</b> · курс {money.fmt(d.rate)}",
             f"{pe('shop')} Bybit-ордер: {_link(d) if d.bybit_url else 'ссылки ещё нет'} · "

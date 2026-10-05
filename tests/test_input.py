@@ -80,7 +80,7 @@ def test_failure_is_answered_and_dialog_reset(go, monkeypatch):
 
         async def boom(*a, **k):
             raise RuntimeError("db down")
-        monkeypatch.setattr(start.deals, "open_deal_of", boom)
+        monkeypatch.setattr(start.deals, "open_deals_of", boom)
         await b.run(cb(BUYER, "menu"))
         assert any("Не получилось" in a for a in b.session.alerts())  # the button does not spin forever
         await b.run(msg(BUYER, "/start"))

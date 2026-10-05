@@ -288,3 +288,52 @@ def test_leaving_the_chat_by_a_button_ends_the_chat_mode(go):
         async with models.Session() as s:
             assert await s.scalar(select(func.count(DealMessage.id))) == 1  # «второе» is not a chat message
     go(fn)
+
+
+def test_the_chat_post_follows_the_request_step_by_step(go):
+    from bot import tasks
+    from bot.services import settings
+    from tests.test_scenarios import PDF
+
+    chat = -100700
+
+    async def fn(b):
+        await ready(b)
+        await merchant(b, M1, balance=D(0))
+        async with models.Session() as s:
+            await settings.put(s, "chat_id", str(chat))
+            await s.commit()
+
+        def post():
+            texts = [m for m in b.session.calls if getattr(m, "chat_id", None) == chat
+                     and type(m).__name__ in ("SendMessage", "EditMessageText")]
+            return plain(texts[-1].text), texts[-1].reply_markup
+
+        d = await request(b)
+        text, markup = post()
+        assert "Новая заявка" in text and "Ищем мерчанта" in text and markup is not None
+        await b.run(cb(M1, f"orq:take:{d.id}:b"))
+        text, markup = post()
+        assert "✅ Мерчант взял заявку" in text and "⏳ Ссылка на Bybit-ордер получена — ждём ссылку до" in text
+        assert markup is None
+        await b.run(msg(M1, LINK))
+        await tasks.chat_posts(b.bot)
+        assert "⏳ Оператор выдал реквизиты — ждём оператора" in post()[0]
+        await b.run(cb(OP, f"opq:go:{d.id}"))
+        await tasks.chat_posts(b.bot)
+        assert "оператор проверяет ордер" in post()[0]
+        await give(b, OP, d.id)
+        await tasks.chat_posts(b.bot)
+        assert "✅ Оператор выдал реквизиты" in post()[0] and "⏳ Покупатель оплатил — ждём перевод и чек" in post()[0]
+        await b.run(cb(BUYER, f"dl:rc:{d.id}"), msg(BUYER, document=PDF))
+        await tasks.chat_posts(b.bot)
+        assert "✅ Покупатель оплатил" in post()[0] and "⏳ Оплата подтверждена — чек на проверке" in post()[0]
+        n = len(b.session.calls)
+        await tasks.chat_posts(b.bot)  # nothing changed: no edit
+        assert not [m for m in b.session.calls[n:] if getattr(m, "chat_id", None) == chat]
+        await b.run(cb(OP, f"dl:ok2:{d.id}"))
+        await tasks.chat_posts(b.bot)
+        text = post()[0]
+        assert "Выполнена" in text and "✅ Оплата подтверждена" in text and "⏳" not in text
+        assert "4111" not in text and "5536" not in text  # never the requisites in a public chat
+    go(fn)

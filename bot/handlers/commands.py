@@ -28,19 +28,19 @@ from bot.ui import BRAND, TAGLINE, esc, ok, warn
 
 router = Router()
 
+# the «/» menu: what people actually use, named by what it does; other commands still work, they are just not listed
 COMMANDS = [
-    ("start", "Strait Pay: главное меню"),
-    ("buy", "Купить USDT"),
-    ("sell", "Продать USDT: мои карты"),
+    ("start", "Главное меню"),
+    ("buy", "Купить USDT за рубли"),
+    ("sell", "Продать USDT на свою карту"),
     ("wallet", "Кошелёк: пополнить и вывести"),
     ("deals", "Мои сделки"),
-    ("help", "Как это работает и условия"),
-    ("support", "Написать оператору"),
-    ("api", "API для сервисов"),
+    ("help", "Помощь и условия"),
+    ("manager", "Связаться с менеджером"),
 ]
-ADMIN_COMMANDS = COMMANDS + [("admin", "Админ-панель"), ("deal", "Сделка по номеру: /deal 15"),
-                             ("user", "Пользователь: /user ID или @username"), ("find", "Поиск: ID, @ник, #сделка, карта")]
-GROUP_COMMANDS = [("help", "Как работать: инструкции Strait Pay")]
+ADMIN_COMMANDS = COMMANDS + [("admin", "Админ-панель"), ("find", "Поиск: ID, @ник, #сделка, карта"),
+                             ("deal", "Сделка по номеру: /deal 15")]
+GROUP_COMMANDS = [("help", "Инструкции Strait Pay")]
 
 
 DESCRIPTION = (f"{BRAND} — {TAGLINE}.\n\n"
@@ -148,6 +148,24 @@ async def cmd_help(m: Message, bot: Bot, user: User, state: FSMContext):
 async def cmd_support(m: Message, bot: Bot, s: AsyncSession, user: User, state: FSMContext):
     await state.clear()
     await info_screen(bot, user)
+
+
+@router.message(Command("manager"))
+async def cmd_manager(m: Message, bot: Bot, user: User, state: FSMContext):
+    from bot.handlers.start import manager_url
+    from bot.emoji import back, btn, kb, pe
+    from bot.services import settings
+    from bot.ui import quote, show, title
+    await state.clear()
+    url = manager_url()
+    nick = settings.get("manager") or settings.get("support")
+    await show(bot, user, "\n".join([
+        title(pe("support"), "Менеджер Strait Pay"),
+        "",
+        quote(f"Вопросы по работе, условиям и сделкам — @{nick}. Укажите номер сделки и ваш ID "
+              f"<code>{user.id}</code>." if url else "Менеджер пока не назначен — напишите в «Помощь».")]),
+        kb(btn("Написать менеджеру", url=url, icon="support", style="success") if url else None,
+           back("menu", "В меню")))
 
 
 @router.message(Command("api"))

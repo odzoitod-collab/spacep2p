@@ -325,19 +325,6 @@ async def cancel(s: AsyncSession, deal_id: int, to: str = "cancelled", reason: s
     return res
 
 
-async def last_requisites(s: AsyncSession, uid: int, limit: int = 3) -> list[Card]:
-    """Requisites this user (merchant or operator) gave recently, distinct, newest first: one tap to give them again."""
-    rows = (await s.scalars(select(Card).where(Card.user_id == uid, Card.is_deleted, ~Card.is_active,
-                                               Card.id.in_(select(Deal.card_id).where(Deal.is_order)))
-                            .order_by(Card.id.desc()).limit(30))).all()
-    seen, out = set(), []
-    for c in rows:
-        if (c.kind, c.requisites, c.holder, c.bank) not in seen:
-            seen.add((c.kind, c.requisites, c.holder, c.bank))
-            out.append(c)
-    return out[:limit]
-
-
 async def stale(s: AsyncSession) -> tuple[list[int], list[int], list[int]]:
     """(searching, assigned, checking) deal ids past their deadline."""
     t = now()

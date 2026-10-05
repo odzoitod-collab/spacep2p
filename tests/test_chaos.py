@@ -97,16 +97,15 @@ async def act(b, rng: random.Random):
         if d.via_bybit:
             await b.run(msg(d.seller_id, f"{LINK}{rng.randint(1, 10**9)}"))
         else:
-            await b.run(cb(d.seller_id, f"orq:k:{d.id}:card"), cb(d.seller_id, f"orq:b:{d.id}:0"),
-                        msg(d.seller_id, "5536 9138 1234 5672"), msg(d.seller_id, "Петров Пётр П."),
+            await b.run(cb(d.seller_id, f"orq:give:{d.id}"), msg(d.seller_id, "5536 9138 1234 5672 Сбер"),
                         cb(d.seller_id, f"orq:t:{d.id}:15"), cb(d.seller_id, f"orq:ok:{d.id}"))
     elif kind == "operator" and (ds := [d for d in live if d.status == "checking"]):
         d, op = rng.choice(ds), rng.choice(OPERATORS)
         await b.run(cb(op, f"opq:go:{d.id}"))
         what = rng.random()
         if what < 0.5:
-            await b.run(cb(op, f"orq:k:{d.id}:sbp"), cb(op, f"orq:b:{d.id}:1"), msg(op, "+7 900 123-45-67"),
-                        msg(op, "Иван Иванович И."), cb(op, f"orq:t:{d.id}:15"), cb(op, f"orq:ok:{d.id}"))
+            await b.run(msg(op, "+7 900 123-45-67 Т-Банк\nИван Иванович И."), cb(op, f"orq:t:{d.id}:15"),
+                        cb(op, f"orq:ok:{d.id}"))
         else:
             await b.run(cb(op, rng.choice([f"opq:nr:{d.id}", f"opq:nm:{d.id}", f"opq:rj:{d.id}", f"opq:back:{d.id}"])))
         rate = [x for x in b.session.buttons(op) if x and x.startswith("opr:")]

@@ -17,6 +17,7 @@ SPEC: dict[str, tuple[str, str, str]] = {
     "withdraw_pct": ("1.5", "pct", "Комиссия вывода, %"),
     "withdraw_fee": ("0", "dec", "Фикс. комиссия вывода чеком"),
     "deal_minutes": ("30", "int", "Время на оплату сделки"),
+    "buyer_max_open": ("5", "int", "Неоплаченных сделок у покупателя"),
     "confirm_minutes": ("30", "int", "Покупатель может открыть спор через"),
     "escalate_minutes": ("1440", "int", "Автоспор, если продавец молчит"),
     "late_hold_minutes": ("30", "int", "Удержание залога после истечения"),
@@ -27,6 +28,7 @@ SPEC: dict[str, tuple[str, str, str]] = {
     "receipt_images": ("0", "int0", "Формат чеков"),
     "log_all": ("1", "int0", "Лог-чат"),
     "support": ("", "text", "Ник поддержки"),
+    "manager": ("", "text", "Ник менеджера для вопросов"),
     "manual_url": ("https://telegra.ph/Strait-Pay--P2P-obmen-USDT--RUB-v-Telegram-09-27", "url", "Ссылка на инструкцию"),
     "order_min_rub": ("1000", "dec", "Ордер: минимальная сумма"),
     "order_max_rub": ("1000000", "dec", "Ордер: максимальная сумма"),
@@ -65,12 +67,12 @@ SPEC: dict[str, tuple[str, str, str]] = {
 GROUPS: list[tuple[str, list[str]]] = [
     ("Курс и комиссии", ["rate", "order_rate", "seller_pct", "platform_pct", "deposit_fee", "withdraw_pct",
                          "withdraw_fee", "chain_withdraw_fee", "team_pct"]),
-    ("Сроки сделок", ["deal_minutes", "confirm_minutes", "escalate_minutes", "late_hold_minutes", "late_minutes",
+    ("Сроки сделок", ["deal_minutes", "buyer_max_open", "confirm_minutes", "escalate_minutes", "late_hold_minutes", "late_minutes",
                       "online_minutes"]),
     ("Кошелёк и лимиты", ["deposit_min", "withdraw_min", "chain_withdraw_min",
                           "adjust_approval_usdt", "withdraw_turnover"]),
     ("Правила и лог-чат", ["receipt_images", "log_all", "signup_review", "join_required"]),
-    ("Тексты, поддержка, чат", ["support", "tutorial", "manual_url", "docs_url", "chat_id", "channel_id",
+    ("Тексты, поддержка, чат", ["support", "manager", "tutorial", "manual_url", "docs_url", "chat_id", "channel_id",
                                 "channel_autopost_hours"]),
     ("Ордерные реквизиты", ["order_min_rub", "order_max_rub", "order_search_minutes", "order_take_minutes",
                             "order_link_minutes", "order_pay_minutes", "order_check_minutes", "strike_limit",
@@ -101,6 +103,8 @@ HINTS = {
     "strike_limit": "Сколько раз подряд мерчант может не дать реквизиты по своему ордеру (по ответу оператора), "
                     "прежде чем уйдёт на паузу.",
     "strike_sleep_hours": "На сколько часов мерчант уходит на паузу (не получает и не берёт заявки).",
+    "buyer_max_open": "Сколько неоплаченных сделок покупатель может держать одновременно (каждая занимает карту "
+                      "продавца). Оплаченные (с чеком) не считаются.",
     "withdraw_turnover": "1 — пополнение нельзя сразу вывести: выводится только баланс сверх непрокрученных "
                          "пополнений (пополнение уменьшается на USDT, ушедшие покупателям в завершённых сделках). "
                          "Купленное, доход тимлида и начисления админа выводятся сразу. 0 — выключено.",
@@ -275,7 +279,7 @@ def validate(key: str, raw: str) -> str:
         if not raw.lstrip("-").isdigit() or not raw.startswith("-"):
             raise ValueError("Нужен числовой ID группы, начинается с «-», например -1001234567890")
         return raw
-    if key == "support":
+    if key in ("support", "manager"):
         raw = raw.lstrip("@")
         if raw == "-":
             return ""

@@ -77,9 +77,16 @@ def personal():
 
 
 async def open_deal_of(s: AsyncSession, uid: int) -> Deal | None:
+    """The buyer's latest open deal (he may have several)."""
     return await s.scalar(
         select(Deal).where(Deal.buyer_id == uid, personal(), Deal.status.in_(OPEN)).order_by(Deal.id.desc()).limit(1)
     )
+
+
+async def open_deals_of(s: AsyncSession, uid: int) -> list[Deal]:
+    """Every open purchase of this buyer in the bot, newest first."""
+    return list((await s.scalars(select(Deal).where(Deal.buyer_id == uid, personal(), Deal.status.in_(OPEN))
+                                 .order_by(Deal.id.desc()))).all())
 
 
 async def seller_todo(s: AsyncSession, uid: int) -> list[Deal]:
@@ -286,12 +293,16 @@ async def create(s: AsyncSession, buyer: User, card_id: int, amount_rub: Decimal
 
 
 async def check_buyer(s: AsyncSession, buyer: User, amount_rub: Decimal, client=None) -> None:
-    """Who may open a deal now: API limits for a client; a person — any number of deals and cancellations, one
-    open deal at a time (its screen, receipt and timer are the buyer's current step). Buyer row locked."""
+    """Who may open a deal now: API limits for a client; a person — several deals at once, up to buyer_max_open
+    unpaid ones (each holds a seller's card and frozen USDT). Buyer row locked."""
     if client is not None:
         return await _check_client(s, client, amount_rub)
-    if await open_deal_of(s, buyer.id):
-        raise DealError("У вас уже есть открытая сделка")
+    limit = settings.num("buyer_max_open")
+    waiting = await s.scalar(select(func.count(Deal.id)).where(
+        Deal.buyer_id == buyer.id, personal(), Deal.status.in_(UNPAID)))
+    if waiting >= limit:
+        raise DealError(f"У вас уже {waiting} неоплаченных сделок — это предел. Оплатите или отмените одну из них.",
+                        "open_limit")
 
 
 async def _check_client(s: AsyncSession, client, amount_rub: Decimal) -> None:

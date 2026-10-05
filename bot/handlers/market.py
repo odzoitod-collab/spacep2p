@@ -49,14 +49,7 @@ async def cb_sell(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User):
 
 
 async def buy_screen(bot: Bot, s: AsyncSession, user: User, state: FSMContext, src=None, note: str = ""):
-    active = await deals.open_deal_of(s, user.id)
-    if active:
-        await state.set_state(None)
-        return await show(bot, user, "\n".join([
-            title(pe("down"), "RUB ⇄ USDT · покупка USDT"),
-            f"{pe('warn')} У вас открыта сделка #{active.id}. Новую можно создать после неё.",
-        ]) + note, kb(btn(f"Открыть сделку #{active.id}", f"dl:{active.id}", "fire", style="primary"),
-                      back("menu", "В меню")), src)
+    active = await deals.open_deals_of(s, user.id)
     await state.set_state(Buy.amount)
     lo, hi = order_range()
     await show(bot, user, "\n".join([
@@ -65,7 +58,9 @@ async def buy_screen(bot: Bot, s: AsyncSession, user: User, state: FSMContext, s
         "<b>Отправьте сумму в рублях</b>, которую переведёте, например <code>10000</code>.",
         f"Бот сам подберёт реквизиты: готовую карту продавца или реквизиты под вашу сумму от ордерного мерчанта "
         f"(от {money.fmt(lo)} до {money.fmt(hi)} ₽). Подробнее — {doc('buy', 'как купить USDT')}.",
-    ]) + note, kb(back("menu", "В меню")), src)
+        f"{pe('info')} Открытых сделок: <b>{len(active)}</b> — можно вести несколько сразу." if active else "",
+    ]) + note, kb(*[btn(f"Сделка #{d.id} · {money.fmt(d.amount_rub)} ₽", f"dl:{d.id}", "fire") for d in active[:3]],
+                  back("menu", "В меню")), src)
 
 
 @router.message(Buy.amount, F.text)
@@ -88,8 +83,6 @@ async def pick_card(s: AsyncSession, user: User, amount: Decimal) -> Card | None
 async def offer_screen(bot: Bot, s: AsyncSession, user: User, state: FSMContext, amount: Decimal, src=None,
                        note: str = ""):
     """What the buyer gets and how — a card or a request — with one button to start."""
-    if await deals.open_deal_of(s, user.id):
-        return await buy_screen(bot, s, user, state, src)
     card = await pick_card(s, user, amount)
     lo, hi = order_range()
     if card is None and not lo <= amount <= hi:

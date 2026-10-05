@@ -341,8 +341,24 @@ async def deposit_screen(bot: Bot, user: User, dep: Deposit, src=None, note: str
             f"Оплатите до {at(dep.created_at + timedelta(hours=1))}. Проверка — автоматически раз в минуту.",
         ])
         rows = [btn("Оплатить в xRocket", icon="wallet", url=dep.link, style="success") if dep.link else None]
-    await show(bot, user, text + note, kb(*rows, btn("Проверить оплату", f"w:chk:{dep.id}", "refresh"),
+    await show(bot, user, text + note, kb(*rows, [btn("Проверить оплату", f"w:chk:{dep.id}", "refresh"),
+                                               btn("Отменить", f"w:dc:{dep.id}", "cross")
+                                               if dep.status == "active" else None],
                                          back("w", "Кошелёк")), src)
+
+
+@router.callback_query(F.data.regexp(r"^w:dc:(\d+)$"))
+async def cb_deposit_cancel(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User):
+    """Changed one's mind: the deposit leaves the wallet. If it is paid anyway, the bot still credits it (it keeps
+    checking a cancelled one for a day)."""
+    dep = await s.get(Deposit, int(c.data.split(":")[2]), with_for_update=True, populate_existing=True)
+    if not dep or dep.user_id != user.id or dep.status != "active":
+        return await c.answer("Пополнение уже оплачено или закрыто", show_alert=True)
+    dep.status = "cancelled"
+    events.add(s, f"dep:{dep.id}", "cancelled", "Пользователь отменил пополнение", user.id, notice=True)
+    await s.flush()
+    await wallet_screen(bot, s, user, c, ok(f"Пополнение #{dep.id} отменено. Если вы всё же успели оплатить — "
+                                            "зачислим автоматически."))
 
 
 async def check_deposit(s: AsyncSession, dep: Deposit) -> str:
@@ -366,6 +382,8 @@ async def check_deposit(s: AsyncSession, dep: Deposit) -> str:
     if received <= 0:
         if st == "paid":
             return "active"
+        if dep.status == "cancelled":  # cancelled and never paid: it simply stays cancelled
+            return "cancelled"
         res = await s.execute(update(Deposit).where(Deposit.id == dep.id, Deposit.status == "active")
                               .values(status="expired"))
         if res.rowcount == 1:
@@ -376,7 +394,8 @@ async def check_deposit(s: AsyncSession, dep: Deposit) -> str:
         return await _repaid(s, dep, received, st)
     credit = credit_of(received)
     expected = dep.amount
-    res = await s.execute(update(Deposit).where(Deposit.id == dep.id, Deposit.status == "active")
+    # a cancelled one that was paid anyway is credited all the same: the money must not get lost
+    res = await s.execute(update(Deposit).where(Deposit.id == dep.id, Deposit.status.in_(("active", "cancelled")))
                           .values(status="paid", credit=credit, amount=received))
     if res.rowcount != 1:
         return "paid"
@@ -395,7 +414,7 @@ async def check_deposit(s: AsyncSession, dep: Deposit) -> str:
 
 async def _repaid(s: AsyncSession, dep: Deposit, received: Decimal, st: str) -> str:
     """An operator's invoice for his debt is paid: no fee, the debt goes down; anything above it goes to his balance."""
-    res = await s.execute(update(Deposit).where(Deposit.id == dep.id, Deposit.status == "active")
+    res = await s.execute(update(Deposit).where(Deposit.id == dep.id, Deposit.status.in_(("active", "cancelled")))
                           .values(status="paid", credit=received, amount=received))
     if res.rowcount != 1:
         return "paid"
