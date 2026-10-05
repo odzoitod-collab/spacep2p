@@ -91,7 +91,7 @@ async def act(b, rng: random.Random):
                                                       file_name="check.pdf")))
     elif kind == "take" and (ds := [d for d in live if d.status == "searching"]):
         d = rng.choice(ds)
-        await b.run(cb(rng.choice(MERCHANTS), f"orq:take:{d.id}:{rng.choice('bbw')}"))
+        await b.run(cb(rng.choice(MERCHANTS), f"orq:take:{d.id}:{rng.choice('bBBw')}"))
     elif kind == "link" and (ds := [d for d in live if d.status == "assigned"]):
         d = rng.choice(ds)
         if d.via_bybit:
@@ -104,13 +104,17 @@ async def act(b, rng: random.Random):
         await b.run(cb(op, f"opq:go:{d.id}"))
         what = rng.random()
         if what < 0.5:
-            await b.run(msg(op, "+7 900 123-45-67 Т-Банк\nИван Иванович И."), cb(op, f"orq:t:{d.id}:15"),
+            await b.run(cb(op, f"orq:req:{d.id}"), msg(op, "+7 900 123-45-67 Т-Банк\nИван Иванович И."), cb(op, f"orq:t:{d.id}:15"),
                         cb(op, f"orq:ok:{d.id}"))
         else:
-            await b.run(cb(op, rng.choice([f"opq:nr:{d.id}", f"opq:nm:{d.id}", f"opq:rj:{d.id}", f"opq:back:{d.id}"])))
+            await b.run(cb(op, rng.choice([f"opq:nr:{d.id}", f"opq:nm:{d.id}", f"opq:rj:{d.id}", f"opq:back:{d.id}",
+                                           f"opq:cl2:{d.id}"])))
         rate = [x for x in b.session.buttons(op) if x and x.startswith("opr:")]
         if rate:
             await b.run(cb(op, rng.choice(rate)))
+    elif kind == "operator" and (ds := [d for d in live if d.status == "waiting_payment" and d.operator_id]):
+        d = rng.choice(ds)  # an operator's deal: recreate the order or close it, no clock does it
+        await b.run(cb(d.operator_id, rng.choice([f"opq:rj:{d.id}", f"opq:cl:{d.id}", f"opq:cl2:{d.id}"])))
     elif kind == "seller" and (ds := [d for d in live if d.status == "paid"]):
         d = rng.choice(ds)
         who = deals.checker(d)

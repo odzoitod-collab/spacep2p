@@ -218,7 +218,9 @@ def test_navigation_is_last_single_row(go):
         await b.run(cb(BUYER, "menu"))
         menu = next(m for m in reversed(b.session.calls) if getattr(m, "reply_markup", None) and m.chat_id == BUYER)
         rows = [[x.text for x in r] for r in menu.reply_markup.inline_keyboard]
-        assert rows[0] == ["Кошелёк · 0 USDT"] and rows[1] == ["RUB ⇄ USDT", "USDT ⇄ RUB"]  # one big, two small
+        assert rows[0] == ["Открыть приложение"]  # the mini app first
+        assert menu.reply_markup.inline_keyboard[0][0].web_app.url == "https://straitpay.best/app"
+        assert rows[1] == ["Кошелёк · 0 USDT"] and rows[2] == ["RUB ⇄ USDT", "USDT ⇄ RUB"]  # one big, two small
     go(fn)
 
 
@@ -292,4 +294,45 @@ def test_a_button_on_a_text_notification_opens_the_screen_with_the_banner(go):
         last = [m for m in b.session.calls if getattr(m, "chat_id", None) == BUYER][-1]
         assert type(last).__name__ == "SendAnimation" and "Strait Pay" in last.caption
         assert any(type(m).__name__ == "DeleteMessage" and m.message_id == note.message_id for m in b.session.calls)
+    go(fn)
+
+
+def test_a_card_without_balance_leaves_the_flow(go):
+    async def fn(b):
+        await ready(b)
+        await b.run(cb(SELLER, "cd:1"))
+        assert "Не видна" not in plain(b.session.last(SELLER))
+        async with models.Session() as s:  # the balance went into deals / was withdrawn: below 2 000 ₽
+            (await s.get(User, SELLER)).balance = D(10)
+            await s.commit()
+        await tasks.cards_flow(b.bot)
+        async with models.Session() as s:
+            assert not (await s.get(Card, 1)).is_active
+        assert "снята с потока" in plain(b.session.last(SELLER)) and "пополните баланс" in plain(b.session.last(SELLER))
+        await b.run(cb(SELLER, "cd:on:1"))
+        assert "Нельзя поставить в поток" in b.session.alerts()[-1]
+    go(fn)
+
+
+def test_admin_sets_operator_debt_and_card_limits(go):
+    from bot.models import Operator
+    from tests.test_scenarios import ADMIN
+
+    async def fn(b):
+        await ready(b)
+        await b.run(cb(ADMIN, f"amd:{SELLER}:+"), msg(ADMIN, "40 получил USDT мимо бота"))
+        async with models.Session() as s:
+            assert (await s.get(Operator, SELLER)).debt == D(40)
+        await b.run(cb(ADMIN, f"amd:{SELLER}:-"), msg(ADMIN, "15 вернул на xRocket"))
+        async with models.Session() as s:
+            assert (await s.get(Operator, SELLER)).debt == D(25)
+
+        await b.run(cb(ADMIN, "amc:max:1"), msg(ADMIN, "7000"))
+        async with models.Session() as s:
+            assert (await s.get(Card, 1)).max_rub == D(7000)
+        await b.run(cb(ADMIN, "amc:max:1"), msg(ADMIN, "1"))  # below the minimum: refused like for the owner
+        assert "Максимум не может быть меньше минимума" in plain(b.session.last(ADMIN))
+        await b.run(cb(ADMIN, "aco:1"), cb(ADMIN, "amc:on:1"))
+        async with models.Session() as s:
+            assert (await s.get(Card, 1)).is_active
     go(fn)

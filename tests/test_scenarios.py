@@ -80,7 +80,7 @@ def test_buyer_happy_path_with_exact_economics(go):
         assert "4111111111111111" in screen and "Иванов Иван" in screen and "Ровно: 10000 ₽" in screen
         assert "Вы получите: 94 USDT" in screen
         await b.run(cb(BUYER, f"dl:rc:{d.id}"), msg(BUYER, document=PDF))
-        assert "Чек отправлен продавцу" in plain(b.session.last(BUYER))
+        assert "Чек отправлен на проверку" in plain(b.session.last(BUYER))
         assert "проверьте поступление" in plain(b.session.last(SELLER))  # document caption to the seller
         await b.run(cb(SELLER, f"dl:ok:{d.id}"), cb(SELLER, f"dl:ok2:{d.id}"), cb(SELLER, f"dl:ok2:{d.id}"))
         s_, b_ = await user(SELLER), await user(BUYER)
@@ -288,17 +288,19 @@ def test_seller_sees_why_card_is_hidden(go):
     async def fn(b):
         await ready(b, balance=D(5))
         await b.run(cb(SELLER, "cd:1"))
-        assert "мало свободного баланса" in plain(b.session.last(SELLER))
+        assert "пополните баланс" in plain(b.session.last(SELLER))  # saved, but not in the flow
+        await b.run(cb(SELLER, "cd:on:1"))
+        assert "Нельзя поставить в поток" in b.session.alerts()[-1]
         async with models.Session() as s:
             (await s.get(User, SELLER)).balance = D(200)
             await s.commit()
-        await b.run(cb(SELLER, "sl:on:0"), cb(SELLER, "cd:1"))
+        await b.run(cb(SELLER, "cd:on:1"), cb(SELLER, "sl:on:0"), cb(SELLER, "cd:1"))
         assert "вы не на смене" in plain(b.session.last(SELLER))
         await b.run(cb(SELLER, "sl:on:1"), cb(SELLER, "sl:on:1"))  # double tap keeps the shift on
         assert (await user(SELLER)).is_online
         await create_deal(b)
         await b.run(cb(SELLER, "cd:1"))
-        assert "занята сделкой #1" in plain(b.session.last(SELLER))
+        assert "По карте идёт сделок: 1 из 3" in plain(b.session.last(SELLER))  # more can go on it
     go(fn)
 
 

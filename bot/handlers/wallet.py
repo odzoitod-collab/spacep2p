@@ -17,7 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from bot.emoji import back, btn, kb, pe
 from bot.models import Deposit, Ledger, Operator, User, Withdrawal, now
 from bot.services import events, money, operators, settings, xrocket
-from bot.ui import at, esc, field, notify, ok, quote, section, show, title, warn
+from bot.ui import app_btn, at, esc, field, notify, ok, quote, section, show, title, warn
 
 log = logging.getLogger(__name__)
 router = Router()
@@ -138,7 +138,7 @@ async def wallet_screen(bot: Bot, s: AsyncSession, user: User, src=None, note: s
         if pending_dep else None,
         [btn("Пополнить", "w:in", "plus", style="success"), btn("Вывести", "w:out", "up", style="danger")],
         *[btn(f"Отменить вывод #{w.id}", f"w:qc:{w.id}") for w in queued],
-        btn("История операций", inline="операции "),
+        [btn("История операций", inline="операции "), app_btn("Кошелёк в приложении")],
         back("menu", "В меню"),
     ), src)
 
@@ -237,8 +237,19 @@ async def msg_deposit(m: Message, bot: Bot, s: AsyncSession, user: User, state: 
         return await show(bot, user, _deposit_prompt(f"Нужно число не меньше {settings.get('deposit_min')}"),
                           kb(back("w:in", "Назад")))
     await state.set_state(None)
+    dep, err = await new_invoice_deposit(s, user, v)
+    if dep is None:
+        return await wallet_screen(bot, s, user, note=warn(err))
+    await deposit_screen(bot, user, dep)
+
+
+async def new_invoice_deposit(s: AsyncSession, user: User, v: Decimal | None) -> tuple[Deposit | None, str]:
+    """A deposit by an xRocket invoice for `v` USDT (the bot and the mini app): (deposit, "") or (None, why).
+    Commits."""
+    if v is None or v < settings.dec("deposit_min"):
+        return None, f"Нужно число не меньше {settings.get('deposit_min')}"
     if not await _deposit_allowed(s, user):
-        return await wallet_screen(bot, s, user, note=warn("Не более 10 пополнений в час"))
+        return None, "Не более 10 пополнений в час"
     dep = Deposit(user_id=user.id, amount=v, credit=credit_of(v))
     s.add(dep)
     await s.flush()
@@ -247,20 +258,20 @@ async def msg_deposit(m: Message, bot: Bot, s: AsyncSession, user: User, state: 
     try:
         inv = await xrocket.rocket.create_invoice(v, f"dep-{dep.id}", f"Пополнение Strait Pay на {v} USDT")
     except xrocket.XRocketError as e:
-        return await _deposit_failed(bot, s, user, dep, e)
+        return None, await _deposit_error(s, user, dep, e)
     dep.invoice_id, dep.link, dep.status = str(inv["id"]), xrocket.XRocket.link(inv), "active"
     events.add(s, f"dep:{dep.id}", "invoice", f"Счёт xRocket {dep.invoice_id} создан", user.id)
     await s.commit()
-    await deposit_screen(bot, user, dep)
+    return dep, ""
 
 
-async def _deposit_failed(bot, s, user, dep: Deposit, e: xrocket.XRocketError, src=None):
+async def _deposit_error(s: AsyncSession, user: User, dep: Deposit, e: xrocket.XRocketError) -> str:
     log.warning("deposit %s: %s", dep.id, e)
     # "new" is re-checked by the poller; an address deposit without its address cannot be paid: failed
     dep.status = "new" if e.uncertain and not dep.invoice_id and not dep.network else "failed"
     events.add(s, f"dep:{dep.id}", "xrocket_error", f"xRocket: {e}"[:500], user.id)
     await s.commit()
-    await wallet_screen(bot, s, user, src, warn(f"Не удалось создать пополнение: {e.human}. Попробуйте позже."))
+    return f"Не удалось создать пополнение: {e.human}. Попробуйте позже."
 
 
 def credit_of(received: Decimal) -> Decimal:
@@ -270,16 +281,27 @@ def credit_of(received: Decimal) -> Decimal:
 @router.callback_query(F.data.regexp(r"^w:adr:([A-Z]{2,5})$"))
 async def cb_address(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User, state: FSMContext):
     await state.set_state(None)
-    net = c.data.split(":")[2]
+    dep, err = await new_address_deposit(s, user, c.data.split(":")[2])
+    if dep is None:
+        return await (c.answer(err, show_alert=True) if err == NET_OFF else wallet_screen(bot, s, user, c, warn(err)))
+    await deposit_screen(bot, user, dep, c)
+
+
+NET_OFF = "Сеть сейчас недоступна"
+
+
+async def new_address_deposit(s: AsyncSession, user: User, net: str) -> tuple[Deposit | None, str]:
+    """An address for USDT in `net` (the bot and the mini app): a live one of this network again, or a new one.
+    (deposit, "") or (None, why). Commits."""
     if net not in await xrocket.networks():
-        return await c.answer("Сеть сейчас недоступна", show_alert=True)
+        return None, NET_OFF
     dep = await s.scalar(select(Deposit).where(
         Deposit.user_id == user.id, Deposit.network == net, Deposit.status == "active", Deposit.address.is_not(None),
         Deposit.expires_at > now() + timedelta(minutes=15)).order_by(Deposit.id.desc()).limit(1))
     if dep:  # a live address of this network: show it again instead of a new one
-        return await deposit_screen(bot, user, dep, c)
+        return dep, ""
     if not await _deposit_allowed(s, user):
-        return await wallet_screen(bot, s, user, c, warn("Не более 10 пополнений в час"))
+        return None, "Не более 10 пополнений в час"
     dep = Deposit(user_id=user.id, amount=Decimal(0), credit=Decimal(0), network=net)
     s.add(dep)
     await s.flush()
@@ -292,13 +314,13 @@ async def cb_address(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User, st
         dep.invoice_id, dep.link = str(inv["id"]), xrocket.XRocket.link(inv)
         addr = await xrocket.rocket.payment_address(dep.invoice_id, net)
     except xrocket.XRocketError as e:
-        return await _deposit_failed(bot, s, user, dep, e, c)
+        return None, await _deposit_error(s, user, dep, e)
     dep.address, dep.status = addr["address"][:128], "active"
     dep.expires_at = _when(addr.get("expiresAt")) or now() + timedelta(hours=ADDRESS_HOURS)
     events.add(s, f"dep:{dep.id}", "address", f"Адрес {dep.address} ({xrocket.net_name(net)}), счёт {dep.invoice_id}",
                user.id)
     await s.commit()
-    await deposit_screen(bot, user, dep, c)
+    return dep, ""
 
 
 def _when(raw: str | None) -> datetime | None:
@@ -507,12 +529,7 @@ def withdraw_prompt(user: User, err: str = "") -> str:
 async def msg_withdraw(m: Message, bot: Bot, user: User, state: FSMContext):
     v = parse_usdt(m.text)
     fee = withdraw_fee(v, "xrocket") if v is not None else Decimal(0)
-    err = ("Введите сумму числом" if v is None
-           else f"Минимум {settings.get('withdraw_min')} USDT" if v < settings.dec("withdraw_min")
-           else "Сумма должна быть больше комиссии" if v <= fee
-           else f"Доступно только {money.usdt(user.balance)} USDT" if v > user.balance
-           else f"Вывести можно только {money.usdt(money.withdrawable(user))} USDT — остальное пополнение ещё не "
-                "прокручено в сделках" if v > money.withdrawable(user) else "")
+    err = withdraw_problem(user, v, "xrocket", fee)
     if err:
         return await show(bot, user, withdraw_prompt(user, err), kb(back("w:out", "Назад")))
     await state.set_state(None)
@@ -542,6 +559,18 @@ async def cb_withdraw_go(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User
     await _submit(bot, s, user, wd, c, f"Запрос вывода чеком: списано {money.usdt(amount)} USDT, чек {money.usdt(amount - fee)}")
 
 
+def withdraw_problem(user: User, v: Decimal | None, method: str, fee: Decimal, xmin: Decimal = Decimal(0)) -> str:
+    """Why `v` USDT cannot be withdrawn ("" — it can): the same rules in the bot and the mini app."""
+    low = settings.dec("withdraw_min" if method == "xrocket" else "chain_withdraw_min")
+    return ("Введите сумму числом" if v is None
+            else f"Минимум {money.usdt(low)} USDT" if v < low
+            else "Сумма должна быть больше комиссии" if v <= fee
+            else f"Доступно только {money.usdt(user.balance)} USDT" if v > user.balance
+            else f"Вывести можно только {money.usdt(money.withdrawable(user))} USDT — остальное пополнение ещё не "
+                 "прокручено в сделках" if v > money.withdrawable(user)
+            else f"После комиссии должно остаться не меньше {money.usdt(xmin)} USDT" if v - fee < xmin else "")
+
+
 def lock_note(user: User) -> str:
     """Why part of the balance cannot be withdrawn yet ("" if all of it can)."""
     free = money.withdrawable(user)
@@ -552,11 +581,24 @@ def lock_note(user: User) -> str:
 
 
 async def _submit(bot: Bot, s: AsyncSession, user: User, wd: Withdrawal, c: CallbackQuery, what: str):
-    """Debit, commit (a crash after this leaves "pending" for the sync tasks), then pay or queue."""
+    if err := await debit_withdrawal(s, user, wd, what):
+        return await c.answer(err, show_alert=True)
+    await c.answer("Отправляем…")
+    result = await pay_or_queue(s, wd)
+    await s.commit()
+    await s.refresh(user)
+    await wallet_screen(bot, s, user, c, payout_note(wd, result))
+    if result == "done":
+        await notify_withdrawal(bot, wd, "done")
+
+
+async def debit_withdrawal(s: AsyncSession, user: User, wd: Withdrawal, what: str) -> str:
+    """Debit and commit (a crash after this leaves "pending" for the sync tasks); then pay_or_queue. "" or why not.
+    The bot and the mini app alike."""
     u = await money.lock(s, user.id)  # the final word, under the row lock: only what was turned over leaves
     if wd.amount > money.withdrawable(u):
-        return await c.answer(f"Вывести можно только {money.usdt(money.withdrawable(u))} USDT: пополнение "
-                              "сначала нужно прокрутить в сделках", show_alert=True)
+        return (f"Вывести можно только {money.usdt(money.withdrawable(u))} USDT: пополнение сначала нужно прокрутить "
+                "в сделках")
     s.add(wd)
     try:
         await s.flush()
@@ -566,15 +608,8 @@ async def _submit(bot: Bot, s: AsyncSession, user: User, wd: Withdrawal, c: Call
     except (money.NotEnough, IntegrityError) as e:
         await s.rollback()
         await s.refresh(user)  # rollback expires every loaded object
-        return await c.answer("Недостаточно средств" if isinstance(e, money.NotEnough) else "Заявка уже обработана",
-                              show_alert=True)
-    await c.answer("Отправляем…")
-    result = await pay_or_queue(s, wd)
-    await s.commit()
-    await s.refresh(user)
-    await wallet_screen(bot, s, user, c, payout_note(wd, result))
-    if result == "done":
-        await notify_withdrawal(bot, wd, "done")
+        return "Недостаточно средств" if isinstance(e, money.NotEnough) else "Заявка уже обработана"
+    return ""
 
 
 ADDRESS = {"TON": r"[A-Za-z0-9_-]{48}|-?[01]:[0-9a-fA-F]{64}", "TRX": r"T[1-9A-HJ-NP-Za-km-z]{33}",
@@ -692,13 +727,7 @@ async def _chain_confirm(bot, user, state: FSMContext, v: Decimal | None, src=No
     data = await state.get_data()
     nf, xmin = await chain_quota(data["t_net"])
     fee = withdraw_fee(v, "chain", nf) if v is not None else Decimal(0)
-    err = ("Введите сумму числом" if v is None
-           else f"Минимум {settings.get('chain_withdraw_min')} USDT" if v < settings.dec("chain_withdraw_min")
-           else "Сумма должна быть больше комиссии" if v <= fee
-           else f"Доступно только {money.usdt(user.balance)} USDT" if v > user.balance
-           else f"Вывести можно только {money.usdt(money.withdrawable(user))} USDT — остальное пополнение ещё не "
-                "прокручено в сделках" if v > money.withdrawable(user)
-           else f"После комиссии должно остаться не меньше {money.usdt(xmin)} USDT" if v - fee < xmin else "")
+    err = withdraw_problem(user, v, "chain", fee, xmin)
     if err:
         return await show(bot, user, _amount_text(user, data, nf, err), kb(back("w:out", "Отмена")), src)
     await state.set_state(None)

@@ -1,5 +1,6 @@
 """Commands mixed with messages: ordering per user, unknown commands, where replies appear, error answers."""
 import asyncio
+from decimal import Decimal as D
 
 from aiogram.types import Chat, Message, Update
 from sqlalchemy import func, select
@@ -88,4 +89,29 @@ def test_failure_is_answered_and_dialog_reset(go, monkeypatch):
         monkeypatch.undo()
         await b.run(msg(BUYER, "50"))  # the broken step was reset: not taken as a deposit amount
         assert "не распознано" in plain(b.session.last(BUYER))
+    go(fn)
+
+
+def test_a_receipt_with_several_unpaid_deals_asks_which_deal(go):
+    from tests.test_scenarios import BUYER, PDF, create_deal, ready
+    from bot import models
+    from bot.models import Deal, Card
+
+    async def fn(b):
+        await ready(b, balance=D(500))
+        async with models.Session() as s:  # a second card so two deals can be open at once
+            c = await s.get(Card, 1)
+            s.add(Card(user_id=c.user_id, kind="card", bank="ВТБ", requisites="5536913812345672", holder="Пётр П",
+                       min_rub=c.min_rub, max_rub=c.max_rub, is_active=True))
+            await s.commit()
+        d1 = await create_deal(b)
+        d2 = await create_deal(b)
+        assert d1.id != d2.id
+        await b.run(msg(BUYER, document=PDF))
+        assert "К какой сделке этот чек?" in plain(b.session.last(BUYER))
+        await b.run(cb(BUYER, f"dl:rcp:{d2.id}"))
+        async with models.Session() as s:
+            assert (await s.get(Deal, d2.id)).status == "paid" and (await s.get(Deal, d1.id)).status == "waiting_payment"
+        await b.run(cb(BUYER, f"dl:rcp:{d1.id}"))  # the kept file is used once
+        assert "пришлите файл ещё раз" in b.session.alerts()[-1]
     go(fn)

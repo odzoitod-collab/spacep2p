@@ -12,11 +12,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from bot.emoji import back, btn, kb, pe
 from bot.models import Deal, Deposit, Operator, User, now
 from bot.services import deals, events, money, operators, xrocket
-from bot.ui import at, esc, ok, quote, show, title, warn
+from bot.ui import at, esc, ok, quote, section, show, title, warn
 
 router = Router()
-WORK = {"checking": "выдать реквизиты", "waiting_payment": "ждём оплату", "paid": "проверьте оплату",
-        "dispute": "спор"}
+WORK = {"assigned": "мерчант пересоздаёт ордер", "checking": "выдать реквизиты", "waiting_payment": "ждём оплату",
+        "paid": "проверьте оплату", "dispute": "спор"}
+# the cabinet's groups, the operator's next step first
+GROUPS = (("paid", "bell", "Проверьте оплату"), ("checking", "key", "Выдайте реквизиты"),
+          ("waiting_payment", "clock", "Ждём перевод покупателя"), ("assigned", "refresh", "Мерчант пересоздаёт ордер"),
+          ("dispute", "flag", "Спор"))
 
 
 async def allowed(s: AsyncSession, uid: int) -> bool:
@@ -40,36 +44,43 @@ async def operator_screen(bot: Bot, s: AsyncSession, user: User, src=None, note:
     working = (await s.scalars(select(Deal).where(Deal.operator_id == user.id, Deal.via_bybit,
                                                   Deal.status.in_(tuple(WORK))).order_by(Deal.id))).all()
     free = (await s.scalars(select(Deal).where(Deal.status == "checking", Deal.operator_id.is_(None),
-                                               Deal.seller_id != user.id).order_by(Deal.id).limit(5))).all()
+                                               Deal.seller_id != user.id, Deal.buyer_id != user.id)
+                            .order_by(Deal.id).limit(5))).all()
     today, week, total = [await _results(s, user.id, since) for since in
                           (deals.day_start(), now() - timedelta(days=7), None)]
     invoice = await s.scalar(select(Deposit).where(Deposit.user_id == user.id, Deposit.purpose == "debt",
                                                    Deposit.status == "active").order_by(Deposit.id.desc()).limit(1))
     active = await operators.is_operator(s, user.id)
-    await show(bot, user, "\n".join([
+    by = {st: [d for d in working if d.status == st] for st, _, _ in GROUPS}
+    await show(bot, user, "\n".join(x for x in [
         title(pe("shop"), "Кабинет оператора"),
-        "" if active else f"{pe('pause')} Вы больше не оператор — погасите остаток долга.",
-        "<b>Долг перед площадкой</b>",
-        quote(f"• Принято по Bybit-ордерам и не погашено: <b>{money.usdt(debt)} USDT</b>",
+        None if active else f"{pe('pause')} Вы больше не оператор — погасите остаток долга.",
+        "",
+        section("fire", "Ваши сделки"),
+        quote(*[f"• {label}: <b>{len(by[st])}</b>" for st, _, label in GROUPS if by[st]])
+        if working else "<i>Принятых ордеров нет.</i>",
+        f"{pe('bell')} Свободных ордеров ждут оператора: <b>{len(free)}</b>" if free else None,
+        "",
+        section("dollar", "Долг перед площадкой"),
+        quote(f"• Принято по ордерам и не погашено: <b>{money.usdt(debt)} USDT</b>",
               f"• Ваш баланс в боте: {money.usdt(user.balance)} USDT",
-              f"• Счёт на погашение #{invoice.id}: {money.usdt(invoice.amount)} USDT ждёт оплаты" if invoice else ""),
-        "Долг растёт, когда вы подтверждаете оплату по ордеру: USDT ордера пришли вам на Bybit. Погасите его счётом "
-        "xRocket или с баланса." if debt else f"{pe('ok')} Долга нет.",
-        "<b>Результаты</b>",
+              f"• Счёт на погашение #{invoice.id}: {money.usdt(invoice.amount)} USDT ждёт оплаты" if invoice else "")
+        if debt else f"{pe('ok')} Долга нет.",
+        "",
+        section("stats", "Результаты"),
         quote(f"• Сегодня: <b>{today[0]}</b> ордеров · {money.usdt(today[1])} USDT",
-              f"• 7 дней: {week[0]} · {money.usdt(week[1])} USDT",
-              f"• Всего: {total[0]} · {money.usdt(total[1])} USDT"),
-        f"{pe('bell')} Свободных ордеров ждут оператора: <b>{len(free)}</b>" if free else "",
-    ]) + note, kb(
-        btn(f"Погасить через xRocket · {money.usdt(debt)} USDT", "op:pay", "wallet", style="success") if debt else None,
+              f"• 7 дней: {week[0]} · {money.usdt(week[1])} USDT · всего {total[0]}"),
+    ] if x is not None) + note, kb(
+        *[btn(f"#{d.id} · {money.fmt(d.amount_rub)} ₽ · {WORK[d.status]}", f"dl:{d.id}" if st != "checking"
+              else f"orq:give:{d.id}", icon, style="danger" if st == "paid" else "primary" if st == "checking" else None)
+          for st, icon, _ in GROUPS for d in by[st]],
+        *([btn(f"Принять ордер #{d.id} · {money.fmt(d.amount_rub)} ₽", f"opq:go:{d.id}", "bell", style="success")
+           for d in free] if active else []),
+        btn(f"Погасить через xRocket · {money.usdt(debt)} USDT", "op:pay", "wallet") if debt else None,
         btn(f"Погасить с баланса · {money.usdt(min(debt, user.balance))} USDT", "op:bal", "dollar")
         if debt and user.balance > 0 else None,
         btn(f"Оплатить счёт #{invoice.id}", url=invoice.link, icon="wallet") if invoice and invoice.link else None,
-        *[btn(f"#{d.id} · {money.usdt(d.seller_debit)} USDT · {WORK[d.status]}", f"dl:{d.id}", "fire",
-              style="primary" if d.status in ("checking", "paid") else None) for d in working],
-        *([btn(f"Принять ордер #{d.id} · {money.usdt(d.seller_debit)} USDT", f"opq:go:{d.id}", "bell")
-           for d in free] if active else []),
-        btn("История долга", "op:h", "list"),
+        [btn("Обновить", "op", "refresh"), btn("История долга", "op:h", "list")],
         back("menu", "В меню"),
     ), src)
 

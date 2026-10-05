@@ -94,7 +94,7 @@ def test_bybit_order_from_another_bot_with_an_operator(go, monkeypatch):
             oid = order["id"]
             assert code == 202 and order["detail"] == "searching_merchant" and order["requisites"] is None
             assert f"orq:take:{oid}:b" in b.session.buttons(M1)
-            await b.run(cb(M1, f"orq:take:{oid}:b"))
+            await b.run(cb(M1, f"orq:take:{oid}:B"))
             assert (await cl.get(oid))["detail"] == "waiting_bybit_order"
             await b.run(cb(M1, f"orq:give:{oid}"))
             from tests.harness import msg
@@ -213,4 +213,31 @@ def test_cancel_dispute_and_late_receipt_through_the_api(go, monkeypatch):
             assert late["status"] == "expired" and late["next_action"] == "upload_late_receipt"
             code, late = await cl.receipt(late["id"])
             assert code == 200 and late["status"] == "verifying"
+    go(fn)
+
+
+def test_payer_id_blocks_and_pauses_one_customer_of_the_client(go, monkeypatch):
+    capture(monkeypatch)
+
+    async def fn(b):
+        await ready(b, balance=D(800))
+        token = await apply_and_approve(b)
+        async with http(b) as c:
+            cl = Client(c, token)
+            code, err = await cl.create("10000", "p-0", payer_id="bad id with spaces")
+            assert code == 422 and err["error"]["code"] == "invalid_payer_id"
+            for i in range(3):  # the same customer abandons three orders
+                code, o = await cl.create(str(10000 + i * 10), f"p-{i}", payer_id="cust-7")
+                assert code == 201 and o["payer_id"] == "cust-7"
+                async with models.Session() as s:
+                    (await s.get(Deal, o["id"])).expires_at = models.now().replace(year=2020)
+                    await s.commit()
+                await tasks.expire_deals(b.bot)
+            code, err = await cl.create("10500", "p-9", payer_id="cust-7")
+            assert code == 429 and err["error"]["code"] == "payer_paused"
+            code, o = await cl.create("10600", "p-10", payer_id="cust-8")  # another customer is fine
+            assert code == 201
+            await b.run(cb(ADMIN, f"apb:{o['id']}"))  # the admin stops taking orders from him
+            code, err = await cl.create("10700", "p-11", payer_id="cust-8")
+            assert code == 403 and err["error"]["code"] == "payer_blocked"
     go(fn)

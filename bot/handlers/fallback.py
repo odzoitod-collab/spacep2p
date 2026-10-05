@@ -4,7 +4,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from bot.handlers.deal import process_receipt
+from bot.handlers.deal import pick_receipt_deal, process_receipt
 from bot.handlers.start import main_menu
 from bot.models import User
 from bot.services import deals
@@ -16,11 +16,17 @@ router = Router()
 @router.message()
 async def any_message(m: Message, bot: Bot, s: AsyncSession, user: User, is_admin: bool, state: FSMContext):
     await state.set_state(None)
-    waiting = [d for d in await deals.open_deals_of(s, user.id) if d.status == "waiting_payment"]
-    d = waiting[0] if len(waiting) == 1 else None  # with several unpaid deals the receipt must be attached to one
-    if (m.document or m.photo) and d:
+    open_ = await deals.open_deals_of(s, user.id)
+    waiting = [d for d in open_ if d.status == "waiting_payment"]
+    if (m.document or m.photo) and len(waiting) == 1:
         # e.g. input state was lost on restart: a PDF during an unpaid deal is its receipt
-        return await process_receipt(bot, s, user, d, m, state)
+        return await process_receipt(bot, s, user, waiting[0], m, state)
+    if (m.document or m.photo) and waiting:  # several unpaid deals: the buyer picks which one it pays
+        return await pick_receipt_deal(bot, s, user, m, state, waiting)
+    if (m.document or m.photo) and any(d.status in ("searching", "assigned", "checking") for d in open_):
+        return await main_menu(bot, s, user, is_admin, note=warn(
+            "Чек пока не нужен: реквизиты по вашей заявке ещё не выданы. Не переводите деньги, пока реквизиты не "
+            "появятся в сделке — тогда переведите и пришлите чек."))
     await main_menu(bot, s, user, is_admin, note=warn(
         "Сообщение не распознано: сейчас бот не ждёт ввода. Выберите действие кнопками ниже — "
         "если вы что-то заполняли, начните этот шаг заново."))

@@ -37,7 +37,7 @@ def test_profile_splits_buys_and_sells_with_outcomes(go):
         await b.run(cb(ADMIN, f"auv:{SELLER}"))
         assert "Продажи: 1 завершено на 10 000 ₽" in plain(b.session.last(ADMIN))
         buttons = b.session.buttons(ADMIN)
-        for data in (f"aud:{SELLER}", f"auh:{SELLER}", f"auc:{SELLER}", f"auw:{SELLER}", f"aadj:{SELLER}",
+        for data in (f"aud:{SELLER}", f"auh:{SELLER}", f"auc:{SELLER}", f"auw:{SELLER}", f"bal:u:{SELLER}",
                      f"dm:0:{SELLER}", f"aub:{SELLER}:1"):
             assert data in buttons, data
     go(fn)

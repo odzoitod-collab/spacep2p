@@ -1,7 +1,7 @@
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
-from sqlalchemy import exists, func, select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.models import Card, Deal, User, now
@@ -11,6 +11,9 @@ OPEN = ("searching", "assigned", "checking", "waiting_payment", "paid", "dispute
 # a merchant works on the deal; his USDT are frozen for it unless it goes through a Bybit order (frozen(d))
 FUNDED = ("assigned", "checking", "waiting_payment", "paid", "dispute")
 UNPAID = ("searching", "assigned", "checking", "waiting_payment")  # nothing transferred yet
+# an operator who accepted a Bybit order owns the deal: no deadline closes it (checking, waiting for the payment),
+# he gives the requisites, asks the merchant to recreate the order or closes the deal himself
+HOLD = timedelta(days=365)
 MAX_EVIDENCE = 15  # per side: one party cannot use up the other's slots
 
 
@@ -27,6 +30,11 @@ def aware(dt: datetime) -> datetime:
 def frozen(d: Deal) -> bool:
     """The seller's USDT are frozen for this deal (not a Bybit order, where the operator receives USDT on Bybit)."""
     return not d.via_bybit
+
+
+def held(d: Deal) -> bool:
+    """The deal is in an operator's hands (a Bybit order he accepted, or an admin's own requisites): no deadline."""
+    return bool(d.via_bybit and d.operator_id and d.status in ("checking", "waiting_payment"))
 
 
 def checker(d: Deal) -> int | None:
@@ -65,10 +73,6 @@ def buyer_preview(amount_rub: Decimal, buyer=None) -> money.Quote:
     """What a buyer gets for amount_rub (the buyer side does not depend on the merchant): for screens before a deal."""
     rate, pct = settings.buyer_terms(buyer)
     return money.split(amount_rub, Decimal("Infinity"), rate, pct)
-
-
-def card_busy():
-    return exists().where(Deal.card_id == Card.id, Deal.status.in_(OPEN))
 
 
 def personal():
@@ -130,6 +134,18 @@ def need_usdt(rub: Decimal, seller: User) -> Decimal:
     return money.seller_debit(rub, settings.dec("rate"), settings.merchant_pct(seller))
 
 
+def flow_problem(card: Card, seller: User) -> str:
+    """Why this card may not be in the flow ("" — it may): its maximum and the seller's free balance must both cover
+    a deal of at least card_min_rub. A card of a seller without balance is never shown to buyers."""
+    low = settings.dec("card_min_rub")
+    if card.max_rub < low:
+        return f"максимум карты меньше {money.fmt(low)} ₽ — поднимите максимум"
+    if money.max_rub(seller.balance, settings.dec("rate"), settings.merchant_pct(seller)) < low:
+        return (f"пополните баланс: карта в потоке — от {money.fmt(low)} ₽, нужно {money.usdt(need_usdt(low, seller))} "
+                f"USDT свободных, у вас {money.usdt(seller.balance)}")
+    return ""
+
+
 def card_visibility(card: Card, seller: User, busy_deal: int | None,
                     used: Decimal = Decimal(0)) -> tuple[bool, str]:
     """Is the card shown to buyers right now, and if not, why (in seller's words)."""
@@ -137,6 +153,8 @@ def card_visibility(card: Card, seller: User, busy_deal: int | None,
         return False, "заблокирована администрацией"
     if seller.is_banned:
         return False, "аккаунт заблокирован"
+    if problem := flow_problem(card, seller):  # first: what to fix before the card can be switched on at all
+        return False, problem
     if not card.is_active:
         return False, "выключена — включите карту"
     if not seller.is_online:
@@ -158,9 +176,35 @@ def card_visibility(card: Card, seller: User, busy_deal: int | None,
     return True, f"сделки от {money.fmt(lo)} до {money.fmt(hi)} ₽{why}"
 
 
-async def busy_cards(s: AsyncSession, uid: int) -> dict[int, int]:
-    rows = await s.execute(select(Deal.card_id, Deal.id).where(Deal.seller_id == uid, Deal.status.in_(OPEN)))
-    return {cid: did for cid, did in rows.all()}
+async def busy_cards(s: AsyncSession, uid: int, full: bool = False) -> dict[int, int]:
+    """{card: an open deal on it}. full=True: only the cards that take no more deals now (card_parallel)."""
+    rows = (await s.execute(select(Deal.card_id, Deal.id).where(Deal.seller_id == uid, Deal.status.in_(OPEN))
+                            .order_by(Deal.id))).all()
+    out, count = {}, {}
+    for cid, did in rows:
+        out.setdefault(cid, did)
+        count[cid] = count.get(cid, 0) + 1
+    return {cid: did for cid, did in out.items() if not full or count[cid] >= settings.num("card_parallel")}
+
+
+async def card_load(s: AsyncSession, card_ids: list[int]) -> dict[int, list[Decimal]]:
+    """Amounts of the open deals on each card."""
+    out = {cid: [] for cid in card_ids}
+    if card_ids:
+        for cid, amount in (await s.execute(select(Deal.card_id, Deal.amount_rub).where(
+                Deal.card_id.in_(card_ids), Deal.status.in_(OPEN)))).all():
+            out[cid].append(amount)
+    return out
+
+
+def card_fits(amounts: list[Decimal], amount: Decimal | None) -> str:
+    """Why one more deal of `amount` cannot go on a card with these open deals ("" — it can): up to card_parallel at
+    once, and the amounts differ by 1 ₽ at least, so the seller tells the transfers apart."""
+    if len(amounts) >= settings.num("card_parallel"):
+        return "Карта сейчас занята другими сделками"
+    if amount is not None and any(abs(a - amount) < 1 for a in amounts):
+        return "На эту карту уже идёт перевод такой же суммы — укажите сумму, отличную хотя бы на 1 ₽"
+    return ""
 
 
 async def completed_count(s: AsyncSession, uids: list[int]) -> dict[int, int]:
@@ -182,7 +226,7 @@ async def market(s: AsyncSession, me: int, amount: Decimal | None, bank: str | N
         .join(User, User.id == Card.user_id)
         .where(
             Card.is_active, ~Card.is_banned, ~Card.is_deleted,
-            User.is_online, ~User.is_banned, Card.user_id != me, ~card_busy(),
+            User.is_online, ~User.is_banned, Card.user_id != me,
         )
         .order_by(Card.min_rub)
     )
@@ -192,8 +236,11 @@ async def market(s: AsyncSession, me: int, amount: Decimal | None, bank: str | N
         q = q.where(Card.kind == kind)
     rows = (await s.execute(q)).all()
     used = await used_today(s, [card.id for card, _ in rows])
+    load = await card_load(s, [card.id for card, _ in rows])
     out = []
     for card, seller in rows:
+        if card_fits(load[card.id], amount):
+            continue
         lo, hi = card_range(card, seller, used[card.id])
         if hi < lo or (amount is not None and not lo <= amount <= hi):
             continue
@@ -244,7 +291,8 @@ async def income_by_day(s: AsyncSession, uid: int, days: int = 7) -> list[tuple[
 
 
 async def create(s: AsyncSession, buyer: User, card_id: int, amount_rub: Decimal,
-                 expect_credit: Decimal | None = None, client=None, external_id: str | None = None) -> Deal:
+                 expect_credit: Decimal | None = None, client=None, external_id: str | None = None,
+                 payer_id: str | None = None) -> Deal:
     """expect_credit: USDT amount the buyer saw on the confirmation screen; terms changed -> error.
     client: ApiClient for an API order — its own limits replace the per-person ones (one open deal, 3 per hour,
     cancellation limit), everything about the card and the seller is checked the same way."""
@@ -255,14 +303,14 @@ async def create(s: AsyncSession, buyer: User, card_id: int, amount_rub: Decimal
         raise DealError("Карта недоступна")
     for uid in sorted((buyer.id, owner)):
         await money.lock(s, uid)
-    await check_buyer(s, buyer, amount_rub, client)
+    await check_buyer(s, buyer, amount_rub, client, payer_id)
     card = await s.get(Card, card_id, with_for_update=True, populate_existing=True)
     if not card or not card.is_active or card.is_banned or card.is_deleted:
         raise DealError("Карта больше недоступна")
     if card.user_id == buyer.id:
         raise DealError("Нельзя купить у себя")
-    if await s.scalar(select(exists().where(Deal.card_id == card.id, Deal.status.in_(OPEN)))):
-        raise DealError("Карта сейчас занята другой сделкой")
+    if problem := card_fits((await card_load(s, [card.id]))[card.id], amount_rub):
+        raise DealError(problem, "card_busy")
     seller = await money.lock(s, card.user_id)
     if not seller.is_online or seller.is_banned:
         raise DealError("Продавец ушёл со смены")
@@ -284,7 +332,7 @@ async def create(s: AsyncSession, buyer: User, card_id: int, amount_rub: Decimal
         rate=rate, seller_pct=sp, platform_pct=cpct if cpct is not None else pp, seller_debit=qt.seller_debit,
         buyer_credit=qt.buyer_credit, platform_fee=qt.platform_fee,
         expires_at=now() + timedelta(minutes=settings.num("deal_minutes")),
-        api_client_id=client.id if client is not None else None, external_id=external_id,
+        api_client_id=client.id if client is not None else None, external_id=external_id, payer_id=payer_id,
     )
     s.add(deal)
     await s.flush()
@@ -292,11 +340,41 @@ async def create(s: AsyncSession, buyer: User, card_id: int, amount_rub: Decimal
     return deal
 
 
-async def check_buyer(s: AsyncSession, buyer: User, amount_rub: Decimal, client=None) -> None:
-    """Who may open a deal now: API limits for a client; a person — several deals at once, up to buyer_max_open
-    unpaid ones (each holds a seller's card and frozen USDT). Buyer row locked."""
+async def abandon_pause(s: AsyncSession, *where) -> datetime | None:
+    """Until when this buyer (or API payer) may not open deals: abandon_limit deals expired without a receipt within
+    24 h — each held a seller's card and USDT for nothing — pause abandon_pause_minutes after the last one."""
+    limit = settings.num("abandon_limit")
+    if not limit:
+        return None
+    rows = (await s.scalars(select(Deal.closed_at).where(
+        *where, Deal.status == "expired", Deal.close_reason == "expired", Deal.receipt_file_id.is_(None),
+        Deal.closed_at > now() - timedelta(hours=24)).order_by(Deal.closed_at.desc()).limit(limit))).all()
+    if len(rows) < limit:
+        return None
+    until = aware(rows[0]) + timedelta(minutes=settings.num("abandon_pause_minutes"))
+    return until if until > now() else None
+
+
+async def check_buyer(s: AsyncSession, buyer: User, amount_rub: Decimal, client=None, payer_id: str | None = None
+                      ) -> None:
+    """Who may open a deal now: API limits for a client (and its payer); a person — several deals at once, up to
+    buyer_max_open unpaid ones (each holds a seller's card and frozen USDT), not on an abandon pause. Buyer row
+    locked."""
     if client is not None:
-        return await _check_client(s, client, amount_rub)
+        await _check_client(s, client, amount_rub)
+        if payer_id:
+            from bot.models import ApiPayerBlock
+            if await s.scalar(select(ApiPayerBlock.id).where(ApiPayerBlock.client_id == client.id,
+                                                             ApiPayerBlock.payer_id == payer_id)):
+                raise DealError("Orders from this payer are not accepted", "payer_blocked")
+            if until := await abandon_pause(s, Deal.api_client_id == client.id, Deal.payer_id == payer_id):
+                raise DealError(f"This payer abandoned {settings.get('abandon_limit')} orders within 24 h: new orders "
+                                f"from him are accepted after {until.isoformat(timespec='minutes')}", "payer_paused")
+        return
+    if until := await abandon_pause(s, Deal.buyer_id == buyer.id, personal()):
+        raise DealError(f"{settings.get('abandon_limit')} сделки за сутки истекли без оплаты — они держали карты "
+                        f"продавцов. Новые сделки — с {until.astimezone(MSK):%H:%M} МСК. Создавайте сделку, только "
+                        "когда готовы перевести.", "abandon_pause")
     limit = settings.num("buyer_max_open")
     waiting = await s.scalar(select(func.count(Deal.id)).where(
         Deal.buyer_id == buyer.id, personal(), Deal.status.in_(UNPAID)))
@@ -352,7 +430,8 @@ async def mark_paid(s: AsyncSession, deal_id: int, buyer_id: int, file_id: str) 
     res = await s.execute(update(Deal).where(
         Deal.id == deal_id, Deal.buyer_id == buyer_id,
         Deal.status == "waiting_payment", Deal.expires_at > now(),
-    ).values(status="paid", receipt_file_id=file_id, paid_at=now()).execution_options(synchronize_session=False))
+    ).values(status="paid", receipt_file_id=file_id, paid_at=now(), reminded=False)
+        .execution_options(synchronize_session=False))
     if res.rowcount != 1:
         return None
     d = await s.get(Deal, deal_id, populate_existing=True)
@@ -448,8 +527,10 @@ async def add_evidence(s: AsyncSession, deal_id: int, uid: int, item: list) -> D
 
 
 async def complete(s: AsyncSession, deal_id: int, frm=("paid", "dispute"), actual_rub: Decimal | None = None,
-                   reason: str = "confirmed") -> Deal | None:
-    """Release coins to buyer. actual_rub re-prices the deal by the amount really received."""
+                   reason: str = "confirmed", operator_debt: bool = True) -> Deal | None:
+    """Release coins to buyer. actual_rub re-prices the deal by the amount really received. operator_debt=False: a
+    Bybit order whose USDT never reached the operator (the merchant did not release them) — the buyer is still
+    credited, but the operator owes nothing: the platform carries it and settles with the merchant."""
     from bot.services import events, operators, teams  # they build on this module's callers, not the other way round
     d = await s.get(Deal, deal_id, with_for_update=True, populate_existing=True)
     if not d or d.status not in frm:
@@ -480,7 +561,7 @@ async def complete(s: AsyncSession, deal_id: int, frm=("paid", "dispute"), actua
     ref = f"deal:{d.id}"
     if frozen(d):
         await money.spend_frozen(s, d.seller_id, d.seller_debit, ref)
-    elif d.operator_id and d.bybit_url:  # a Bybit order: its USDT came to the operator's Bybit account — he owes them
+    elif d.operator_id and d.bybit_url and operator_debt:  # a Bybit order: its USDT came to the operator — he owes them
         op = await operators.accrue(s, d.operator_id, d.seller_debit, ref)
         operators.log(s, d.operator_id, d, "completed", f"долг +{money.usdt(d.seller_debit)} USDT, всего "
                                                         f"{money.usdt(op.debt)} USDT")
@@ -563,8 +644,8 @@ async def on_ban(s: AsyncSession, uid: int) -> tuple[list[Deal], list[Deal]]:
         if d := await _move(s, did, ("paid",), "dispute", dispute_reason="seller_banned"):
             disputed.append(d)
     # an operator: an order he accepted goes back to the other operators, a payment he had to check — to the admins
-    await s.execute(update(Deal).where(Deal.status == "checking", Deal.operator_id == uid, Deal.bybit_url.is_not(None))
-                    .values(operator_id=None).execution_options(synchronize_session=False))
+    _, closed = await orders.drop_operator(s, uid)
+    cancelled += closed
     for did in (await s.scalars(select(Deal.id).where(Deal.status == "paid", Deal.via_bybit,
                                                       Deal.operator_id == uid))).all():
         if d := await _move(s, did, ("paid",), "dispute", dispute_reason="seller_banned"):

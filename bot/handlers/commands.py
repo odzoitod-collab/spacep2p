@@ -39,7 +39,7 @@ COMMANDS = [
     ("manager", "Связаться с менеджером"),
 ]
 ADMIN_COMMANDS = COMMANDS + [("admin", "Админ-панель"), ("find", "Поиск: ID, @ник, #сделка, карта"),
-                             ("deal", "Сделка по номеру: /deal 15")]
+                             ("deal", "Сделка по номеру: /deal 15"), ("balance", "Балансы пользователей")]
 GROUP_COMMANDS = [("help", "Инструкции Strait Pay")]
 
 
@@ -63,6 +63,18 @@ async def setup_commands(bot: Bot) -> None:
                                   scope=BotCommandScopeAllGroupChats())
     for aid in admins.ids():
         await admin_menu(bot, aid, True)
+    await app_menu(bot)
+
+
+async def app_menu(bot: Bot) -> None:
+    """The button next to the input field: «Strait Pay» opens the mini app (no app address — the «/» menu)."""
+    from aiogram.types import MenuButtonCommands, MenuButtonWebApp, WebAppInfo
+
+    from bot import ui
+    url = ui.app_url()
+    with suppress(TelegramAPIError):
+        await bot.set_chat_menu_button(menu_button=MenuButtonWebApp(text="Strait Pay", web_app=WebAppInfo(url=url))
+                                       if url else MenuButtonCommands())
 
 
 async def admin_menu(bot: Bot, uid: int, on: bool) -> None:

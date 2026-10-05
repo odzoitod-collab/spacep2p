@@ -297,6 +297,7 @@ async def reset_db(url: str) -> None:
         await settings.put(s, "signup_review", "0")  # scenarios start from approved users; test_signup turns it on
         await settings.put(s, "join_required", "0")  # the entry gate has its own tests
         await settings.put(s, "withdraw_turnover", "0")  # so has the turnover rule (tests/test_turnover.py)
+        await settings.put(s, "order_first_wave", "0")  # requests to everyone at once; the waves have their own test
         await s.commit()
         await settings.load(s)
 

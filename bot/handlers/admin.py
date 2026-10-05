@@ -179,12 +179,18 @@ SHORT = {"rate": "курс", "order_rate": "ордер", "seller_pct": "карт
          "online_minutes": "смена", "deposit_min": "пополнение от", "withdraw_min": "вывод от",
          "chain_withdraw_min": "на кошелёк от", "adjust_approval_usdt": "второй админ от", "withdraw_turnover": "прокрутка", "receipt_images": "чеки",
          "log_all": "лог", "signup_review": "вход", "join_required": "чат и канал", "support": "поддержка", "manager": "менеджер",
-         "tutorial": "«как это работает»", "manual_url": "памятка", "docs_url": "инструкции", "chat_id": "чат",
+         "tutorial": "о сервисе", "manual_url": "памятка", "docs_url": "инструкции", "chat_id": "чат",
          "channel_id": "канал", "channel_autopost_hours": "автопост", "order_min_rub": "от", "order_max_rub": "до", "order_search_minutes": "поиск",
          "order_take_minutes": "реквизиты", "order_link_minutes": "ссылка", "order_pay_minutes": "оплата от",
          "order_check_minutes": "оператору", "strike_limit": "пропусков", "strike_sleep_hours": "пауза",
          "rep_min_count": "оценок", "rep_low": "без Bybit <", "rep_mid": "лимит <", "rep_mid_max_rub": "до",
-         "late_hold_minutes": "залог", "escalate_minutes": "автоспор"}
+         "late_hold_minutes": "залог", "escalate_minutes": "автоспор", "webapp_url": "приложение",
+         "webapp_link": "app-ссылка", "card_min_rub": "карта от",
+         "operator_max_debt": "долг до", "abandon_limit": "брошенных", "abandon_pause_minutes": "пауза",
+         "card_parallel": "на карту", "order_first_wave": "лучшим", "order_wave_seconds": "через"}
+
+
+OVERVIEW_PER_GROUP = 7
 
 
 def _brief(key: str) -> str:
@@ -205,9 +211,10 @@ async def settings_screen(bot: Bot, user: User, src=None, note: str = ""):
         f"{money.usdt(qo.platform_fee)}",
     ]
     for (name, keys), icon in zip(settings.GROUPS, SETTING_ICONS):
+        shown = keys[:OVERVIEW_PER_GROUP]  # the screen keeps its banner: the rest is one tap away
         lines += ["", section(icon, name),
-                  " · ".join(f"{esc(SHORT.get(k, k))} <b>{esc(_brief(k))}</b>" for k in keys)]
-    lines += ["", quote("Изменить — раздел кнопкой ниже.")]
+                  " · ".join(f"{esc(SHORT.get(k, k))} <b>{esc(_brief(k))}</b>" for k in shown)
+                  + (f" · <i>ещё {len(keys) - len(shown)}</i>" if len(keys) > len(shown) else "")]
     await show(bot, user, "\n".join(lines) + note, kb(
         *[btn(name, f"asg:{i}", "pencil") for i, (name, _) in enumerate(settings.GROUPS)],
         back("a", "Админ-панель"),
@@ -296,6 +303,9 @@ async def msg_setting(m: Message, bot: Bot, s: AsyncSession, user: User, state: 
         await s.execute(sql_update(User).values(**{"in_chat" if key == "chat_id" else "in_channel": False}))
         if key == "channel_id":
             await forget_channel_link(s)
+    if key in ("webapp_url", "docs_url") and old != value:  # the app's address follows: the menu button too
+        from bot.handlers.commands import app_menu
+        await app_menu(bot)
     await state.set_state(None)
     note = ok(f"Сохранено: {esc(settings.human(key, old))} → {esc(settings.human(key))}")
     if data.get("ret") == "acm":
@@ -623,7 +633,7 @@ async def user_screen(bot: Bot, s: AsyncSession, admin: User, u: User, src=None,
         [btn("Карты", f"auc:{u.id}", "card"), btn("Ввод и вывод", f"auw:{u.id}", "wallet")],
         [btn("История", f"aev:user:{u.id}", "list"),
          btn("Мерчант", f"aom:{u.id}", "key") if om and om.status != "rejected" else None],
-        [btn("Написать", f"dm:0:{u.id}", "support"), btn("Баланс", f"aadj:{u.id}", "dollar")],
+        [btn("Написать", f"dm:0:{u.id}", "support"), btn("Баланс", f"bal:u:{u.id}", "dollar")],
         [btn("Ставка мерчанта" + (" · своя" if u.pct_static is not None else ""), f"aup:{u.id}", "star"),
          btn("Условия покупки" + (" · свои" if settings.has_terms(u) else ""), f"aut:{u.id}", "star")],
         btn("Оператор: долг и ордера", f"aop:{u.id}", "shop") if is_op or (oper and oper.debt) else None,
@@ -1037,7 +1047,7 @@ async def cb_cards(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User):
 
 async def admin_card_screen(bot: Bot, s: AsyncSession, admin: User, card: Card, src=None, note: str = ""):
     owner = await s.get(User, card.user_id)
-    busy = (await deals.busy_cards(s, owner.id)).get(card.id)
+    busy = (await deals.busy_cards(s, owner.id, full=True)).get(card.id)
     visible, why = deals.card_visibility(card, owner, busy, (await deals.used_today(s, [card.id]))[card.id])
     state = "Удалена владельцем" if card.is_deleted else "Заблокирована" if card.is_banned \
         else "Включена" if card.is_active else "Выключена"
@@ -1056,7 +1066,12 @@ async def admin_card_screen(bot: Bot, s: AsyncSession, admin: User, card: Card, 
         "",
         quote("«Выключить» — владелец может включить снова; «Заблокировать» — только администрация."),
     ]) + note, kb(
-        btn("Выключить", f"aco:{card.id}", "pause") if card.is_active else None,
+        btn("Выключить", f"aco:{card.id}", "pause") if card.is_active else
+        btn("Поставить в поток", f"amc:on:{card.id}", "ok", style="success") if not card.is_banned and not card.is_deleted
+        else None,
+        [btn("Минимум", f"amc:min:{card.id}", "down"), btn("Максимум", f"amc:max:{card.id}", "up")]
+        if not card.is_deleted else None,
+        btn("Лимит в день", f"amc:daily:{card.id}", "clock") if not card.is_deleted else None,
         btn("Разблокировать", f"acb:{card.id}:0", "ok", style="success") if card.is_banned
         else btn("Заблокировать", f"acb:{card.id}:1", "ban", style="danger"),
         btn(f"Сделка #{busy}", f"adv:{busy}", "fire") if busy else None,
@@ -1156,16 +1171,17 @@ async def cb_files(c: CallbackQuery, bot: Bot, s: AsyncSession):
 
 
 VERDICTS = {"b": "в пользу покупателя", "s": "в пользу продавца (отмена)", "a": "по фактической сумме",
-            "c": "отмена неоплаченной сделки"}
+            "c": "отмена неоплаченной сделки", "n": "в пользу покупателя, USDT оператору не пришли"}
 
 
-@router.callback_query(F.data.regexp(r"^ar:(\d+):([bsac])$"))
+@router.callback_query(F.data.regexp(r"^ar:(\d+):([bsacn])$"))
 async def cb_resolve_ask(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User, state: FSMContext):
     await state.set_state(None)
     _, did, verdict = c.data.split(":")
     d = await s.get(Deal, int(did), populate_existing=True)
     allowed = deals.UNPAID if verdict == "c" else ("paid", "dispute")
-    if not d or d.status not in allowed or (verdict == "a" and d.dispute_amount_rub is None):
+    if not d or d.status not in allowed or (verdict == "a" and d.dispute_amount_rub is None) \
+            or (verdict == "n" and not (d.via_bybit and d.bybit_url)):
         return await c.answer("Сделка уже закрыта или решение недоступно", show_alert=True)
     await show(bot, user, "\n".join([
         f"{pe('warn')} <b>Решение по сделке #{d.id}: {VERDICTS[verdict]}</b>",
@@ -1178,7 +1194,7 @@ async def cb_resolve_ask(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User
            back(f"adv:{d.id}", "Назад", "back")), c)
 
 
-@router.callback_query(F.data.regexp(r"^ar3:(\d+):([bsac])$"))
+@router.callback_query(F.data.regexp(r"^ar3:(\d+):([bsacn])$"))
 async def cb_resolve_comment(c: CallbackQuery, bot: Bot, user: User, state: FSMContext):
     _, did, verdict = c.data.split(":")
     await state.set_state(Adm.verdict)
@@ -1200,7 +1216,7 @@ async def msg_resolve_comment(m: Message, bot: Bot, s: AsyncSession, user: User,
     await resolve(bot, s, user, data["deal"], data["verdict"], comment)
 
 
-@router.callback_query(F.data.regexp(r"^ar2:(\d+):([bsac])$"))
+@router.callback_query(F.data.regexp(r"^ar2:(\d+):([bsacn])$"))
 async def cb_resolve(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User):
     _, did, verdict = c.data.split(":")
     await resolve(bot, s, user, int(did), verdict, "", c)
@@ -1219,7 +1235,8 @@ async def resolve(bot: Bot, s: AsyncSession, user: User, did: int, verdict: str,
                    else await deals.cancel(s, d.id, ("paid", "dispute"), "cancelled", "dispute_seller"))
         else:
             res = await deals.complete(s, d.id, actual_rub=d.dispute_amount_rub if verdict == "a" else None,
-                                       reason="dispute_actual" if verdict == "a" else "dispute_buyer")
+                                       reason="dispute_actual" if verdict == "a" else "dispute_buyer",
+                                       operator_debt=verdict != "n")
     except deals.DealError as e:
         res, error = None, str(e)
     if not res:

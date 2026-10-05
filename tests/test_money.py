@@ -82,9 +82,10 @@ async def _flow(resolve):
         await s.commit()
         seller = await s.get(User, 1, populate_existing=True)
         assert (seller.balance, seller.frozen) == (D(105), D(95))
-        assert await deals.market(s, 2, None, None, None) == []  # card busy
+        assert await deals.market(s, 2, D(10000), None, None) == []  # the same amount: the seller could not tell
+        assert len(await deals.market(s, 2, D(5000), None, None)) == 1  # another amount fits on the same card
         with pytest.raises(deals.DealError):
-            await deals.create(s, buyer, 1, D(5000))
+            await deals.create(s, buyer, 1, D("10000.50"))  # less than 1 ₽ apart
         assert await deals.mark_paid(s, d.id, 2, "file")
         await resolve(s, d.id)
         await s.commit()

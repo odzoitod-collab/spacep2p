@@ -147,5 +147,8 @@ def test_settings_screen_escapes_labels(go):
         await ready(b)
         await b.run(cb(ADMIN, "as"))
         raw = b.session.last(ADMIN)
-        assert "без Bybit &lt;" in raw and "лимит &lt;" in raw and "без Bybit <" not in raw
+        assert "без Bybit <" not in raw and "лимит <" not in raw  # escaped (or folded into «ещё N»), never raw
+        from bot.handlers.admin import SHORT
+        from bot.ui import esc
+        assert esc(SHORT["rep_low"]) == "без Bybit &lt;"  # the overview escapes every label it shows
     go(fn)

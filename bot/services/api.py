@@ -127,6 +127,7 @@ def order_json(d: Deal, card: Card | None) -> dict:
     out = {
         "id": d.id,
         "external_id": d.external_id,
+        "payer_id": d.payer_id,
         "status": status,
         "amount_rub": str(d.amount_rub),
         "amount_usdt": str(d.buyer_credit),

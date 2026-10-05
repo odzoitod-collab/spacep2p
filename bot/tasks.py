@@ -87,7 +87,11 @@ async def remind_sellers(bot: Bot) -> None:
 async def escalate_unanswered_deals(bot: Bot) -> None:
     async with Session() as s:
         edge = now() - timedelta(minutes=settings.num("escalate_minutes"))
-        ids = (await s.scalars(select(Deal.id).where(Deal.status == "paid", Deal.paid_at < edge))).all()
+        # a working operator's Bybit deal is never sent to a dispute by the clock: he confirms or opens it himself;
+        # one whose operator is gone goes to the administration as usual
+        working = await operators.ids(s)
+        ids = (await s.scalars(select(Deal.id).where(Deal.status == "paid", Deal.paid_at < edge, ~(
+            Deal.via_bybit & Deal.operator_id.in_(working or [0]))))).all()
         for did in ids:
             d = await deals.escalate_unanswered(s, did)
             if d:
@@ -198,10 +202,15 @@ async def order_timeouts(bot: Bot) -> None:
                                               "Попробуйте другую сумму или повторите позже")
         for did in assigned:
             before = await s.get(Deal, did)
-            merchant, bybit = before.seller_id, before.via_bybit
+            merchant, bybit, operator = before.seller_id, before.via_bybit, before.operator_id
             d = await orders.release(s, did)
             if d is None:
                 continue
+            if bybit:  # took a request without a ready card: it counts against his reputation
+                await orders.auto_score(s, d, merchant, orders.SCORE_LATE_LINK)
+            if operator:
+                await notify(bot, operator, f"{pe('info')} Мерчант не прислал новый ордер по заявке #{d.id} вовремя — "
+                                            "она снова ищет мерчанта.")
             events.add(s, f"deal:{d.id}", "released", (f"Мерчант {merchant} не прислал ссылку на Bybit-ордер за "
                        f"{settings.get('order_link_minutes')} мин — заявка не засчитана и передана другим" if bybit else
                        f"Мерчант {merchant} не выдал реквизиты вовремя, заявка передана другим"), alert=not bybit,
@@ -333,6 +342,53 @@ async def auto_offline(bot: Bot) -> None:
                                "Чтобы продолжить — «Продать USDT» → «Выйти на смену».")
 
 
+HELD_REMIND = timedelta(hours=1)  # requisites given, no receipt: the operator is reminded once
+HELD_ALERT = timedelta(hours=6)  # still nothing: the administration looks at it
+
+
+async def held_watch(bot: Bot) -> None:
+    """An operator's deal has no deadline, so it must not hang unnoticed: an hour after the requisites without a
+    receipt the operator is reminded (once), after six hours the admins are alerted."""
+    async with Session() as s:
+        rows = (await s.scalars(select(Deal).where(Deal.status == "waiting_payment", Deal.via_bybit,
+                                                   Deal.operator_id.is_not(None)))).all()
+        remind = []
+        for d in rows:
+            given = deals.aware(d.expires_at) - deals.HOLD  # the requisites were given with expires = now + HOLD
+            waited = now() - given
+            if waited > HELD_REMIND and not d.reminded:
+                d.reminded = True
+                remind.append(d)
+            if waited > HELD_ALERT:
+                await events.alert_once(s, f"deal:{d.id}", "held_long", f"Сделка #{d.id} у оператора {d.operator_id} "
+                                        f"больше {HELD_ALERT.seconds // 3600} ч без оплаты — проверьте", minutes=720)
+        await s.commit()
+        for d in remind:
+            await push(bot, s, d.operator_id, d, f"Сделка #{d.id}: час без оплаты. Покупатель не платит — напишите ему "
+                                                 "в чат сделки или закройте сделку")
+
+
+async def cards_flow(bot: Bot) -> None:
+    """A card stays in the flow only while its seller's free balance covers card_min_rub: the others are taken off,
+    and the seller is told why (once — the card stays off until he puts it back)."""
+    from bot.handlers.seller import mask
+    from bot.models import Card
+    async with Session() as s:
+        rows = (await s.execute(select(Card, User).join(User, User.id == Card.user_id).where(
+            Card.is_active, ~Card.is_deleted, ~Card.is_banned))).all()
+        off = []
+        for card, seller in rows:
+            if problem := deals.flow_problem(card, seller):
+                card.is_active = False
+                events.add(s, f"card:{card.id}", "flow_off", f"Снята с потока: {problem}", seller.id, notice=True)
+                off.append((seller.id, card, problem))
+        await s.commit()
+        for uid, card, problem in off:
+            await notify(bot, uid, f"{pe('pause')} <b>Карта {card.bank} {mask(card)} снята с потока</b>\n"
+                                   f"Причина: {problem}. Исправьте и включите карту снова.",
+                         kb(btn("Мои карты", "sl", "card", style="primary"), back("x", "Скрыть", "cross")))
+
+
 async def loop(fn, bot: Bot, every: int) -> None:
     while True:
         try:
@@ -361,4 +417,6 @@ def start(bot: Bot) -> list[asyncio.Task]:
             asyncio.create_task(loop(stats_topic, bot, 600)),
             asyncio.create_task(loop(chat_pin, bot, 300)),
             asyncio.create_task(loop(channel_autopost, bot, 600)),
-            asyncio.create_task(loop(chat_posts, bot, 5))]
+            asyncio.create_task(loop(chat_posts, bot, 5)),
+            asyncio.create_task(loop(cards_flow, bot, 60)),
+            asyncio.create_task(loop(held_watch, bot, 300))]

@@ -12,7 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from bot.emoji import back, btn, kb, pe
 from bot.models import Card, Deal, User, now
 from bot.services import deals, events, money, settings
-from bot.ui import esc, manual, ok, quote, show, title, warn
+from bot.ui import app_btn, esc, manual, ok, quote, show, title, warn
 
 router = Router()
 
@@ -69,7 +69,7 @@ async def _cards(s: AsyncSession, uid: int) -> list[Card]:
 
 async def seller_menu(bot: Bot, s: AsyncSession, user: User, src=None, note: str = "") -> None:
     cards = await _cards(s, user.id)
-    busy = await deals.busy_cards(s, user.id)
+    busy = await deals.busy_cards(s, user.id, full=True)
     used = await deals.used_today(s, [c.id for c in cards])
     todo = await deals.seller_todo(s, user.id)
     need_check = [d for d in todo if d.status == "paid" and not d.via_bybit]  # a Bybit order is the operator's
@@ -109,6 +109,7 @@ async def seller_menu(bot: Bot, s: AsyncSession, user: User, src=None, note: str
         else btn("Выйти на смену", "sl:on:1", "live", style="success") if cards else None,
         *[btn(("🟢 " if vis[c.id][0] else "⏸ ") + card_label(c), f"cd:{c.id}") for c in cards],
         btn("Добавить карту", "sl:add", "plus", style=None if cards else "primary"),
+        app_btn("Карты в приложении", "cards"),
         [btn(f"В работе ({len(todo)})" if todo else "В работе", "sl:work", "fire"), btn("Статистика", "sl:st", "stats")],
         btn("Настройки", "sl:cfg", "settings"),
         back("menu", "В меню"),
@@ -196,7 +197,7 @@ async def cb_toggle_online(c: CallbackQuery, bot: Bot, s: AsyncSession, user: Us
     user.is_online = c.data.endswith("1")  # explicit target state: a double tap cannot flip it back
     if user.is_online:
         cards = await _cards(s, user.id)
-        note = _shift_note(user, cards, await deals.busy_cards(s, user.id),
+        note = _shift_note(user, cards, await deals.busy_cards(s, user.id, full=True),
                            await deals.used_today(s, [cd.id for cd in cards]))
     else:
         note = ok("Смена завершена, карты скрыты. Открытые сделки продолжаются — завершите их.")
@@ -216,9 +217,11 @@ async def own_card(s: AsyncSession, user: User, card_id: str) -> Card | None:
 
 
 async def card_screen(bot: Bot, s: AsyncSession, user: User, card: Card, src=None, note: str = "") -> None:
-    busy = (await deals.busy_cards(s, user.id)).get(card.id)
+    full = (await deals.busy_cards(s, user.id, full=True)).get(card.id)
+    busy = (await deals.busy_cards(s, user.id)).get(card.id)  # any open deal: the requisites stay as they are
+    load = (await deals.card_load(s, [card.id]))[card.id]
     used = (await deals.used_today(s, [card.id]))[card.id]
-    visible, why = deals.card_visibility(card, user, busy, used)
+    visible, why = deals.card_visibility(card, user, full, used)
     total_n, total_rub = (await s.execute(select(func.count(Deal.id), func.coalesce(func.sum(Deal.amount_rub), 0))
                                           .where(Deal.card_id == card.id, Deal.status == "completed"))).one()
     state = (f"{pe('ban')} заблокирована администрацией" if card.is_banned
@@ -240,7 +243,9 @@ async def card_screen(bot: Bot, s: AsyncSession, user: User, card: Card, src=Non
             f"{pe('stats')} Всего завершено: <b>{total_n}</b> сделок на <b>{money.fmt(Decimal(total_rub))} ₽</b>",
             f"Состояние: {state}" + ("" if user.is_online else " · вы не на смене"),
         ),
-        f"{pe('fire')} Сейчас по карте идёт сделка #{busy}: реквизиты менять нельзя до её завершения." if busy
+        f"{pe('fire')} По карте идёт сделок: <b>{len(load)}</b> из {settings.get('card_parallel')} — суммы "
+        f"{', '.join(money.fmt(a) for a in sorted(load))} ₽. Сверяйте переводы по сумме; реквизиты менять нельзя, "
+        "пока сделки идут." if busy
         else "Реквизиты увидит только покупатель, создавший сделку." if not card.is_banned
         else "Разблокировать карту может только администрация — напишите в поддержку.",
     ]) + note
@@ -281,6 +286,8 @@ async def cb_card_toggle(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User
     card = await own_card(s, user, cid)
     if not card or card.is_banned:
         return await c.answer("Карта недоступна", show_alert=True)
+    if act != "off" and (problem := deals.flow_problem(card, user)):
+        return await c.answer(f"Нельзя поставить в поток: {problem}", show_alert=True)
     if act == "off":
         card.is_active = False
         return await card_screen(bot, s, user, card, c, ok("Карта выключена и скрыта. Открытая сделка по ней продолжится."))
@@ -415,9 +422,24 @@ async def cb_edit(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User, state
 
 
 async def _save(bot, s, user, state, card: Card, field: str, raw: str, src=None):
-    if field in LOCKED and (await deals.busy_cards(s, user.id)).get(card.id):
+    value, err = await check_field(s, user, card, field, raw)
+    if err == BUSY:
         await state.clear()
-        return await card_screen(bot, s, user, card, src, warn("По карте началась сделка — изменение не сохранено."))
+        return await card_screen(bot, s, user, card, src, warn(err))
+    if err:
+        return await show(bot, user, _edit_text(card, field, err), _edit_kb(card, field), src)
+    await state.clear()
+    set_field(card, field, value)
+    await card_screen(bot, s, user, card, src, ok(f"{FIELDS[field][0]}: сохранено. Открытые сделки не меняются."))
+
+
+BUSY = "По карте началась сделка — изменение не сохранено."
+
+
+async def check_field(s: AsyncSession, user: User, card: Card, field: str, raw: str):
+    """(value, "") or (None, why) for one field of a card — the bot and the mini app alike."""
+    if field in LOCKED and (await deals.busy_cards(s, user.id)).get(card.id):
+        return None, BUSY
     err, value = "", None
     if field in ("min", "max", "daily"):
         v = Decimal(0) if field == "daily" and raw.strip() == "0" else parse_rub(raw)
@@ -440,22 +462,13 @@ async def _save(bot, s, user, state, card: Card, field: str, raw: str, src=None)
         value, err = check_requisites(card.kind, raw)
         if value and value != card.requisites:
             err = await requisites_taken(s, value, user, except_id=card.id)
-    if err:
-        return await show(bot, user, _edit_text(card, field, err), _edit_kb(card, field), src)
-    await state.clear()
-    if field == "min":
-        card.min_rub = value
-    elif field == "max":
-        card.max_rub = value
-    elif field == "daily":
-        card.daily_limit_rub = value or None
-    elif field == "bank":
-        card.bank = value
-    elif field == "holder":
-        card.holder = value
-    else:
-        card.requisites = value
-    await card_screen(bot, s, user, card, src, ok(f"{FIELDS[field][0]}: сохранено. Открытые сделки не меняются."))
+    return (None, err) if err else (value, "")
+
+
+def set_field(card: Card, field: str, value) -> None:
+    attr = {"min": "min_rub", "max": "max_rub", "daily": "daily_limit_rub", "bank": "bank", "holder": "holder",
+            "req": "requisites"}[field]
+    setattr(card, attr, value or None if field == "daily" else value)
 
 
 @router.message(CardEdit.value, F.text)
@@ -602,11 +615,15 @@ async def cb_save(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User, state
     if err := await requisites_taken(s, data["requisites"], user):  # added meanwhile (e.g. from another device)
         return await seller_menu(bot, s, user, c, warn(err))
     card = Card(user_id=user.id, kind=data["kind"], bank=data["bank"], requisites=data["requisites"],
-                holder=data["holder"], min_rub=Decimal(data["min"]), max_rub=Decimal(data["max"]), is_active=True)
+                holder=data["holder"], min_rub=Decimal(data["min"]), max_rub=Decimal(data["max"]))
+    problem = deals.flow_problem(card, user)
+    card.is_active = not problem  # in the flow only with a balance behind it
     s.add(card)
     await s.flush()
     events.add(s, f"card:{card.id}", "added", f"Новая карта {card.bank} {mask(card)}, "
                f"{money.fmt(card.min_rub)}–{money.fmt(card.max_rub)} ₽", user.id, notice=True)
+    if problem:
+        return await card_screen(bot, s, user, card, c, note=warn(f"Реквизиты сохранены, но не в потоке: {problem}."))
     was_online = user.is_online
     user.is_online = True  # a new card is meant to work right away
     await card_screen(bot, s, user, card, c, note=ok("Реквизиты сохранены и включены"

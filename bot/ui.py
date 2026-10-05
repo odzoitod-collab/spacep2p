@@ -26,14 +26,15 @@ from pathlib import Path
 from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
 from aiogram.types import (CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, Message,
-                           ReplyParameters)
+                           ReplyParameters, WebAppInfo)
 
 from bot.config import config
-from bot.emoji import E, NavButton, back, kb, pe
+from bot.emoji import E, NavButton, WideButton, back, kb, pe
 from bot.models import User
 
 esc = html.escape
 BOT = ""  # the bot's username, known after the first update (middlewares.Context): deep links in texts
+MAIN_APP = False  # the bot has a Main Mini App in BotFather (getMe.has_main_web_app): t.me/<bot>?startapp works
 # Brand canon (docs/BRAND.md): the name is always "Strait Pay" — two words, capital S and P.
 BRAND = "Strait Pay"
 TAGLINE = "P2P-обмен USDT ⇄ RUB с защитой сделки"
@@ -59,6 +60,43 @@ async def paced(call):
             if attempt:
                 raise
             await asyncio.sleep(e.retry_after)
+
+
+def app_url(path: str = "") -> str | None:
+    """The mini app (settings: webapp_url; empty — the docs site's domain + /app, the bot's own web server serves
+    both). Only https: Telegram opens nothing else, and a web_app button with another address breaks the message."""
+    from urllib.parse import urlsplit
+
+    from bot.services import settings
+    base = settings.get("webapp_url").rstrip("/")
+    if not base and (docs := settings.get("docs_url")):
+        parts = urlsplit(docs)
+        base = f"{parts.scheme}://{parts.netloc}/app"
+    if not base.startswith("https://"):
+        return None
+    return base + (f"?p={path}" if path else "")  # not #: Telegram puts its launch data into the hash
+
+
+def app_btn(text: str, path: str = "", icon: str | None = None, style: str | None = None,
+            wide: bool = False) -> InlineKeyboardButton | None:
+    """A button that opens the mini app on `path` (deal/5, wallet …). None when there is no app or the screen
+    goes to a group: web_app buttons work only in the private chat."""
+    url = app_url(path)
+    if url is None or place.get() is not None:
+        return None
+    return (WideButton if wide else InlineKeyboardButton)(
+        text=text[:64], web_app=WebAppInfo(url=url), style=style,
+        icon_custom_emoji_id=E[icon][0] if icon and style and config.emoji_mode == "premium" else None)
+
+
+def app_link(param: str = "") -> str | None:
+    """A t.me link that opens the mini app from any chat, groups too (settings: webapp_link; empty — the bot's Main
+    Mini App when BotFather has one). The app reads `param` (deal-5, wallet …) as its start page."""
+    from bot.services import settings
+    base = settings.get("webapp_link") or (f"https://t.me/{BOT}" if MAIN_APP and BOT else "")
+    if not base:
+        return None
+    return f"{base}?startapp={param}" if param else base
 
 
 async def deep_link(bot: Bot, payload: str) -> str:

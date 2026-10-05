@@ -47,7 +47,7 @@ def test_operators_from_the_panel_first_accept_wins_and_the_debt_is_repaid(go):
         async with models.Session() as s:
             assert await operators.ids(s) == [OPA, OPB]  # the admins are no longer operators by default
         d = await request(b)
-        await b.run(cb(40, f"orq:take:{d.id}:b"), msg(40, LINK))
+        await b.run(cb(40, f"orq:take:{d.id}:B"), msg(40, LINK))
         assert f"opq:go:{d.id}" in b.session.buttons(OPA) and f"opq:go:{d.id}" in b.session.buttons(OPB)
         assert not any("Bybit-ордер · заявка" in t for t in b.session.texts(ADMIN))
 
@@ -164,7 +164,7 @@ def test_requests_go_to_the_community_chat_and_outsiders_are_asked_to_apply(go):
         assert "om" in b.session.buttons(OTHER) and f"orq:take:{d.id}:b" not in b.session.buttons(OTHER)
         await tasks.order_timeouts(b.bot)
         assert len(posts(b, CHAT)) == 1  # posted once, not on every re-send
-        await b.run(cb(40, f"orq:take:{d.id}:b"))
+        await b.run(cb(40, f"orq:take:{d.id}:B"))
         await b.run(msg(OTHER, f"/start o{d.id}"))
         assert "уже взяли" in plain(b.session.last(OTHER))
     go(fn)

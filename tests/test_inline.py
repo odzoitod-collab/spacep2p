@@ -28,9 +28,10 @@ def test_deal_search_and_pick_edits_the_screen(go):
     async def fn(b):
         await ready(b)
         d = await create_deal(b)
+        n = len(b.session.calls)
         await b.run(msg(BUYER, "/start"))
-        buttons = [x for r in b.session.calls[-2].reply_markup.inline_keyboard for x in r
-                   if x.switch_inline_query_current_chat]
+        buttons = [x for m in b.session.calls[n:] if getattr(m, "reply_markup", None)
+                   for r in m.reply_markup.inline_keyboard for x in r if x.switch_inline_query_current_chat]
         assert buttons and buttons[0].switch_inline_query_current_chat == "сделки "  # «Мои сделки» opens the search
         await b.run(inline(BUYER, "сделки "))
         res = answers(b)[-1]

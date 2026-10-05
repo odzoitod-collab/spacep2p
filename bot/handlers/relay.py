@@ -232,31 +232,47 @@ async def cb_chat(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User, state
 
 @router.message(Relay.chat)
 async def msg_chat(m: Message, bot: Bot, s: AsyncSession, user: User, state: FSMContext):
-    from bot.models import DealMessage
     d = await _chat_deal(s, user, (await state.get_data()).get("chat_deal", 0))
     if d is None:
         await state.set_state(None)
         return await show(bot, user, warn("Чат недоступен"), kb(back("menu", "В меню")))
+    err = await post(bot, s, user, d, (m.text or "").strip(), forbidden(m))
+    await chat_screen(bot, s, user, d, state, note=warn(err) if err else "")
+
+
+def text_forbidden(text: str) -> bool:
+    """A link or a @username in plain text (the mini app sends no Telegram markup)."""
+    return bool(LINK.search(text) or MENTION.search(text))
+
+
+async def post(bot: Bot, s: AsyncSession, user: User, d: Deal, text: str, bad: bool = False) -> str:
+    """A message into the deal chat — from the bot or the mini app: the same checks, the history of the deal and a
+    notification to every other member. "" or why it was not sent. Commits."""
+    from bot.models import DealMessage
+    from bot.ui import app_btn
     admin = admins.is_admin(user.id)
-    text = (m.text or "").strip()
     if not text or len(text) > MAX_LEN:
-        return await chat_screen(bot, s, user, d, state, note=warn(f"Только текст, до {MAX_LEN} символов"))
-    if not admin and forbidden(m):
+        return f"Только текст, до {MAX_LEN} символов"
+    if not admin and (bad or text_forbidden(text)):
         events.add(s, f"deal:{d.id}", "message_blocked", f"{chat_role(d, user.id)} {user.id} пытался отправить в чат "
                    f"ссылку или @юзернейм: {text[:200]}", user.id, alert=True)
-        return await chat_screen(bot, s, user, d, state, note=warn(
-            "Не отправлено: ссылки и @юзернеймы запрещены. Общайтесь только здесь."))
+        await s.commit()
+        return "Не отправлено: ссылки и @юзернеймы запрещены. Общайтесь только здесь."
     recent = await s.scalar(select(func.count(DealMessage.id)).where(
         DealMessage.sender_id == user.id, DealMessage.created_at > now() - timedelta(hours=1)))
     if not admin and recent >= PER_HOUR:
-        return await chat_screen(bot, s, user, d, state, note=warn("Слишком много сообщений за час — попробуйте позже"))
+        return "Слишком много сообщений за час — попробуйте позже"
     sender_role = chat_role(d, user.id)
     s.add(DealMessage(deal_id=d.id, sender_id=user.id, role=sender_role[:40], text=text))
     events.add(s, f"deal:{d.id}", "message", f"Чат · {sender_role}: {text[:300]}", user.id, notice=True)
     await s.commit()
+    members = " · ".join(dict.fromkeys(chat_role(d, x) for x in chat_people(d)))
     for uid in [x for x in chat_people(d) if x != user.id]:
         await notify(bot, uid, "\n".join([
-            f"{pe('support')} <b>Чат сделки #{d.id}</b> · {sender_role}",
+            f"{pe('support')} <b>Чат сделки #{d.id}</b>",
+            f"Пишет: <b>{esc(sender_role)}</b> · вы здесь — {esc(chat_role(d, uid))}",
             quote(esc(text)),
-        ]), kb(btn("Ответить в чат", f"dch:{d.id}", "support", style="primary"), back("x", "Скрыть", "cross")))
-    await chat_screen(bot, s, user, d, state)
+            f"<i>В чате: {esc(members)}{' · администрация' if not admins.is_admin(user.id) else ''}</i>",
+        ]), kb(btn("Ответить в чат", f"dch:{d.id}", "support", style="primary"),
+               app_btn("Чат в приложении", f"deal/{d.id}/chat"), back("x", "Скрыть", "cross")))
+    return ""

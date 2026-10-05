@@ -2,7 +2,7 @@
 import re
 
 from bot.config import config
-from tests.harness import cb, msg
+from tests.harness import plain, cb, msg
 from tests.test_scenarios import ADMIN, BUYER, PDF, SELLER, create_deal, ready
 
 EMOJI = re.compile("[\U0001F300-\U0001FAFF☀-➿⬀-⯿️]")
@@ -58,6 +58,13 @@ def test_card_style_helpers():
     assert text.count("<tg-emoji") == 2  # card labels and section headers keep their icons
 
 
+def long_texts(b):
+    from bot.ui import CAPTION_LIMIT, visible_len
+    return [(m.chat_id, visible_len(t), t) for m in b.session.calls
+            if (t := getattr(m, "text", None) or getattr(m, "caption", None)) and visible_len(t) > CAPTION_LIMIT
+            and type(m).__name__ in ("SendAnimation", "EditMessageCaption", "SendMessage", "EditMessageText")]
+
+
 def test_every_screen_fits_under_the_banner(go):
     """A screen longer than a caption cannot keep the banner and is re-sent as text: every screen of the tour fits."""
     from bot.ui import CAPTION_LIMIT, visible_len
@@ -69,5 +76,5 @@ def test_every_screen_fits_under_the_banner(go):
                 if type(m).__name__ in ("SendAnimation", "EditMessageCaption", "SendMessage", "EditMessageText")
                 and (t := getattr(m, "text", None) or getattr(m, "caption", None)) and m.chat_id in (BUYER, SELLER, ADMIN)
                 and visible_len(t) > CAPTION_LIMIT]
-        assert not long, long
+        assert not long, [(c, n, plain(t)[:300]) for c, n, t in long_texts(b)] if long else long
     go(fn)

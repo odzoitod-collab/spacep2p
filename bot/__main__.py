@@ -28,11 +28,20 @@ async def main() -> None:
             raise SystemExit(1)
     async with models.Session() as s:
         await settings.load(s)
+        if settings.get("order_link_minutes") == "2":  # the old default: 5 minutes for the link now
+            await settings.put(s, "order_link_minutes", "5")
+            await s.commit()
     xrocket.rocket = xrocket.XRocket(xrocket.token(config.xrocket_token), config.xrocket_base_url)
 
     bot = Bot(config.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     logging.getLogger().addHandler(logchat.ErrorTopic(bot))  # the bot's errors -> the admin chat's «Ошибки бота»
     dp = build_dispatcher()
+    from bot import ui
+    try:
+        me = await bot.me()
+        ui.BOT, ui.MAIN_APP = me.username or "", bool(getattr(me, "has_main_web_app", False))
+    except Exception:  # noqa: BLE001 - known after the first update anyway
+        logging.exception("getMe failed")
     await commands.setup_commands(bot)
     try:  # the admin chat's topics in the current layout, with their pins; never blocks the start
         await logchat.ensure_topics(bot)

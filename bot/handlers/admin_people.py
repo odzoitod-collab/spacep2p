@@ -19,7 +19,7 @@ from bot.emoji import back, btn, kb, pe
 from bot.handlers.admin_api import terms_lines
 from bot.handlers.wallet import parse_usdt
 from bot.models import Deal, Operator, Team, User, now
-from bot.services import admins, audit, deals, events, money, operators, settings, teams
+from bot.services import admins, audit, deals, events, money, operators, orders, settings, teams
 from bot.ui import (BRAND, alink, at, card, cf, deep_link, esc, mark, notify, ok, quote, show, title, ulink,
                     verdict, warn)
 
@@ -136,6 +136,7 @@ async def operator_card(bot: Bot, s: AsyncSession, admin: User, uid: int, src=No
         (btn("Убрать из операторов", f"aop:st:{uid}:0", "pause", style="danger") if active and not env else
          btn("Вернуть в операторы", f"aop:st:{uid}:1", "ok", style="success") if not active else None),
         btn("Списать долг вручную", f"aop:wo:{uid}", "dollar") if op and op.debt > 0 else None,
+        [btn("Долг: +", f"amd:{uid}:+", "plus"), btn("Долг: −", f"amd:{uid}:-", "down")],
         btn("История", f"aev:op:{uid}", "list"),
         back("aopl", "Операторы")), src)
 
@@ -157,7 +158,17 @@ async def cb_operator_status(c: CallbackQuery, bot: Bot, s: AsyncSession, user: 
     what = "вернули в операторы" if op.active else "убрали из операторов"
     audit.log(s, user.id, "operator_status", f"op:{uid}", what)
     events.add(s, f"op:{uid}", "status", f"Оператора {what} ({user.name})", uid, alert=True)
+    returned, closed = await orders.drop_operator(s, uid) if not op.active else ([], [])
     await s.commit()
+    if returned or closed:  # his deals do not hang: orders go to the other operators, unpaid deals close
+        from bot.handlers.deal import push
+        from bot.handlers.orders import notify_operators
+        for d in returned:
+            if d.status == "checking":
+                await notify_operators(bot, s, d, await s.get(User, d.seller_id) if d.seller_id else None)
+        for d in closed:
+            await push(bot, s, d.buyer_id, d, f"Сделка #{d.id} закрыта: оператор больше не работает. Не переводите "
+                                              "по ней — уже перевели, загрузите чек")
     await notify(bot, uid, f"{pe('shop')} Администрация {what.replace('вернули', 'вернула').replace('убрали', 'убрала')} "
                            "вас." + (f" Долг {money.usdt(op.debt)} USDT остаётся — погасите его в «Оператор»."
                                      if not op.active and op.debt > 0 else ""))

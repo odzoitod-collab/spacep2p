@@ -36,7 +36,7 @@ from bot.models import (Adjustment, ApiApplication, ApiClient, Card, Deal, Depos
                         OrderMerchant, Session, Setting, Team, Ticket, User, Withdrawal, now)
 from bot.services import events, money, xrocket
 from bot.services.admins import IsAdmin
-from bot.ui import MSK, alink, at, card, cf, clean, esc, mark, paced, section, stamp, ulink
+from bot.ui import MSK, alink, app_link, at, card, cf, clean, esc, mark, paced, section, stamp, ulink
 
 log = logging.getLogger(__name__)
 
@@ -447,6 +447,8 @@ async def render(s: AsyncSession, ref: str, attention: bool) -> tuple[str, str, 
                          btn("Отклонить", f"{no_cb}:{oid}", "cross", style="danger")])
         if cb:
             rows.append(btn("Подробнее", f"{cb}:{oid}", "search"))
+        if kind == "deal" and oid.isdigit() and (link := app_link(f"deal-{oid}")):
+            rows.append(btn("Сделка в приложении", url=link))  # groups: a t.me link, web_app buttons are private-only
     if attention:
         head += " · <b>нужно внимание</b>"
     history = (await s.scalars(select(Event).where(Event.ref == ref).order_by(Event.id.desc()).limit(TIMELINE))).all()

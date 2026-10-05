@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.services.admins import IsAdmin
 from bot.emoji import back, btn, kb, pe
-from bot.handlers.deal import CLOSE_REASONS, REASONS, STATUS, card_of, push
+from bot.handlers.deal import CLOSE_REASONS, REASONS, card_of, push, status_of
 from bot.handlers.seller import parse_rub
 from bot.models import ApiClient, Deal, Event, User
 from bot.services import audit, deals, events, money, orders
@@ -45,7 +45,7 @@ async def card_text(s: AsyncSession, d: Deal) -> str:
         u = users.get(uid)
         return f"{ulink(u, uid)} · сделок {done[uid]}" + (" · <b>ЗАБАНЕН</b>" if u and u.is_banned else "")
 
-    icon, label = STATUS[d.status]
+    icon, label = status_of(d)
     frozen = deals.frozen(d) and d.seller_id and d.status in deals.FUNDED
     rows = (await s.scalars(select(Event).where(Event.ref == f"deal:{d.id}").order_by(Event.id.desc())
                             .limit(HISTORY))).all()
@@ -56,7 +56,8 @@ async def card_text(s: AsyncSession, d: Deal) -> str:
         title(pe("fire"), f"Сделка {alink('deal', d.id, f'#{d.id}')}") + f" · {label}",
         "",
         fields(
-            cf("Тип", kind_of(d) + (f" · API «{esc(client.project)}»" if client else ""), icon=icon),
+            cf("Тип", kind_of(d) + (f" · API «{esc(client.project)}»" if client else "")
+               + (f" · плательщик <code>{esc(d.payer_id)}</code>" if d.payer_id else ""), icon=icon),
             cf("Участники", f"Создал (покупатель): {who(d.buyer_id, '—')}",
                f"Принял (мерчант): {who(d.seller_id, 'ещё никто')}",
                f"Оператор: {who(d.operator_id, 'не назначен')}" if d.via_bybit else "", icon="people"),
@@ -96,6 +97,8 @@ def card_kb(d: Deal, *extra):
         btn("Выдать реквизиты самому", f"adm:give:{d.id}", "key", style="primary") if request else None,
         btn("Чек и файлы", f"af:{d.id}", "clip") if d.receipt_file_id or d.dispute_files else None,
         btn("Завершить: USDT покупателю", f"ar:{d.id}:b", "ok", style="success") if settle else None,
+        btn("Покупателю, но USDT оператору не пришли", f"ar:{d.id}:n", "warn")
+        if settle and d.via_bybit and d.bybit_url else None,
         btn(f"Провести на {money.fmt(d.dispute_amount_rub)} ₽", f"ar:{d.id}:a", "ruble", style="primary")
         if settle and d.dispute_amount_rub is not None and d.dispute_amount_rub != d.amount_rub else None,
         btn("Отменить: в пользу продавца", f"ar:{d.id}:s", "cross", style="danger") if settle else None,
@@ -106,6 +109,8 @@ def card_kb(d: Deal, *extra):
         # the people are links in the card; one «Написать» chooses whom
         [btn("Чат сделки", f"dch:{d.id}", "support"),
          btn("Написать лично", f"dmc:{d.id}", "support") if d.seller_id or operator or not d.api_client_id else None],
+        btn("Плательщик API: не принимать / принимать", f"apb:{d.id}", "ban") if d.api_client_id and d.payer_id
+        else None,
         btn("Вся история", f"aev:deal:{d.id}", "list"),
         *extra)
 
@@ -121,6 +126,28 @@ async def cb_view(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User, state
     if not d:
         return await c.answer("Сделка не найдена", show_alert=True)
     await deal_view(bot, s, user, d, c)
+
+
+@router.callback_query(F.data.regexp(r"^apb:(\d+)$"))
+async def cb_payer_block(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User):
+    """The API client's customer of this deal: orders from him are no longer accepted (or again accepted)."""
+    from bot.models import ApiPayerBlock
+    d = await s.get(Deal, int(c.data.split(":")[1]))
+    if not d or not d.api_client_id or not d.payer_id:
+        return await c.answer("У сделки нет плательщика API", show_alert=True)
+    row = await s.scalar(select(ApiPayerBlock).where(ApiPayerBlock.client_id == d.api_client_id,
+                                                     ApiPayerBlock.payer_id == d.payer_id))
+    if row:
+        await s.delete(row)
+        what = f"Плательщик {d.payer_id} снова принимается"
+    else:
+        s.add(ApiPayerBlock(client_id=d.api_client_id, payer_id=d.payer_id, admin_id=user.id,
+                            reason=f"сделка #{d.id}"))
+        what = f"Заказы от плательщика {d.payer_id} больше не принимаются"
+    audit.log(s, user.id, "api_payer", f"deal:{d.id}", what)
+    events.add(s, f"deal:{d.id}", "payer_block", f"{what} ({user.name})", user.id, alert=True)
+    await s.commit()
+    await deal_view(bot, s, user, d, c, ok(what))
 
 
 # ---------- give the requisites yourself ----------

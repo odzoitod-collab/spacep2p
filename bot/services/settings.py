@@ -36,7 +36,14 @@ SPEC: dict[str, tuple[str, str, str]] = {
     "order_take_minutes": ("10", "int", "Ордер: мерчанту на выдачу реквизитов"),
     "order_pay_minutes": ("15", "int", "Ордер: минимальное время на оплату"),
     "order_check_minutes": ("15", "int", "Ордер: оператору на Bybit-ордер"),
-    "order_link_minutes": ("2", "int", "Ордер: мерчанту на ссылку Bybit"),
+    "order_link_minutes": ("5", "int", "Ордер: мерчанту на ссылку Bybit"),
+    "card_min_rub": ("2000", "dec", "Мин. карты в потоке"),
+    "operator_max_debt": ("1000", "dec", "Оператор: предел долга"),
+    "abandon_limit": ("3", "int0", "Брошенных сделок за сутки до паузы"),
+    "abandon_pause_minutes": ("120", "int", "Пауза за брошенные сделки, мин"),
+    "card_parallel": ("3", "int", "Сделок на одну карту сразу"),
+    "order_first_wave": ("5", "int0", "Заявка сначала лучшим: мерчантов"),
+    "order_wave_seconds": ("45", "int", "Заявка лучшим: секунд до всех"),
     "strike_limit": ("3", "int", "Ордер: пропусков реквизитов до паузы"),
     "strike_sleep_hours": ("72", "int", "Ордер: пауза мерчанта, часов"),
     "rep_min_count": ("10", "int", "Репутация: оценок до расчёта"),
@@ -52,6 +59,8 @@ SPEC: dict[str, tuple[str, str, str]] = {
     "channel_autopost_hours": ("24", "int0", "Автопост в канал, часов"),
     "signup_review": ("1", "int0", "Вход новых пользователей"),
     "docs_url": ("https://straitpay.best/docs", "url", "Сайт с инструкциями"),
+    "webapp_url": ("", "url", "Мини-приложение"),
+    "webapp_link": ("", "url", "Приложение: t.me-ссылка"),
     "tutorial": (
         "<b>Купить</b>: «RUB ⇄ USDT» → сумма в рублях → перевод по реквизитам → PDF-чек. USDT придут после "
         "подтверждения.\n"
@@ -67,16 +76,18 @@ SPEC: dict[str, tuple[str, str, str]] = {
 GROUPS: list[tuple[str, list[str]]] = [
     ("Курс и комиссии", ["rate", "order_rate", "seller_pct", "platform_pct", "deposit_fee", "withdraw_pct",
                          "withdraw_fee", "chain_withdraw_fee", "team_pct"]),
-    ("Сроки сделок", ["deal_minutes", "buyer_max_open", "confirm_minutes", "escalate_minutes", "late_hold_minutes", "late_minutes",
+    ("Сроки сделок", ["deal_minutes", "buyer_max_open", "abandon_limit", "abandon_pause_minutes", "card_parallel", "confirm_minutes", "escalate_minutes", "late_hold_minutes", "late_minutes",
                       "online_minutes"]),
-    ("Кошелёк и лимиты", ["deposit_min", "withdraw_min", "chain_withdraw_min",
+    ("Кошелёк и лимиты", ["deposit_min", "withdraw_min", "chain_withdraw_min", "card_min_rub",
                           "adjust_approval_usdt", "withdraw_turnover"]),
     ("Правила и лог-чат", ["receipt_images", "log_all", "signup_review", "join_required"]),
-    ("Тексты, поддержка, чат", ["support", "manager", "tutorial", "manual_url", "docs_url", "chat_id", "channel_id",
+    ("Тексты, поддержка, чат", ["support", "manager", "tutorial", "manual_url", "docs_url", "webapp_url", "webapp_link",
+                                "chat_id", "channel_id",
                                 "channel_autopost_hours"]),
     ("Ордерные реквизиты", ["order_min_rub", "order_max_rub", "order_search_minutes", "order_take_minutes",
                             "order_link_minutes", "order_pay_minutes", "order_check_minutes", "strike_limit",
-                            "strike_sleep_hours", "rep_min_count", "rep_low", "rep_mid", "rep_mid_max_rub"]),
+                            "strike_sleep_hours", "rep_min_count", "rep_low", "rep_mid", "rep_mid_max_rub",
+                            "operator_max_debt", "order_first_wave", "order_wave_seconds"]),
 ]
 HINTS = {
     "dec": "Число, дробная часть через точку или запятую.",
@@ -90,6 +101,20 @@ HINTS = {
     "signup_review": "1 — новый пользователь заполняет заявку (роль, оборот, скриншот) и ждёт одобрения в лог-чате, "
                      "0 — бот открыт всем сразу.",
     "docs_url": "Адрес страниц с инструкциями (их отдаёт API-сервер бота: /docs/buy, /docs/sell …). «-» — без ссылок.",
+    "webapp_url": "Адрес мини-приложения (https). Пусто — домен сайта с инструкциями + /app: приложение отдаёт тот же "
+                  "сервер бота. Кнопки «Приложение» и меню у поля ввода открывают его.",
+    "webapp_link": "t.me-ссылка на приложение для лог-чата и групп (там нельзя кнопку web_app), например "
+                   "https://t.me/straitpay_bot/app. Пусто — Main Mini App бота, если он включён в BotFather.",
+    "card_min_rub": "Карту можно поставить в поток, только если её максимум и свободный баланс мерчанта покрывают "
+                    "сделку не меньше этой суммы. Остальные карты бот снимает с потока сам.",
+    "operator_max_debt": "Долг оператора плюс USDT ордеров у него в работе не больше этой суммы — иначе новые ордера "
+                         "он не принимает, пока не погасит. 0 — без предела (площадка рискует этой суммой).",
+    "abandon_limit": "Сделка истекла без чека — это брошенная сделка: она держала карту продавца и его USDT. Столько "
+                     "брошенных за сутки — и покупатель (или плательщик API-клиента) на паузе. 0 — без ограничения.",
+    "card_parallel": "Сколько сделок одновременно может идти по одной карте. Суммы сделок на карте различаются хотя бы на "
+                     "1 ₽ — продавец отличает переводы по сумме.",
+    "order_first_wave": "Сколько лучших мерчантов (репутация и надёжность) получают новую заявку первыми. 0 — всем сразу.",
+    "order_wave_seconds": "Через сколько секунд заявка уходит всем остальным мерчантам и в чаты.",
     "order_rate": "Сколько рублей ордерный мерчант получает за 1 USDT: он отдаёт сумму заявки / этот курс USDT "
                   "(через Bybit-ордер или из баланса). Процента у ордерных мерчантов нет. Не выше курса сервиса / "
                   "(1 − процент площадки), иначе площадка доплачивала бы покупателю из своих.",

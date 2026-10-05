@@ -11,10 +11,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot import guides
 from bot.emoji import back, btn, kb, pe
-from bot.models import Operator, OrderMerchant, Ticket, User, now
+from bot.models import Deal, Operator, OrderMerchant, Ticket, User, now
 from bot.services import deals, events, money, operators, settings
 from bot.handlers.wallet import withdraw_terms
-from bot.ui import BRAND, esc, field, manual, ok, quote, section, show, title, warn
+from bot.ui import BRAND, app_btn, esc, field, manual, ok, quote, section, show, title, warn
 
 router = Router()
 TICKETS_PER_HOUR = 5
@@ -39,10 +39,14 @@ async def main_menu(bot: Bot, s: AsyncSession, user: User, is_admin: bool, src=N
     open_ = await deals.open_deals_of(s, user.id)
     active = open_[0] if open_ else None
     todo = await deals.seller_todo(s, user.id)
-    need_check = [d for d in todo if d.status == "paid"]
     om = await s.get(OrderMerchant, user.id)
     op = await s.get(Operator, user.id)
     is_op = await operators.is_operator(s, user.id) or bool(op and op.debt)
+    op_work = list((await s.scalars(select(Deal).where(Deal.operator_id == user.id, Deal.via_bybit, Deal.status.in_(
+        ("checking", "paid"))).order_by(Deal.id))).all()) if is_op else []
+    # the payments this user checks himself: his static card, or the Bybit orders he accepted as an operator
+    need_check = [d for d in todo if d.status == "paid" and deals.checker(d) == user.id] + \
+        [d for d in op_work if d.status == "paid"]
     rate, pct = settings.buyer_terms(user)
     lines = [
         title(pe("shop"), BRAND),
@@ -60,11 +64,14 @@ async def main_menu(bot: Bot, s: AsyncSession, user: User, is_admin: bool, src=N
         btn(f"Ещё открытых сделок: {len(open_) - 3}", inline="сделки ") if len(open_) > 3 else None,
         btn(f"Проверить оплату ({len(need_check)})", f"dl:{need_check[0].id}", "bell", style="danger")
         if need_check else None,
+        app_btn("Открыть приложение", "", "wallet", style="success", wide=True),
         btn(f"Кошелёк · {money.usdt(user.balance)} USDT", "w", style="primary"),
         [btn("RUB ⇄ USDT", "buy:0", style="success"), btn("USDT ⇄ RUB", "sl", style="danger")],
         btn("Ордерный кабинет" if om and om.status in ("approved", "suspended", "pending") else "Ордерные реквизиты",
             "om", wide=True),
-        btn("Оператор" + (f" · долг {money.usdt(op.debt)} USDT" if op and op.debt else ""), "op", wide=True)
+        btn("Оператор" + (f" · в работе {len(op_work)}" if op_work else "")
+            + (f" · долг {money.usdt(op.debt)} USDT" if op and op.debt else ""), "op", wide=True,
+            style="primary" if op_work else None)
         if is_op else None,
         [btn("Мои сделки", inline="сделки "), btn("Помощь", "info")],
         [btn("Команда", "tm"), btn(f"{BRAND} API", "api")],

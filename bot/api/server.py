@@ -1,6 +1,7 @@
 """Strait Pay merchant API over HTTP (aiohttp, runs in the bot process). Reference: docs/API.md."""
 import asyncio
 import hashlib
+import re
 import logging
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -21,6 +22,8 @@ from bot.services import api, deals, events, money, orders, settings
 log = logging.getLogger(__name__)
 DOCS = Path(__file__).resolve().parent.parent.parent / "docs" / "API.md"
 LIMIT_CODES = {"amount_limit", "open_limit", "daily_limit"}
+PAYER_CODES = {"payer_blocked": 403, "payer_paused": 429}  # the client's own customer: blocked or on a pause
+PAYER_ID = re.compile(r"[A-Za-z0-9_.:@-]{1,64}")
 limiter = api.RateLimiter()
 BOT = web.AppKey("bot", Bot)
 SESSION = web.RequestKey("session", object)
@@ -197,6 +200,9 @@ async def create_order(request: web.Request) -> web.Response:
     bank, kind = data.get("bank"), data.get("type")
     if kind not in (None, "card", "sbp"):
         raise ApiError(422, "invalid_type", "type must be \"card\" or \"sbp\"")
+    payer = data.get("payer_id")
+    if payer is not None and (not isinstance(payer, str) or not PAYER_ID.fullmatch(payer)):
+        raise ApiError(422, "invalid_payer_id", "payer_id: your customer's id, 1–64 of A–Z a–z 0–9 _ . : @ -")
     use_orders = data.get("order_requisites", True)
     sender_bank = data.get("sender_bank")
     if not isinstance(use_orders, bool) or (sender_bank is not None and (not isinstance(sender_bank, str)
@@ -212,10 +218,12 @@ async def create_order(request: web.Request) -> web.Response:
     last = "No merchant can take this amount right now. See GET /v1/liquidity"
     for card, *_ in offers[:5]:
         try:
-            d = await deals.create(s, owner, card.id, amount, client=client, external_id=ext)
+            d = await deals.create(s, owner, card.id, amount, client=client, external_id=ext, payer_id=payer)
         except deals.DealError as e:
             await s.rollback()
             await s.refresh(owner)
+            if e.code in PAYER_CODES:
+                raise ApiError(PAYER_CODES[e.code], e.code, str(e))
             if e.code in LIMIT_CODES:
                 raise ApiError(409 if e.code == "open_limit" else 422, e.code, str(e))
             last = str(e)
@@ -233,18 +241,21 @@ async def create_order(request: web.Request) -> web.Response:
         await s.commit()
         return await order_response(s, d, 201)
     if use_orders:  # no static card fits: order merchants are asked to give requisites for this exact amount
-        return await request_order(request, amount, sender_bank or bank, ext)
+        return await request_order(request, amount, sender_bank or bank, ext, payer)
     raise ApiError(409, "no_liquidity", last)
 
 
-async def request_order(request: web.Request, amount: Decimal, sender_bank: str | None, ext: str | None):
+async def request_order(request: web.Request, amount: Decimal, sender_bank: str | None, ext: str | None,
+                        payer: str | None = None):
     from bot.handlers.orders import broadcast
     s, client, owner, bot = ctx(request)
     try:
-        d = await orders.create_request(s, owner, amount, sender_bank, client=client, external_id=ext)
+        d = await orders.create_request(s, owner, amount, sender_bank, client=client, external_id=ext, payer_id=payer)
     except deals.DealError as e:
         await s.rollback()
         await s.refresh(owner)
+        if e.code in PAYER_CODES:
+            raise ApiError(PAYER_CODES[e.code], e.code, str(e))
         if e.code in LIMIT_CODES:
             raise ApiError(409 if e.code == "open_limit" else 422, e.code, str(e))
         raise ApiError(409 if e.code != "order_range" else 422, "no_liquidity" if e.code != "order_range"
@@ -417,6 +428,8 @@ async def webhook_test(request: web.Request) -> web.Response:
 def build_app(bot: Bot) -> web.Application:
     app = web.Application(middlewares=[guard], client_max_size=(config.api_receipt_mb + 1) * 1024 * 1024)
     app[BOT] = bot
+    from bot.api import webapp
+    webapp.setup(app, bot)  # the mini app: /app and /app/api/*
     app.router.add_get("/", index)
     app.router.add_get("/docs", docs)
     app.router.add_get("/docs.md", docs_raw)

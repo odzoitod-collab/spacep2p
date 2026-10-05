@@ -12,7 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from bot.emoji import back, btn, kb, pe
 from bot.handlers.deal import deal_screen, on_deal_created
 from bot.handlers.seller import parse_rub, seller_menu
-from bot.models import Card, User
+from bot.models import Card, Deal, User
 from bot.services import deals, events, money, settings
 from bot.ui import doc, esc, person, quote, show, title, warn
 
@@ -80,6 +80,24 @@ async def pick_card(s: AsyncSession, user: User, amount: Decimal) -> Card | None
     return min(offers, key=lambda o: (-done[o[1].id], o[0].id))[0]
 
 
+async def open_card_deal(s: AsyncSession, user: User, card_id: int, amount: Decimal,
+                         expect: Decimal | None) -> Deal:
+    """A deal on a seller's static card (the bot and the mini app). Commits; DealError after a rollback."""
+    try:
+        deal = await deals.create(s, user, card_id, amount, expect)
+    except deals.DealError:
+        await s.rollback()
+        await s.refresh(user)  # rollback expires every loaded object
+        raise
+    seller = await s.get(User, deal.seller_id)
+    events.add(s, f"deal:{deal.id}", "created", f"Открыта: {money.fmt(deal.amount_rub)} ₽ → {money.usdt(deal.buyer_credit)} "
+                                                f"USDT, создал покупатель {person(user)}, карта продавца "
+                                                f"{person(seller)}, заморожено {money.usdt(deal.seller_debit)} USDT",
+               notice=True)
+    await s.commit()
+    return deal
+
+
 async def offer_screen(bot: Bot, s: AsyncSession, user: User, state: FSMContext, amount: Decimal, src=None,
                        note: str = ""):
     """What the buyer gets and how — a card or a request — with one button to start."""
@@ -121,20 +139,12 @@ async def cb_go(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User, state: 
     card_id, amount = int(parts[1]), Decimal(parts[2])
     expect = Decimal(parts[3]) if len(parts) > 3 else None
     try:
-        deal = await deals.create(s, user, card_id, amount, expect)
+        deal = await open_card_deal(s, user, card_id, amount, expect)
     except deals.DealError as e:
-        await s.rollback()
-        await s.refresh(user)  # rollback expires every loaded object
         await c.answer(str(e), show_alert=True)
         # the card was taken meanwhile or the terms changed: quote again (another card or a request)
         return await offer_screen(bot, s, user, state, amount, c, warn(str(e)))
     await state.set_state(None)
-    seller = await s.get(User, deal.seller_id)
-    events.add(s, f"deal:{deal.id}", "created", f"Открыта: {money.fmt(deal.amount_rub)} ₽ → {money.usdt(deal.buyer_credit)} "
-                                                f"USDT, создал покупатель {person(user)}, карта продавца "
-                                                f"{person(seller)}, заморожено {money.usdt(deal.seller_debit)} USDT",
-               notice=True)
-    await s.commit()
     await deal_screen(bot, s, user, deal, c)
     await on_deal_created(bot, s, deal)
 

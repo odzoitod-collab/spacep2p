@@ -212,6 +212,7 @@ awaiting_payment ──receipt──▶ verifying ──продавец под�
 |---|---|---|---|
 | `amount_rub` | string | да | Сумма перевода, до 2 знаков после точки |
 | `external_id` | string | нет | Ваш идентификатор заказа, 1–64 символа. **Ключ идемпотентности** |
+| `payer_id` | string | рекомендуется | ID вашего клиента, который платит (1–64: `A–Z a–z 0–9 _ . : @ -`). По нему: 3 брошенных заказа за сутки (истекли без чека) — пауза 2 ч (`429 payer_paused`); администрация может перестать принимать заказы этого плательщика (`403 payer_blocked`). Остальные ваши клиенты работают как обычно |
 | `bank` | string | нет | Только продавцы этого банка, например `"Сбербанк"` |
 | `type` | string | нет | `"card"` — перевод по номеру карты, `"sbp"` — по телефону |
 | `order_requisites` | bool | нет | По умолчанию `true`: если готовой карты под сумму нет, открыть заявку на ордерные реквизиты (ответ **202**). `false` — сразу `409 no_liquidity` |
@@ -264,7 +265,7 @@ curl -X POST https://api.<домен>/v1/orders \
 с `close_reason: "no_merchant"`. Отменить поиск — `POST /v1/orders/{id}/cancel`. Для вас все три статуса поиска
 работают одинаково: курс и сумма в USDT уже зафиксированы.
 
-Ошибки: `invalid_amount`, `invalid_external_id`, `invalid_type`, `invalid_field` (422), `amount_limit`, `daily_limit`,
+Ошибки: `invalid_amount`, `invalid_external_id`, `invalid_payer_id`, `payer_blocked` (403), `payer_paused` (429), `invalid_type`, `invalid_field` (422), `amount_limit`, `daily_limit`,
 `order_range` (422 — сумма вне диапазона ордерных реквизитов), `open_limit` (409), `no_liquidity` (409 — подходящих
 продавцов нет и ордерные реквизиты выключены или недоступны, см. `/v1/liquidity`).
 

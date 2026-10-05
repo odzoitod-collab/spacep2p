@@ -59,7 +59,8 @@ def pay_choices() -> list[int]:
 
 
 async def create_request(s: AsyncSession, buyer: User, amount_rub: Decimal, sender_bank: str | None,
-                         expect_credit: Decimal | None = None, client=None, external_id: str | None = None) -> Deal:
+                         expect_credit: Decimal | None = None, client=None, external_id: str | None = None,
+                         payer_id: str | None = None) -> Deal:
     """A request for requisites. Terms are quoted now; nothing is frozen until a merchant takes it."""
     if not amount_rub.is_finite() or amount_rub <= 0 or amount_rub.as_tuple().exponent < -2:
         raise DealError("Некорректная сумма", "invalid_amount")
@@ -67,7 +68,7 @@ async def create_request(s: AsyncSession, buyer: User, amount_rub: Decimal, send
     if not lo <= amount_rub <= hi:
         raise DealError(f"Реквизиты под сумму: от {money.fmt(lo)} до {money.fmt(hi)} ₽", "order_range")
     await money.lock(s, buyer.id)
-    await deals.check_buyer(s, buyer, amount_rub, client)
+    await deals.check_buyer(s, buyer, amount_rub, client, payer_id)
     # order merchants sell at the fixed order_rate; the buyer pays the same platform fee as with a static card
     rate, mr, pp = settings.dec("rate"), settings.dec("order_rate"), settings.dec("platform_pct")
     try:
@@ -83,7 +84,7 @@ async def create_request(s: AsyncSession, buyer: User, amount_rub: Decimal, send
              platform_fee=qt.platform_fee,
              status="searching", is_order=True, sender_bank=(sender_bank or None) and sender_bank[:40],
              expires_at=now() + timedelta(minutes=settings.num("order_search_minutes")),
-             api_client_id=client.id if client is not None else None, external_id=external_id)
+             api_client_id=client.id if client is not None else None, external_id=external_id, payer_id=payer_id)
     s.add(d)
     await s.flush()
     return d
@@ -109,6 +110,18 @@ async def reputation(s: AsyncSession, uid: int) -> tuple[Decimal | None, int]:
     if total < settings.num("rep_min_count"):
         return None, total
     return (Decimal(sum(scores)) / len(scores)).quantize(Decimal("0.1")), total
+
+
+SCORE_LATE_LINK = 3  # took a Bybit request and sent no link in time: the platform scores it itself
+
+
+async def auto_score(s: AsyncSession, d: Deal, merchant: int, score: int) -> None:
+    """A score from the platform itself (operator_id 0): facts no operator has to report — they count in the
+    reputation like an operator's score. Does not commit."""
+    from bot.models import MerchantRating
+    if not await s.scalar(select(MerchantRating.id).where(MerchantRating.deal_id == d.id,
+                                                          MerchantRating.merchant_id == merchant)):
+        s.add(MerchantRating(deal_id=d.id, merchant_id=merchant, operator_id=0, gave=False, score=score))
 
 
 def rep_line(rep: Decimal | None, total: int) -> str:
@@ -159,6 +172,26 @@ async def eligible(s: AsyncSession, d: Deal) -> list[tuple[OrderMerchant, User]]
     return [(m, u) for m, u in rows if u.id != d.buyer_id and u.id not in seen and not asleep(m)]
 
 
+async def merchant_score(s: AsyncSession, uid: int, done: int) -> Decimal:
+    """Who gets a new request first: the reputation (operators' scores and the platform's own for late links; 7 until
+    there are enough) and a little for experience."""
+    rep, _ = await reputation(s, uid)
+    return (rep if rep is not None else Decimal(7)) + Decimal(min(done, 100)) / 50
+
+
+async def first_wave(s: AsyncSession, d: Deal, ids: list[int]) -> set[int] | None:
+    """Of these merchants (who have not seen the request yet), the ones who get it during its first
+    order_wave_seconds: the order_first_wave best — each re-send in the window reaches the next best, so a request
+    the best ones declined is not left unseen. None when the wave is over (or off): everyone and the chats."""
+    size, secs = settings.num("order_first_wave"), settings.num("order_wave_seconds")
+    started = deals.aware(d.expires_at) - timedelta(minutes=settings.num("order_search_minutes"))
+    if not size or now() - started >= timedelta(seconds=secs):
+        return None
+    done = await deals.completed_count(s, ids)
+    scored = sorted([(await merchant_score(s, uid, done[uid]), uid) for uid in ids], reverse=True)
+    return {uid for _, uid in scored[:size]}
+
+
 async def take(s: AsyncSession, deal_id: int, merchant: User, bybit: bool = True) -> Deal:
     """First merchant wins: the deal row is locked, the status checked; with the balance his funds are frozen.
     Does not commit."""
@@ -176,6 +209,10 @@ async def take(s: AsyncSession, deal_id: int, merchant: User, bybit: bool = True
         raise DealError("Вы уже работали с этой заявкой — её выполнит другой мерчант", "cannot")
     if bybit and (problem := bybit_problem((await reputation(s, merchant.id))[0], d)):
         raise DealError(f"Не можете взять через Bybit-ордер: {problem}", "cannot")
+    if bybit and (waiting := await s.scalar(select(Deal.id).where(
+            Deal.seller_id == merchant.id, Deal.status == "assigned", Deal.via_bybit).limit(1))):
+        raise DealError(f"Сначала пришлите ссылку на ордер по заявке #{waiting} — две заявки без ордера держать "
+                        "нельзя", "busy")
     if not bybit:
         await money.freeze(s, u.id, d.seller_debit, f"deal:{d.id}")
     # a Bybit order: order_link_minutes for the link, or the request is not his (it goes to the others);
@@ -202,7 +239,7 @@ async def give_requisites(s: AsyncSession, deal_id: int, who: User, kind: str, b
     d = await s.get(Deal, deal_id, with_for_update=True, populate_existing=True)
     if not giver(d, who.id):
         raise DealError("Заявка уже не у вас", "not_yours")
-    if deals.aware(d.expires_at) < now():
+    if not deals.held(d) and deals.aware(d.expires_at) < now():
         raise DealError("Время на выдачу реквизитов вышло", "late")
     if minutes not in pay_choices():
         raise DealError("Недопустимое время на оплату")
@@ -213,8 +250,9 @@ async def give_requisites(s: AsyncSession, deal_id: int, who: User, kind: str, b
     if d.via_bybit and d.bybit_url and d.seller_id and (m := await s.get(
             OrderMerchant, d.seller_id, with_for_update=True, populate_existing=True)):
         m.strikes = 0  # his order had requisites: the misses in a row start again (row locked, like strike())
+    held = d.via_bybit and d.operator_id == who.id  # the operator closes it himself: no payment deadline
     return await deals._move(s, d.id, (d.status,), "waiting_payment", card_id=card.id,
-                             expires_at=now() + timedelta(minutes=minutes))
+                             expires_at=now() + (deals.HOLD if held else timedelta(minutes=minutes)))
 
 
 async def give_link(s: AsyncSession, deal_id: int, merchant: User, url: str) -> Deal:
@@ -226,6 +264,8 @@ async def give_link(s: AsyncSession, deal_id: int, merchant: User, url: str) -> 
         raise DealError("Время на ссылку вышло — заявка передана другим мерчантам", "late")
     if used := await s.scalar(select(Deal.id).where(Deal.bybit_url == url, Deal.id != d.id).limit(1)):
         raise DealError(f"Эта ссылка уже была в заявке #{used}. Создайте новый ордер под эту сумму", "link_used")
+    if d.operator_id:  # the operator asked to recreate the order: the new link is his, still without a deadline
+        return await deals._move(s, d.id, ("assigned",), "checking", bybit_url=url, expires_at=now() + deals.HOLD)
     return await deals._move(s, d.id, ("assigned",), "checking", bybit_url=url, operator_id=None,
                              expires_at=now() + timedelta(minutes=settings.num("order_check_minutes")))
 
@@ -237,8 +277,46 @@ async def claim(s: AsyncSession, deal_id: int, operator: User) -> Deal:
         raise DealError("Ордер уже обработан или заявка закрыта", "gone")
     if d.operator_id not in (None, operator.id):
         raise DealError("Ордер уже принял другой оператор", "taken")
+    if operator.id in (d.buyer_id, d.seller_id):
+        raise DealError("Это ваша собственная заявка — её ордер примет другой оператор", "own")
+    if (cap := settings.dec("operator_max_debt")) > 0:
+        exposure = await operator_exposure(s, operator.id)
+        if exposure + d.seller_debit > cap:
+            raise DealError(f"Предел {money.usdt(cap)} USDT: долг и ордера в работе — {money.usdt(exposure)} USDT. "
+                            "Погасите долг в «Оператор», и ордера снова можно принимать", "debt_cap")
     d.operator_id = operator.id
+    d.expires_at = now() + deals.HOLD  # from now on the operator closes it, not a timer
     return d
+
+
+async def operator_exposure(s: AsyncSession, uid: int) -> Decimal:
+    """What the platform risks with this operator: his debt plus the USDT of the Bybit orders in his hands that will
+    become debt once confirmed."""
+    from bot.models import Operator
+    op = await s.get(Operator, uid)
+    open_ = await s.scalar(select(func.coalesce(func.sum(Deal.seller_debit), 0)).where(
+        Deal.operator_id == uid, Deal.via_bybit, Deal.bybit_url.is_not(None),
+        Deal.status.in_(("assigned", "checking", "waiting_payment", "paid", "dispute"))))
+    return (op.debt if op else Decimal(0)) + Decimal(open_)
+
+
+async def drop_operator(s: AsyncSession, uid: int) -> tuple[list[Deal], list[Deal]]:
+    """The operator is gone (removed or banned): his orders not yet with requisites go back to the other operators
+    with the usual time; deals where the buyer has requisites but has not paid are closed like an expired payment —
+    a buyer who did pay still uploads the receipt and the deal goes to the administration. Returns (returned,
+    closed). Does not commit."""
+    returned, closed = [], []
+    for d in (await s.scalars(select(Deal).where(Deal.operator_id == uid, Deal.via_bybit,
+                                                 Deal.status.in_(("checking", "assigned"))))).all():
+        d.operator_id = None
+        if d.status == "checking":
+            d.expires_at = now() + timedelta(minutes=settings.num("order_check_minutes"))
+        returned.append(d)
+    for did in (await s.scalars(select(Deal.id).where(Deal.operator_id == uid, Deal.via_bybit,
+                                                      Deal.status == "waiting_payment"))).all():
+        if d := await deals._move(s, did, ("waiting_payment",), "expired", close_reason="operator_gone"):
+            closed.append(d)
+    return returned, closed
 
 
 async def unclaim(s: AsyncSession, deal_id: int, operator: User) -> Deal | None:
@@ -252,6 +330,7 @@ async def unclaim(s: AsyncSession, deal_id: int, operator: User) -> Deal | None:
                                  operator_id=None,
                                  expires_at=now() + timedelta(minutes=settings.num("order_search_minutes")))
     d.operator_id = None
+    d.expires_at = now() + timedelta(minutes=settings.num("order_check_minutes"))  # the others get the usual time
     return d
 
 
@@ -270,17 +349,34 @@ async def admin_take(s: AsyncSession, deal_id: int, admin: User) -> tuple[Deal, 
     keep = d.status == "checking" and d.bybit_url
     moved = await deals._move(s, d.id, (d.status,), "checking", via_bybit=True, operator_id=admin.id,
                               seller_id=d.seller_id if keep else None,
-                              expires_at=now() + timedelta(minutes=settings.num("order_take_minutes")))
+                              expires_at=now() + deals.HOLD)
     return moved, merchant, operator
 
 
-async def reject_link(s: AsyncSession, deal_id: int, operator: User) -> Deal | None:
-    """The link is wrong (other amount, closed order...): back to the merchant for another one (checking -> assigned)."""
+async def recreate(s: AsyncSession, deal_id: int, operator: User) -> tuple[Deal | None, bool]:
+    """«Пересоздать ордер»: the order is wrong or dead (another amount, closed, no requisites yet) — the merchant
+    makes a new one and sends its link within order_link_minutes. The operator who asked keeps the deal and gets the
+    new link; requisites already given are taken back (the buyer has not paid). (deal or None, requisites revoked).
+    Does not commit."""
     d = await s.get(Deal, deal_id, with_for_update=True, populate_existing=True)
-    if d is None or d.status != "checking" or d.operator_id not in (None, operator.id):
+    if d is None or not d.via_bybit or not d.bybit_url or not d.seller_id \
+            or d.status not in ("checking", "waiting_payment") or d.operator_id not in (None, operator.id):
+        return None, False
+    revoked = d.status == "waiting_payment"
+    moved = await deals._move(s, d.id, (d.status,), "assigned", bybit_url=None, card_id=None, operator_id=operator.id,
+                              expires_at=now() + timedelta(minutes=settings.num("order_link_minutes")))
+    return moved, revoked
+
+
+async def close_by_operator(s: AsyncSession, deal_id: int, operator: User) -> Deal | None:
+    """The operator closes his deal before the buyer paid (the order is gone, the buyer does not answer…).
+    Does not commit."""
+    d = await s.get(Deal, deal_id, with_for_update=True, populate_existing=True)
+    if d is None or not d.via_bybit or d.operator_id != operator.id or d.status not in ("checking", "waiting_payment"):
         return None
-    return await deals._move(s, d.id, ("checking",), "assigned", bybit_url=None, operator_id=None,
-                             expires_at=now() + timedelta(minutes=settings.num("order_link_minutes")))
+    if d.status == "waiting_payment":  # the buyer has requisites: if he paid after all, his receipt still comes in
+        return await deals._move(s, d.id, ("waiting_payment",), "expired", close_reason="operator_close")
+    return await deals.cancel(s, d.id, (d.status,), "cancelled", "operator_close")
 
 
 async def strike(s: AsyncSession, merchant_id: int) -> tuple[int, object]:
@@ -330,7 +426,10 @@ async def stale(s: AsyncSession) -> tuple[list[int], list[int], list[int]]:
     t = now()
     out = []
     for st in REQUEST:
-        out.append(list((await s.scalars(select(Deal.id).where(Deal.status == st, Deal.expires_at < t))).all()))
+        q = select(Deal.id).where(Deal.status == st, Deal.expires_at < t)
+        if st == "checking":  # an order an operator accepted has no deadline: he closes it himself
+            q = q.where(Deal.operator_id.is_(None))
+        out.append(list((await s.scalars(q)).all()))
     return tuple(out)
 
 

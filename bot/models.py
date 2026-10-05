@@ -131,6 +131,8 @@ class Deal(Base):
     # the merchant's team: its leader got team_fee USDT out of the platform's fee when the deal completed
     team_id: Mapped[int | None]
     team_fee: Mapped[Decimal] = mapped_column(USDT, default=Decimal(0), server_default=text("0"))
+    # an API order: the id of the client's own customer who pays (payer_id in the API) — limits and blocks per payer
+    payer_id: Mapped[str | None] = mapped_column(String(64), index=True)
 
 
 class Deposit(Base):
@@ -382,6 +384,18 @@ class ApiApplication(Base):
     reason: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(default=now)
     decided_at: Mapped[datetime | None]
+
+
+class ApiPayerBlock(Base):
+    """A payer of an API client we no longer take orders from (an admin's decision on a deal)."""
+    __tablename__ = "api_payer_blocks"
+    __table_args__ = (Index("ux_api_payer_blocks", "client_id", "payer_id", unique=True),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    client_id: Mapped[int] = mapped_column(index=True)
+    payer_id: Mapped[str] = mapped_column(String(64))
+    reason: Mapped[str] = mapped_column(String(200), default="")
+    admin_id: Mapped[int | None] = mapped_column(BigInteger)
+    created_at: Mapped[datetime] = mapped_column(default=now)
 
 
 class ApiClient(Base):
@@ -637,6 +651,11 @@ MIGRATIONS: list[tuple[int, list[str]]] = [
     (17, [
         # withdrawals only of what was turned over: users from before start with nothing locked
         "ALTER TABLE users ADD COLUMN IF NOT EXISTS deposit_lock NUMERIC(20, 6) NOT NULL DEFAULT 0",
+    ]),
+    (18, [
+        # the API client's own payer: abandoned orders and blocks per payer (api_payer_blocks from create_all)
+        "ALTER TABLE deals ADD COLUMN IF NOT EXISTS payer_id VARCHAR(64)",
+        "CREATE INDEX IF NOT EXISTS ix_deals_payer_id ON deals (payer_id)",
     ]),
 ]
 
