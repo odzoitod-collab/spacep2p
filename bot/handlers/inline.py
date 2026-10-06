@@ -6,7 +6,7 @@ from aiogram.types import InlineQuery, InlineQueryResultArticle, InlineQueryResu
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from bot.handlers.deal import STATUS
+from bot.handlers.deal import STATUS, status_of
 from bot.handlers.wallet import KINDS, ref_label, signed
 from bot.models import Deal, Ledger, User
 from bot.services import deals, money
@@ -46,7 +46,7 @@ async def _deals(s: AsyncSession, user: User, words: list[str], offset: int) -> 
     for d in rows:
         buy = d.buyer_id == user.id
         out.append(_article(
-            f"d{d.id}", f"{'↓' if buy else '↑'} #{d.id} · {money.fmt(d.amount_rub)} ₽ · {STATUS[d.status][1]}",
+            f"d{d.id}", f"{'↓' if buy else '↑'} #{d.id} · {money.fmt(d.amount_rub)} ₽ · {status_of(d, user.id)[1]}",
             f"{'Покупка' if buy else 'Продажа'} · {money.usdt(d.buyer_credit if buy else d.seller_debit)} USDT · "
             f"{deals.aware(d.created_at).astimezone(MSK):%d.%m %H:%M}" + (" · ордер" if d.is_order else ""),
             f"/deal {d.id}"))

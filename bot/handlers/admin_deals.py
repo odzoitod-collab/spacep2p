@@ -145,7 +145,7 @@ async def cb_payer_block(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User
                             reason=f"сделка #{d.id}"))
         what = f"Заказы от плательщика {d.payer_id} больше не принимаются"
     audit.log(s, user.id, "api_payer", f"deal:{d.id}", what)
-    events.add(s, f"deal:{d.id}", "payer_block", f"{what} ({user.name})", user.id, alert=True)
+    events.add(s, f"deal:{d.id}", "payer_block", f"{what} ({user.name})", user.id, notice=True)
     await s.commit()
     await deal_view(bot, s, user, d, c, ok(what))
 

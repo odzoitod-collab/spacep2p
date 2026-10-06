@@ -3,9 +3,8 @@ from decimal import Decimal as D
 
 from bot import models, tasks
 from bot.config import config
-from bot.models import TonAddress
-from bot.services import finance, ton
-from tests.harness import cb, msg, plain
+from bot.services import finance
+from tests.harness import cb, deposit, msg, plain
 from tests.test_scenarios import ADMIN, BUYER, PDF, SELLER, create_deal, ready
 
 
@@ -14,20 +13,19 @@ def test_numbers_add_up_and_stats_message_is_edited(go, monkeypatch):
         await ready(b)  # the seller holds 200 USDT
         d = await create_deal(b)
         await b.run(cb(BUYER, f"dl:rc:{d.id}"), msg(BUYER, document=PDF), cb(SELLER, f"dl:ok2:{d.id}"))
-        b.chain.fund_hot(usdt="990", gas="4")
-        async with models.Session() as s:  # 10 USDT came to a personal address, not collected yet
-            s.add(TonAddress(user_id=BUYER, purpose="deposit", address=ton.address(f"deposit:{BUYER}"), unswept=D(10)))
-            await s.commit()
+        b.chain.fund_hot(usdt="990", bnb="4")
+        await deposit(b, BUYER, "10")  # 10 USDT came to his deposit address, not collected yet
+        async with models.Session() as s:
             sn = await finance.snapshot(s)
-        assert (sn.hot, sn.unswept, sn.hot_ton, sn.assets) == (D(990), D(10), D(4), D(1000))
-        assert (sn.users_available, sn.users_frozen) == (D(105) + D(94), D(0))  # seller 105, buyer 94
+        assert (sn.hot, sn.unswept, sn.bnb, sn.assets) == (D(990), D(10), D(4), D(1000))
+        assert (sn.users_available, sn.users_frozen) == (D(105) + D(104), D(0))  # seller 105, buyer 94 + 10
         assert sn.profit["all"] == D(1) and sn.profit["24h"] == D(1)  # 95 − 94 stays with the platform
-        assert sn.liabilities == D(199) and sn.free == D(801)
+        assert sn.liabilities == D(209) and sn.free == D(791)
         assert sn.volume["24h"] == (1, D(10000))
 
         await b.run(cb(ADMIN, "a"), cb(ADMIN, "afin"))
         text = plain(b.session.last(ADMIN))
-        assert "Можно забрать: 801 USDT" in text and "всего +1 USDT" in text and "отсюда выводы: 990 USDT · газ 4 TON" in text
+        assert "Можно забрать: 791 USDT" in text and "всего +1 USDT" in text and "отсюда выводы: 990 USDT · газ 4 BNB" in text
         assert "ещё не собрано: 10 USDT" in text
 
         forum = -100555

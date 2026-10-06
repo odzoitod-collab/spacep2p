@@ -151,7 +151,7 @@ async def step(b, rng: random.Random):
                     d.hold_until = deals.aware(d.hold_until) - shift
             await s.commit()
         for job in (tasks.expire_deals, tasks.order_timeouts, tasks.release_holds, tasks.remind_sellers,
-                    tasks.escalate_unanswered_deals, tasks.ton_cycle, tasks.deliver_alerts):
+                    tasks.escalate_unanswered_deals, tasks.bsc_tick, tasks.deliver_alerts):
             await job(b.bot)
         return
     if roll < 0.55:

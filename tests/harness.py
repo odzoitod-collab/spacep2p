@@ -1,17 +1,14 @@
-"""Test bench: real dispatcher + middlewares + handlers, fake Telegram transport, fake TON network.
+"""Test bench: real dispatcher + middlewares + handlers, fake Telegram transport, fake BNB Smart Chain (FakeBsc).
 
 Database: SQLite in memory by default; every test using `db_url` also runs on PostgreSQL when
 P2P_TEST_PG is set (e.g. postgresql+asyncpg://p2p@127.0.0.1:55432/p2p_test). The PG schema is
 dropped and re-created for every test.
 """
 import asyncio
-import base64
-import hashlib
 import html
 import itertools
 import os
 import re
-import time
 from datetime import datetime
 from decimal import Decimal
 from html.parser import HTMLParser
@@ -20,9 +17,10 @@ os.environ.setdefault("BOT_TOKEN", "123:abc")
 os.environ["ADMIN_IDS"] = "[1, 2]"  # 2 = second admin for approvals
 os.environ["LOG_CHAT_ID"] = "1"  # never use the log chat from a developer's .env
 os.environ["EMOJI_MODE"] = "premium"
-os.environ["TON_SEED"] = "5e" * 32  # a fixed test key: every wallet address is stable across runs
-os.environ["TON_TESTNET"] = "false"
-os.environ["TON_API_KEY"] = ""
+WORDS = "test test test test test test test test test test test junk"  # the well-known test seed (Hardhat)
+os.environ["BSC_MNEMONIC"] = WORDS  # the BEP-20 desk is on in every test, with stable addresses
+os.environ["MASTER_SECRET"] = ""
+os.environ["BSC_RPC_URLS"] = ""
 
 from aiogram import Bot, Dispatcher  # noqa: E402
 from aiogram.client.default import DefaultBotProperties  # noqa: E402
@@ -41,7 +39,19 @@ from bot.app import build_dispatcher  # noqa: E402
 from bot import ui  # noqa: E402
 from bot.api import server as api_server  # noqa: E402
 from bot.handlers import logchat  # noqa: E402
-from bot.services import settings, ton  # noqa: E402
+from bot.services import bsc, settings  # noqa: E402
+import rlp  # noqa: E402
+from eth_account import Account  # noqa: E402
+from eth_utils import keccak, to_checksum_address  # noqa: E402
+
+HOT = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"  # m/44'/60'/0'/0/0 of WORDS — MetaMask «Account 1»
+EXCH = "0x28C6c06298d514Db089934071355E5743bf21d60"  # an exchange that sends deposits
+GWEI = 10 ** 9
+
+
+def W(x) -> int:
+    """USDT or BNB -> wei (18 decimals)."""
+    return int(Decimal(str(x)) * 10 ** 18)
 
 ui.MIN_GAP = 0  # no pacing delays in tests
 
@@ -178,98 +188,136 @@ class FakeSession(BaseSession):
         return []
 
 
-class FakeChain:
-    """The TON network as services/ton.Chain shows it: wallets with seqno and TON, USDT jetton balances, the indexer's
-    jetton transfers. broadcast() executes a message like a v4 wallet: only with the current seqno and before
-    valid_until."""
-
+class FakeBsc:
     def __init__(self):
-        self.seqno: dict[str, int] = {}  # wallet label -> seqno
-        self.ton: dict[str, Decimal] = {}  # raw address -> TON
-        self.usdt: dict[str, Decimal] = {}  # raw owner -> USDT
-        self.transfers: list[dict] = []  # what Toncenter v3 /jetton/transfers knows
-        self.sent: list[tuple] = []  # executed messages: (label, asset, to raw, amount, memo, query_id)
-        self.messages: dict[str, dict] = {}  # boc -> signed message
-        self.apply = True  # broadcast reaches the network (False: lost on the way)
-        self.abort = False  # jetton transfers are aborted on chain
-        self.index = True  # executed jetton transfers show up in the indexer
-        self.down = False  # Toncenter does not answer
-        self.n = 0
+        self.head = self.final = 10_000
+        self.usdt: dict[str, int] = {}
+        self.bnb: dict[str, int] = {}
+        self.nonce: dict[str, int] = {}
+        self.pool: dict[str, dict] = {}
+        self.receipts: dict[str, dict] = {}
+        self.logs: list[dict] = []
+        self.gp = GWEI
+        self.down = False
+        self.accept = True
+        self.revert = 0  # the next N token transfers revert
+        self.sends: list[str] = []
 
-    def _check(self):
+    def _log(self, src, dst, wei, h, li=0):
+        self.logs.append({"address": bsc.USDT.lower(), "topics": [bsc.TRANSFER_TOPIC, bsc.pad32(src), bsc.pad32(dst)],
+                          "data": hex(wei), "blockNumber": hex(self.head), "logIndex": hex(li), "transactionHash": h,
+                          "blockTimestamp": hex(1_700_000_000 + self.head), "removed": False})
+
+    def pay(self, to, amount, src=EXCH) -> str:
+        """A transfer from outside, in a new final block."""
+        self.head += 1
+        self.final = self.head
+        h = "0x" + os.urandom(32).hex()
+        self.usdt[to] = self.usdt.get(to, 0) + W(amount)
+        self._log(src, to, W(amount), h)
+        return h
+
+    def fund(self, a, usdt=0, bnb=0):
+        self.usdt[a] = self.usdt.get(a, 0) + W(usdt)
+        self.bnb[a] = self.bnb.get(a, 0) + W(bnb)
+
+    def fund_hot(self, usdt=0, bnb="0.05"):
+        self.fund(HOT, usdt, bnb)
+
+    def usdt_of(self, a) -> Decimal:
+        return Decimal(self.usdt.get(a, 0)) / 10 ** 18
+
+    def replace(self, a):
+        """Somebody used the address's next nonce outside the bot: our pending transaction can never be mined."""
+        self.nonce[a] = self.nonce.get(a, 0) + 1
+        self.pool = {h: t for h, t in self.pool.items() if not (t["from"] == a and t["nonce"] < self.nonce[a])}
+
+    @staticmethod
+    def _decode(data: str) -> tuple[str, int]:
+        assert data[2:10] == bsc.SEL_TRANSFER
+        return to_checksum_address("0x" + data[34:74]), int(data[74:138], 16)
+
+    def mine(self):
+        """Everything that can go, in nonce order, into one new final block."""
+        self.head += 1
+        self.final = self.head
+        li, moved = 0, True
+        while moved:
+            moved = False
+            for h, t in sorted(self.pool.items(), key=lambda kv: kv[1]["nonce"]):
+                if t["nonce"] != self.nonce.get(t["from"], 0) or self.bnb.get(t["from"], 0) < t["gas"] * t["gp"] + t["value"]:
+                    continue
+                del self.pool[h]
+                moved = True
+                self.nonce[t["from"]] = t["nonce"] + 1
+                token = t["to"] == bsc.USDT
+                self.bnb[t["from"]] -= (50_000 if token else 21_000) * t["gp"] + t["value"]
+                self.bnb[t["to"]] = self.bnb.get(t["to"], 0) + t["value"]
+                ok = True
+                if token:
+                    to, amount = self._decode(t["data"])
+                    if self.revert or amount > self.usdt.get(t["from"], 0):
+                        ok, self.revert = False, max(self.revert - 1, 0)
+                    else:
+                        self.usdt[t["from"]] -= amount
+                        self.usdt[to] = self.usdt.get(to, 0) + amount
+                        self._log(t["from"], to, amount, h, li)
+                        li += 1
+                self.receipts[h] = {"blockNumber": hex(self.head), "status": "0x1" if ok else "0x0"}
+
+    def handle(self, method, params):
         if self.down:
-            raise ton.ChainError("toncenter: ConnectError down")
-
-    def _transfer(self, source, destination, amount, query_id=0, aborted=False, master=None) -> str:
-        self.n += 1
-        h = hashlib.sha256(f"tx{self.n}".encode()).digest()
-        self.transfers.append({
-            "source": source, "destination": destination, "amount": str(int(Decimal(amount) * ton.USDT_UNIT)),
-            "jetton_master": master or ton.usdt_master(), "transaction_hash": base64.b64encode(h).decode(),
-            "transaction_now": int(time.time()), "transaction_aborted": aborted, "query_id": str(query_id)})
-        return h.hex()
-
-    def pay(self, uid, amount, purpose="deposit", master=None, aborted=False) -> str:
-        """Someone sends USDT to the user's personal address. Returns the transaction hash (hex)."""
-        to = ton.address(f"{purpose}:{uid}")
-        if not aborted and master is None:
-            self.usdt[to] = self.usdt.get(to, Decimal(0)) + Decimal(amount)
-        return self._transfer(ton.raw("UQCxE6mUtQJKFnGfaROTKOt1lZbDiiX1kCixRv7Nw2Id_p0p"), to, amount, aborted=aborted,
-                              master=master)
-
-    def fund_hot(self, usdt="0", gas="10"):
-        hot = ton.hot_address()
-        self.usdt[hot] = self.usdt.get(hot, Decimal(0)) + Decimal(usdt)
-        self.ton[hot] = self.ton.get(hot, Decimal(0)) + Decimal(gas)
-
-    async def state(self, label):
-        self._check()
-        return self.seqno.get(label, 0), self.ton.get(ton.address(label), Decimal(0))
-
-    async def build(self, tr):
-        boc = f"boc{tr.id}"
-        self.messages[boc] = {"wallet": tr.wallet, "seqno": tr.seqno, "valid_until": tr.valid_until,
-                              "asset": tr.asset, "to": tr.to_address, "amount": Decimal(tr.amount), "memo": tr.memo,
-                              "query_id": tr.id}
-        return boc, hashlib.sha256(boc.encode()).hexdigest()
-
-    async def broadcast(self, boc):
-        self._check()
-        m = self.messages[boc]
-        label, src = m["wallet"], ton.address(m["wallet"])
-        if not self.apply or self.seqno.get(label, 0) != m["seqno"] or time.time() > m["valid_until"]:
-            return  # a v4 wallet refuses it: nothing happens
-        self.seqno[label] = m["seqno"] + 1
-        fee = ton.JETTON_TON if m["asset"] == "USDT" else m["amount"]
-        self.ton[src] = self.ton.get(src, Decimal(0)) - fee
-        if m["asset"] == "TON":
-            self.ton[m["to"]] = self.ton.get(m["to"], Decimal(0)) + m["amount"]
-        else:
-            aborted = self.abort or self.usdt.get(src, Decimal(0)) < m["amount"]
-            if not aborted:
-                self.usdt[src] -= m["amount"]
-                self.usdt[m["to"]] = self.usdt.get(m["to"], Decimal(0)) + m["amount"]
-            if self.index:
-                self._transfer(src, m["to"], m["amount"], m["query_id"], aborted)
-        self.sent.append((label, m["asset"], m["to"], m["amount"], m["memo"], m["query_id"]))
-
-    async def incoming(self, owners, since):
-        self._check()
-        return [t for t in self.transfers if t["destination"] in owners and t["transaction_now"] >= since]
-
-    async def outgoing(self, owner, since):
-        self._check()
-        return [t for t in self.transfers if t["source"] == owner and t["transaction_now"] >= since]
-
-    async def usdt_balance(self, owner):
-        self._check()
-        return self.usdt.get(owner, Decimal(0))
-
-    async def check(self):
-        self._check()
-
-    async def close(self):
-        pass
+            raise bsc.RpcError("node: ConnectError")
+        if method == "eth_blockNumber":
+            return hex(self.head)
+        if method == "eth_getBlockByNumber":
+            if params[0] == "finalized":
+                return {"number": hex(self.final)}
+            return {"number": params[0], "timestamp": hex(1_700_000_000 + int(params[0], 16))}
+        if method == "eth_call":
+            assert params[0]["to"] == bsc.USDT and params[0]["data"].startswith("0x" + bsc.SEL_BALANCE)
+            return hex(self.usdt.get(to_checksum_address("0x" + params[0]["data"][-40:]), 0))
+        if method == "eth_getBalance":
+            return hex(self.bnb.get(params[0], 0))
+        if method == "eth_gasPrice":
+            return hex(self.gp)
+        if method == "eth_getTransactionCount":
+            a, tag = params
+            n = self.nonce.get(a, 0)
+            while tag == "pending" and any(t["from"] == a and t["nonce"] == n for t in self.pool.values()):
+                n += 1
+            return hex(n)
+        if method == "eth_estimateGas":
+            _, amount = self._decode(params[0]["data"])
+            if amount > self.usdt.get(params[0]["from"], 0):
+                raise bsc.RpcError("node: execution reverted: BEP20: transfer amount exceeds balance")
+            return hex(50_000)
+        if method == "eth_sendRawTransaction":
+            raw = params[0]
+            h = "0x" + keccak(hexstr=raw).hex()
+            self.sends.append(h)
+            if not self.accept:
+                raise bsc.RpcError("node: boom")
+            if h in self.pool or h in self.receipts:
+                raise bsc.RpcError("node: already known")
+            f = rlp.decode(bytes.fromhex(raw[2:]))
+            nonce, gp, gas, to, value, data, v = (int.from_bytes(f[0], "big"), int.from_bytes(f[1], "big"),
+                                                  int.from_bytes(f[2], "big"), f[3], int.from_bytes(f[4], "big"),
+                                                  f[5], int.from_bytes(f[6], "big"))
+            assert v in (35 + 2 * 56, 36 + 2 * 56)  # EIP-155 for chain 56, legacy gasPrice
+            frm = Account.recover_transaction(raw)
+            if nonce < self.nonce.get(frm, 0):
+                raise bsc.RpcError("node: nonce too low")
+            self.pool[h] = {"from": frm, "nonce": nonce, "gp": gp, "gas": gas, "to": to_checksum_address(to),
+                            "value": value, "data": "0x" + data.hex()}
+            return h
+        if method == "eth_getTransactionReceipt":
+            return self.receipts.get(params[0])
+        if method == "eth_getLogs":
+            f = params[0]
+            lo, hi, targets = int(f["fromBlock"], 16), int(f["toBlock"], 16), set(f["topics"][2])
+            return [x for x in self.logs if lo <= int(x["blockNumber"], 16) <= hi and x["topics"][2] in targets]
+        raise AssertionError(method)
 
 
 def tg(uid):
@@ -310,10 +358,10 @@ async def cb_main(uid, data, session=None):
 async def reset_db(url: str) -> None:
     ui._banner_id = None  # every test starts like a fresh process: banner not uploaded yet
     ui._emoji_off_until = 0.0
-    ton._hot = None
-    ton.busy = asyncio.Lock()
-    ton.wake = asyncio.Event()
-    ton.POLL, ton.WAIT = 0, 0.01
+    bsc._use(WORDS)  # the desk is on; a test that needs it off calls bsc._use(None)
+    bsc.error = ""
+    bsc.lock = asyncio.Lock()
+    bsc.wake = asyncio.Event()
     api_server.limiter._buckets.clear()
     logchat._forum.clear()
     logchat._topics.clear()
@@ -331,6 +379,7 @@ async def reset_db(url: str) -> None:
         await settings.put(s, "join_required", "0")  # the entry gate has its own tests
         await settings.put(s, "withdraw_turnover", "0")  # so has the turnover rule (tests/test_turnover.py)
         await settings.put(s, "order_first_wave", "0")  # requests to everyone at once; the waves have their own test
+        await settings.put(s, "log_all", "1")  # scenarios read every step in the log; the quiet default has its own test
         await s.commit()
         await settings.load(s)
 
@@ -344,8 +393,11 @@ class Bench:
     def __init__(self):
         self.session = FakeSession()
         self.bot = Bot("123:abc", session=self.session, default=DefaultBotProperties(parse_mode="HTML"))
-        self.chain = FakeChain()
-        ton.chain = self.chain
+        self.chain = FakeBsc()
+
+        async def post(url, method, params):
+            return self.chain.handle(method, params)
+        bsc._post = post
         self.dp = make_dp()
 
     def restart(self):
@@ -418,6 +470,15 @@ def plain(t: str) -> str:
     return re.sub(r"(?m)^[├╰] {2}", "", p)
 
 
-async def ton_cycle(b) -> "ton.Report":
+async def bsc_tick(b) -> "bsc.Report":
     from bot import tasks
-    return await tasks.ton_cycle(b.bot)
+    return await tasks.bsc_tick(b.bot, 0)
+
+
+async def deposit(b, uid: int, amount) -> str:
+    """Someone sends USDT to the user's deposit address; then a tick credits it. Returns the tx hash."""
+    async with models.Session() as s:
+        addr = await bsc.deposit_address(s, uid)
+    h = b.chain.pay(addr, amount)
+    await bsc_tick(b)
+    return h

@@ -7,7 +7,7 @@ one for both. The page itself is static (bot/webapp/), it reads everything from 
 import hashlib
 import logging
 from datetime import datetime, timedelta
-from decimal import Decimal
+from decimal import ROUND_DOWN, Decimal
 from pathlib import Path
 from uuid import UUID
 
@@ -17,10 +17,12 @@ from aiogram.types import BufferedInputFile
 from aiogram.utils.web_app import safe_parse_webapp_init_data
 from aiohttp import web
 from sqlalchemy import exists, func, or_, select
+from sqlalchemy.exc import IntegrityError
 
 from bot.config import config
-from bot.models import Card, Deal, DealMessage, Deposit, Ledger, Operator, OrderMerchant, Session, User, Withdrawal, now
-from bot.services import admins, api, deals, events, money, operators, settings, teams, ton
+from bot.models import (Card, Deal, DealMessage, DealRead, Deposit, Ledger, Operator, OrderMerchant, Session, User,
+                        Withdrawal, now)
+from bot.services import admins, api, bsc, deals, events, money, operators, settings, teams
 
 log = logging.getLogger(__name__)
 ROOT = Path(__file__).resolve().parent.parent / "webapp"
@@ -34,7 +36,7 @@ limiter = api.RateLimiter()
 # Cloudflare (the proxy in front) injects its analytics beacon into the page: allowed, so the console stays clean —
 # Cloudflare terminates TLS anyway, the script adds no new party
 CSP = ("default-src 'self'; script-src 'self' https://telegram.org https://static.cloudflareinsights.com; "
-       "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; "
+       "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com data: blob:; "
        "img-src 'self' data: blob: https://t.me https://*.telegram.org https://*.t.me; media-src 'self' blob:; "
        "connect-src 'self' https://cloudflareinsights.com")
 
@@ -157,6 +159,17 @@ async def page(request: web.Request) -> web.Response:
                                  "Referrer-Policy": "no-referrer"})
 
 
+VENDOR = {"pdf.min.js", "pdf.worker.min.js", "qrcode.min.js"}  # pdf.js 3.11 (Apache-2.0): PDF receipts in the page; qrcode-generator 1.4.4 (MIT): the deposit address as a QR
+
+
+async def vendor(request: web.Request) -> web.Response:
+    name = request.match_info["name"]
+    if name not in VENDOR or not (ROOT / "vendor" / name).is_file():
+        raise web.HTTPNotFound()
+    return web.Response(body=(ROOT / "vendor" / name).read_bytes(), content_type="application/javascript",
+                        headers={"Cache-Control": "public, max-age=31536000, immutable"})
+
+
 async def asset(request: web.Request) -> web.Response:
     name = request.match_info["name"]
     if name not in FILES or not (ROOT / name).is_file():
@@ -193,6 +206,7 @@ async def me(request: web.Request) -> web.Response:
         work["free_orders"] = await s.scalar(select(func.count(Deal.id)).where(
             Deal.status == "checking", Deal.operator_id.is_(None), Deal.via_bybit, Deal.seller_id != user.id))
     if rl["merchant"] == "approved":
+        work["line"] = not (await s.get(OrderMerchant, user.id)).offline
         work["offers"] = await s.scalar(select(func.count(Deal.id)).where(
             Deal.status == "searching", Deal.buyer_id != user.id, Deal.expires_at >= now()))
     if rl["admin"]:
@@ -210,7 +224,8 @@ async def me(request: web.Request) -> web.Response:
                     "debt": num(op.debt) if op and op.debt else None},
         "rate": {"rate": num(rate), "pct": num(pct), "own": settings.has_terms(user),
                  "example_rub": "10000", "example_usdt": num(deals.buyer_preview(Decimal(10000), user).buyer_credit)},
-        "counts": {"open": len(active), "action": sum(deal_json(d, None, user.id, full=False)["action"] for d in active)},
+        "counts": {"open": len(active), "action": sum(deal_json(d, None, user.id, full=False)["action"] for d in active),
+                   "unread": sum((await unread(s, user.id, [d.id for d in active])).values())},
         "links": {"manager": manager_url(), "bot": f"https://t.me/{name}" if name else None,
                   "channel": settings.raw("channel_link") if settings.get("channel_id") else None,
                   "chat": bool(settings.get("chat_id")), "docs": settings.get("docs_url") or None,
@@ -386,7 +401,9 @@ async def deal_list(request: web.Request) -> web.Response:
     if (before := request.query.get("before", "")).isdigit():
         q = q.where(Deal.id < int(before))
     rows = (await s.scalars(q.order_by(Deal.id.desc()).limit(30))).all()
-    return web.json_response({"deals": [deal_json(d, None, user.id, full=False) for d in rows]})
+    by = await unread(s, user.id, [d.id for d in rows if d.status in deals.OPEN])
+    return web.json_response({"deals": [deal_json(d, None, user.id, full=False) | {"unread": by.get(d.id, 0)}
+                                        for d in rows]})
 
 
 async def deal_of(request: web.Request) -> Deal:
@@ -462,8 +479,6 @@ async def deal_confirm(request: web.Request) -> web.Response:
 def receipt_kind(data: bytes) -> str | None:
     if data[:1024].find(b"%PDF-") >= 0:
         return "pdf"
-    if settings.get("receipt_images") == "1" and (data[:3] == b"\xff\xd8\xff" or data[:8] == b"\x89PNG\r\n\x1a\n"):
-        return "image"
     return None
 
 
@@ -488,8 +503,7 @@ async def deal_receipt(request: web.Request) -> web.Response:
         raise AppError(413, "too_large", "Файл больше 20 МБ")
     kind = receipt_kind(data)
     if kind is None:
-        raise AppError(422, "not_pdf", "Нужен PDF-чек из приложения банка"
-                       + (" или его фото" if settings.get("receipt_images") == "1" else ""))
+        raise AppError(422, "not_pdf", "Нужен PDF-чек из приложения банка — фото и скриншоты не принимаются")
     caption = f"Чек по сделке #{d.id} — отправлен из приложения"
     try:
         if kind == "pdf":
@@ -508,12 +522,47 @@ async def deal_receipt(request: web.Request) -> web.Response:
     return await deal_response(s, paid, user.id)
 
 
+async def unread(s, uid: int, deal_ids: list[int] | None = None) -> dict[int, int]:
+    """Messages of others in the chats of this user's open deals he has not read in the app, by deal."""
+    if deal_ids is None:
+        deal_ids = list((await s.scalars(select(Deal.id).where(mine(uid), Deal.status.in_(deals.OPEN)))).all())
+    if not deal_ids:
+        return {}
+    rows = (await s.execute(select(DealMessage.deal_id, func.count(DealMessage.id)).select_from(DealMessage).outerjoin(
+        DealRead, (DealRead.deal_id == DealMessage.deal_id) & (DealRead.user_id == uid)).where(
+        DealMessage.deal_id.in_(deal_ids), DealMessage.sender_id != uid,
+        DealMessage.id > func.coalesce(DealRead.last_id, 0)).group_by(DealMessage.deal_id))).all()
+    return {did: k for did, k in rows if k}
+
+
+async def mark_read(s, d: Deal, uid: int) -> None:
+    """The user has seen the deal's chat up to its last message."""
+    last = await s.scalar(select(func.max(DealMessage.id)).where(DealMessage.deal_id == d.id)) or 0
+    row = await s.get(DealRead, (d.id, uid))
+    if row is not None:
+        row.last_id = max(row.last_id, last)
+        return
+    try:
+        async with s.begin_nested():  # two polls at once: the loser's row exists already
+            s.add(DealRead(deal_id=d.id, user_id=uid, last_id=last))
+    except IntegrityError:
+        pass
+
+
+async def chat_unread(request: web.Request) -> web.Response:
+    s, user, _ = ctx(request)
+    by = await unread(s, user.id)
+    return web.json_response({"total": sum(by.values()), "deals": {str(k): v for k, v in by.items()}})
+
+
 async def chat_get(request: web.Request) -> web.Response:
     from bot.handlers.relay import chat_people, chat_role
     s, user, _ = ctx(request)
     d = await deal_of(request)
     if user.id not in chat_people(d) and not admins.is_admin(user.id):
         raise AppError(403, "forbidden", "Чат недоступен")
+    if request.query.get("read") == "1" or request.method == "POST":  # the chat is open on the screen
+        await mark_read(s, d, user.id)
     q = select(DealMessage).where(DealMessage.deal_id == d.id)
     if (after := request.query.get("after", "")).isdigit():
         q = q.where(DealMessage.id > int(after))
@@ -557,11 +606,8 @@ async def operator_cabinet(request: web.Request) -> web.Response:
     free = (await s.scalars(select(Deal).where(Deal.status == "checking", Deal.operator_id.is_(None), Deal.via_bybit,
                                                Deal.seller_id != user.id, Deal.buyer_id != user.id)
                             .order_by(Deal.id).limit(20))).all()
-    debt_address = None
-    if op and op.debt and ton.chain is not None:  # his personal address: USDT there repay the debt
-        debt_address = ton.friendly((await ton.personal(s, user.id, "debt")).address)
     from bot.api.webapp_roles import ratings_of
-    return web.json_response({"debt": num(op.debt if op else 0), "debt_address": debt_address,
+    return web.json_response({"debt": num(op.debt if op else 0), "debt_address": None,
                               "balance": num(user.balance), "ratings": await ratings_of(s, user.id),
                               "working": [deal_json(d, None, user.id, full=False) for d in working],
                               "free": [deal_json(d, None, user.id, full=False) for d in free]})
@@ -663,7 +709,7 @@ async def buy(request: web.Request) -> web.Response:
     return await deal_response(s, d, user.id)
 
 
-# ---------- wallet: USDT on TON ----------
+# ---------- wallet: USDT BEP-20 ----------
 
 def deposit_json(dep: Deposit) -> dict:
     return {"id": dep.id, "status": dep.status, "amount": num(dep.amount), "credit": num(dep.credit),
@@ -675,26 +721,27 @@ def withdrawal_json(wd: Withdrawal) -> dict:
     return {"id": wd.id, "status": wd.status, "status_text": WD_STATUS.get(wd.status, wd.status),
             "address": wd.address, "memo": wd.memo, "amount": num(wd.amount), "receive": num(wd.amount - wd.fee),
             "cancellable": wd.status == "queued" and not wd.transfer_id, "tx_hash": wd.tx_hash,
-            "link": wd.link if wd.method == "ton" else None, "created_at": iso(wd.created_at)}
+            "link": wd.link, "created_at": iso(wd.created_at)}
 
 
 async def wallet(request: web.Request) -> web.Response:
-    from bot.handlers.wallet import MOVING, fee_pct, lock_note, withdraw_terms
+    from bot.handlers.wallet import MOVING, lock_note, withdraw_terms
     s, user, _ = ctx(request)
     recent = (await s.scalars(select(Deposit).where(Deposit.user_id == user.id, Deposit.purpose == "deposit",
                                                     Deposit.tx_hash.is_not(None))
                               .order_by(Deposit.id.desc()).limit(5))).all()
     moving = (await s.scalars(select(Withdrawal).where(Withdrawal.user_id == user.id, Withdrawal.status.in_(MOVING))
                               .order_by(Withdrawal.id))).all()
-    last = await s.scalar(select(Withdrawal.address).where(Withdrawal.user_id == user.id, Withdrawal.method == "ton")
+    last = await s.scalar(select(Withdrawal.address).where(Withdrawal.user_id == user.id, Withdrawal.method == "bsc")
                           .order_by(Withdrawal.id.desc()).limit(1))
     return web.json_response({
         "balance": {"available": num(user.balance), "frozen": num(user.frozen),
                     "withdrawable": num(money.withdrawable(user)), "team": num(user.team_balance)},
         "lock_note": lock_note(user) or None,
-        "enabled": ton.chain is not None,
-        "deposit": {"min": settings.get("deposit_min"), "fee": fee_pct()},
-        "withdraw": {"min": settings.get("chain_withdraw_min"), "terms": withdraw_terms(), "last_address": last},
+        "enabled": bsc.ready(), "network": "BEP-20 (BSC)",
+        "deposit": {"min": "0.01", "fee": "без комиссии"},
+        "withdraw": {"min": str(bsc.minimum()), "terms": withdraw_terms(), "last_address": last,
+                     "max": num(money.withdrawable(user).quantize(money.KOP, ROUND_DOWN))},
         "deposits": [deposit_json(d) for d in recent],
         "withdrawals": [withdrawal_json(w) for w in moving],
     })
@@ -714,60 +761,54 @@ async def history(request: web.Request) -> web.Response:
 
 
 async def deposit_address(request: web.Request) -> web.Response:
-    """The user's personal deposit address (made on first use); ?check=1 also scans it for new transfers now."""
+    """The user's permanent BEP-20 deposit address (made on first use). The chain is scanned every few seconds by itself:
+    ?check=1 only re-reads what came."""
     s, user, _ = ctx(request)
-    if ton.chain is None:
+    if not bsc.ready():
         raise AppError(503, "wallet_off", "Кошелёк временно недоступен — попробуйте позже")
-    a = await ton.personal(s, user.id, "deposit")
-    await s.commit()
+    addr = await bsc.deposit_address(s, user.id)
     checked = None
     if request.query.get("check") == "1":
-        try:
-            found = await ton.check_user(s, user.id)
-        except ton.ChainError:
-            raise AppError(502, "check_failed", "Сеть сейчас не отвечает. Поступление зачислим автоматически")
-        checked = None if found is None else [deposit_json(d) for d in found if d.purpose == "deposit"]
+        recent = (await s.scalars(select(Deposit).where(Deposit.user_id == user.id, Deposit.network == "BEP20",
+                                                        Deposit.created_at > now() - timedelta(minutes=10))
+                                  .order_by(Deposit.id.desc()).limit(5))).all()
+        checked = [deposit_json(d) for d in recent]
         await s.refresh(user)
-    return web.json_response({"address": ton.friendly(a.address), "network": "TON", "coin": "USDT",
-                              "min": settings.get("deposit_min"), "checked": checked, "available": num(user.balance)})
+    return web.json_response({"address": addr, "network": "BEP-20 (BSC)", "coin": "USDT", "min": "0.01",
+                              "checked": checked, "available": num(user.balance)})
 
 
 async def withdraw_quote(request: web.Request) -> web.Response:
-    from bot.handlers.wallet import withdraw_fee, withdraw_problem, withdraw_terms
+    from bot.handlers.wallet import withdraw_problem, withdraw_terms
     s, user, _ = ctx(request)
-    amount = parse_amount(request.query.get("amount"), 6) if request.query.get("amount") else None
-    fee = withdraw_fee(amount) if amount else Decimal(0)
+    amount = parse_amount(request.query.get("amount"), 2) if request.query.get("amount") else None
+    fee = bsc.fee()
     return web.json_response({
         "terms": withdraw_terms(), "fee": num(fee) if amount else None,
-        "receive": num(amount - fee) if amount and amount > fee else None,
-        "max": num(money.withdrawable(user)),
-        "error": (withdraw_problem(user, amount, fee) or None) if amount else None,
+        "receive": num(bsc.net_of(amount)) if amount and amount > fee else None,
+        "max": num(money.withdrawable(user).quantize(money.KOP, ROUND_DOWN)),
+        "error": (withdraw_problem(user, amount) or None) if amount else None,
     })
 
 
 async def withdraw(request: web.Request) -> web.Response:
-    from bot.handlers.wallet import accepted, check_address, submit, valid_memo, withdraw_fee, withdraw_problem
+    from bot.handlers.wallet import accepted, check_address, withdraw_problem
     s, user, _ = ctx(request)
     data = await body(request)
-    amount = parse_amount(data.get("amount"), 6)
+    amount = parse_amount(data.get("amount"), 2)
     try:
         request_id = str(UUID(str(data.get("request_id"))))
     except ValueError:
         raise AppError(422, "bad_request", "Начните вывод заново")
-    fee = withdraw_fee(amount)
-    if err := withdraw_problem(user, amount, fee):
+    if err := withdraw_problem(user, amount):
         raise AppError(422, "bad_amount", err)
-    if data.get("fee") is not None and parse_amount(data.get("fee"), 6) != fee:
+    if data.get("fee") is not None and parse_amount(data.get("fee"), 6) != bsc.fee():
         raise AppError(409, "fee_changed", "Комиссия изменилась — проверьте сумму ещё раз")
     addr, err = await check_address(s, data.get("address"))
     if not addr:
         raise AppError(422, "bad_address", err)
-    memo = None
-    if data.get("memo"):
-        if (memo := valid_memo(data.get("memo"))) is None:
-            raise AppError(422, "bad_memo", "Memo — до 120 обычных символов")
-    wd = Withdrawal(user_id=user.id, amount=amount, fee=fee, request_id=request_id, address=addr, memo=memo)
-    if err := await submit(s, user, wd, "приложение"):
+    wd, err = await bsc.queue_withdrawal(s, user.id, amount, addr, request_id, "приложение")
+    if err:
         raise AppError(409, "not_debited", err)
     await s.refresh(user)
     return web.json_response({"result": "queued", "ok": True, "message": accepted(wd),
@@ -911,6 +952,7 @@ def setup(app: web.Application, bot: Bot) -> None:
     r.add_get("/app", page)
     r.add_get("/app/", page)
     r.add_get("/app/{name:app\\.(css|js)}", asset)
+    r.add_get("/app/vendor/{name}", vendor)
     r.add_get("/app/api/me", me)
     r.add_post("/app/api/settings", save_settings)
     r.add_post("/app/api/chat-invite", chat_invite)
@@ -921,6 +963,7 @@ def setup(app: web.Application, bot: Bot) -> None:
     r.add_post("/app/api/deals/{id:\\d+}/confirm", deal_confirm)
     r.add_post("/app/api/deals/{id:\\d+}/receipt", deal_receipt)
     r.add_get("/app/api/deals/{id:\\d+}/chat", chat_get)
+    r.add_get("/app/api/chat/unread", chat_unread)
     r.add_post("/app/api/deals/{id:\\d+}/chat", chat_post)
     r.add_get("/app/api/operator", operator_cabinet)
     r.add_post("/app/api/deals/{id:\\d+}/{act:accept|requisites|recreate|close|pass_on|no_requisites}", operator_act)

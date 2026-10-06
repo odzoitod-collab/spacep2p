@@ -77,8 +77,8 @@ def test_buyer_happy_path_with_exact_economics(go):
         await ready(b)
         d = await create_deal(b)
         screen = plain(b.session.last(BUYER))
-        assert "4111111111111111" in screen and "Иванов Иван" in screen and "Ровно: 10000 ₽" in screen
-        assert "Вы получите: 94 USDT" in screen
+        assert "4111111111111111" in screen and "Иванов Иван" in screen and "ровно 10000 ₽" in screen
+        assert "10 000 ₽ → 94 USDT" in screen
         await b.run(cb(BUYER, f"dl:rc:{d.id}"), msg(BUYER, document=PDF))
         assert "Чек отправлен на проверку" in plain(b.session.last(BUYER))
         assert "проверьте поступление" in plain(b.session.last(SELLER))  # document caption to the seller
@@ -99,6 +99,9 @@ def test_wrong_file_types_keep_deal_waiting(go):
         assert "Это фото" in plain(b.session.last(BUYER))
         doc = Document(file_id="x", file_unique_id="x", mime_type="image/png", file_name="scan.png")
         await b.run(msg(BUYER, document=doc))
+        assert "Это фото" in plain(b.session.last(BUYER))  # an image sent as a file: still no
+        txt = Document(file_id="t", file_unique_id="t", mime_type="text/plain", file_name="check.txt")
+        await b.run(msg(BUYER, document=txt))
         assert "не PDF" in plain(b.session.last(BUYER))
         big = Document(file_id="b", file_unique_id="b", mime_type="application/pdf", file_size=25 * 2 ** 20)
         await b.run(msg(BUYER, document=big))
@@ -198,7 +201,7 @@ def test_late_receipt_during_hold_returns_deal_to_seller(go):
         d1 = await get_deal(d.id)
         assert d1.status == "expired" and d1.funds_held
         assert (await user(SELLER)).frozen == D(95)  # still held: the late receipt is covered
-        assert "Уже перевели деньги?" in plain(b.session.last(BUYER))
+        assert "Уже перевели?" in plain(b.session.last(BUYER))
         assert "удерживается до" in plain(b.session.last(SELLER))
         await b.run(cb(BUYER, f"dl:late:{d.id}"), msg(BUYER, document=PDF))
         d2 = await get_deal(d.id)
@@ -215,7 +218,7 @@ def test_seller_cannot_withdraw_held_funds_after_expiry(go):
         await ready(b)
         d = await create_deal(b)
         await expire_now(b, d)
-        await b.run(cb(SELLER, "w:out"), msg(SELLER, DEST), cb(SELLER, "w:nomemo"), msg(SELLER, "200"))
+        await b.run(cb(SELLER, "w:out"), msg(SELLER, "200"))
         assert "Доступно только 105 USDT" in plain(b.session.last(SELLER))
         await end_hold(b, d)
         assert (await user(SELLER)).frozen == 0 and not (await get_deal(d.id)).funds_held
@@ -451,7 +454,7 @@ def test_two_admins_same_card_ban_is_idempotent(go):
 
 # ---------- wallet ----------
 
-DEST = "UQBvW8Z5huBkMJYdnfAEM5JqTNkuWX3diqYENkWsIL0XglxD"
+DEST = "0xdD2FD4581271e230360230F9337D5c0430Bf44C0"
 
 
 def test_withdraw_double_click_debits_once(go):
@@ -460,8 +463,8 @@ def test_withdraw_double_click_debits_once(go):
         async with models.Session() as s:
             (await s.get(User, BUYER)).balance = D(50)
             await s.commit()
-        await b.run(cb(BUYER, "w:out"), msg(BUYER, DEST), cb(BUYER, "w:nomemo"), msg(BUYER, "20"),
-                    cb(BUYER, "w:go"), cb(BUYER, "w:go"))
+        await b.run(cb(BUYER, "w:out"), msg(BUYER, "20"), msg(BUYER, DEST),
+                    cb(BUYER, "wb:go"), cb(BUYER, "wb:go"))
         async with models.Session() as s:
             wd = await s.scalar(select(Withdrawal))
             assert wd.status == "queued" and await s.scalar(select(func.count(Withdrawal.id))) == 1
@@ -473,11 +476,11 @@ def test_withdraw_double_click_debits_once(go):
 
 def test_wallet_off_without_seed(go):
     async def fn(b):
-        from bot.services import ton
+        from bot.services import bsc
         await ready(b)
-        ton.chain = None
+        bsc._use(None)
         await b.run(cb(BUYER, "w:out"))
-        assert "временно недоступен" in b.session.alerts()[-1]
+        assert "временно недоступен" in plain(b.session.last(BUYER))
         await b.run(cb(BUYER, "w:in"))
         assert "временно недоступен" in plain(b.session.last(BUYER))
     go(fn)

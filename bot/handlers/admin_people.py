@@ -70,8 +70,7 @@ async def operators_screen(bot: Bot, s: AsyncSession, admin: User, src=None, not
                   + ("" if uid in active else " · убран") for uid in shown) if shown else "",
         "",
         quote("Оператор получает ссылку на Bybit-ордер, выдаёт его реквизиты и подтверждает оплату. USDT ордера "
-              "приходят ему на Bybit — это его долг, он гасит его переводом USDT (TON) на свой адрес погашения или с "
-              "баланса."
+              "приходят ему на Bybit — это его долг, он гасит его с баланса в боте (пополняет USDT BEP-20)."
               + (f" Из .env (OPERATOR_IDS): {', '.join(map(str, config.operator_ids))}." if config.operator_ids else "")),
     ]).replace("\n\n\n", "\n\n") + note, kb(
         btn("Добавить оператора", "aop:add", "plus", style="success"),
@@ -103,14 +102,14 @@ async def msg_operator_add(m: Message, bot: Bot, s: AsyncSession, user: User, st
     op.active, op.added_by = True, user.id
     u.access = "approved"  # an operator is let in: no entry application stands between him and the orders
     audit.log(s, user.id, "operator_add", f"op:{u.id}")
-    events.add(s, f"op:{u.id}", "added", f"Назначен оператором ({user.name})", u.id, alert=True)
+    events.add(s, f"op:{u.id}", "added", f"Назначен оператором ({user.name})", u.id, notice=True)
     await s.commit()
     await notify(bot, u.id, "\n".join([
         f"{pe('shop')} <b>Вы — оператор Strait Pay</b>",
         "• Когда мерчант пришлёт Bybit-ордер, вам придёт сообщение с кнопкой «Принять ордер»",
         "• Кто первым принял — получает ссылку, у остальных ордер пропадает",
         "• Зайдите в ордер, выдайте покупателю реквизиты, проверьте оплату и подтвердите",
-        "• USDT ордера приходят вам на Bybit — это ваш долг, гасите его в «Оператор» переводом USDT (TON)"]),
+        "• USDT ордера приходят вам на Bybit — это ваш долг, гасите его в «Оператор» с баланса"]),
         kb(btn("Кабинет оператора", "op", "shop", style="success"), back("x", "Скрыть", "cross")))
     await operator_card(bot, s, user, u.id, note=ok("Оператор добавлен и уведомлён"))
 
@@ -158,7 +157,7 @@ async def cb_operator_status(c: CallbackQuery, bot: Bot, s: AsyncSession, user: 
     op.active = on == "1"
     what = "вернули в операторы" if op.active else "убрали из операторов"
     audit.log(s, user.id, "operator_status", f"op:{uid}", what)
-    events.add(s, f"op:{uid}", "status", f"Оператора {what} ({user.name})", uid, alert=True)
+    events.add(s, f"op:{uid}", "status", f"Оператора {what} ({user.name})", uid, notice=True)
     returned, closed = await orders.drop_operator(s, uid) if not op.active else ([], [])
     await s.commit()
     if returned or closed:  # his deals do not hang: orders go to the other operators, unpaid deals close
@@ -367,7 +366,7 @@ async def cb_team_unlink(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User
         return await c.answer("Чат уже отключён", show_alert=True)
     old, t.chat_id = t.chat_id, None
     audit.log(s, user.id, "team_chat_off", f"team:{t.id}", str(old))
-    events.add(s, f"team:{t.id}", "chat_off", f"Чат команды {old} отключён ({user.name})", t.leader_id, alert=True)
+    events.add(s, f"team:{t.id}", "chat_off", f"Чат команды {old} отключён ({user.name})", t.leader_id, notice=True)
     await s.commit()
     await notify(bot, t.leader_id, f"{pe('info')} Администрация отключила чат команды «{esc(t.name)}». "
                                    "Подключить другой — отправьте /team в нужной группе.")
@@ -382,7 +381,7 @@ async def cb_team_approve(c: CallbackQuery, bot: Bot, s: AsyncSession, user: Use
     t.status, t.admin_id, t.decided_at = "approved", user.id, now()
     (await s.get(User, t.leader_id)).team_id = t.id
     audit.log(s, user.id, "team_approve", f"team:{t.id}")
-    events.add(s, f"team:{t.id}", "approved", f"Команда одобрена ({user.name})", t.leader_id, alert=True)
+    events.add(s, f"team:{t.id}", "approved", f"Команда одобрена ({user.name})", t.leader_id, notice=True)
     await s.commit()
     await notify(bot, t.leader_id, "\n".join([
         f"{pe('ok')} <b>Команда «{esc(t.name)}» одобрена — вы тимлид</b>",
@@ -422,7 +421,7 @@ async def msg_team_reject(m: Message, bot: Bot, s: AsyncSession, user: User, sta
         return await show(bot, user, warn("Заявка уже рассмотрена"), kb(back("atml", "Команды")))
     t.status, t.admin_id, t.decided_at, t.reason = "rejected", user.id, now(), reason
     audit.log(s, user.id, "team_reject", f"team:{tid}", reason)
-    events.add(s, f"team:{tid}", "rejected", f"Заявка отклонена ({user.name}): {reason}", t.leader_id, alert=True)
+    events.add(s, f"team:{tid}", "rejected", f"Заявка отклонена ({user.name}): {reason}", t.leader_id, notice=True)
     await s.commit()
     await notify(bot, t.leader_id, f"{pe('cross')} <b>Заявка на команду «{esc(t.name)}» отклонена</b>\n"
                                    + quote(f"• Причина: {esc(reason)}"))
@@ -440,7 +439,7 @@ async def cb_team_status(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User
     t.status = "approved" if on == "1" else "suspended"
     what = "возобновлена" if on == "1" else "приостановлена"
     audit.log(s, user.id, "team_status", f"team:{tid}", what)
-    events.add(s, f"team:{tid}", "status", f"Команда {what} ({user.name})", t.leader_id, alert=True)
+    events.add(s, f"team:{tid}", "status", f"Команда {what} ({user.name})", t.leader_id, notice=True)
     await s.commit()
     await notify(bot, t.leader_id, f"{pe('people')} Команда «{esc(t.name)}» {what} администрацией."
                  + (" Пока она приостановлена, процент с её сделок не начисляется и заявки в чат не приходят."
@@ -475,7 +474,7 @@ async def msg_team_pct(m: Message, bot: Bot, s: AsyncSession, user: User, state:
     old, t.pct = t.pct, value
     audit.log(s, user.id, "team_pct", f"team:{tid}", f"{old} → {value}")
     events.add(s, f"team:{tid}", "pct", f"Процент тимлида: {old if old is not None else 'общий'} → "
-               f"{value if value is not None else 'общий'} ({user.name})", t.leader_id, alert=True)
+               f"{value if value is not None else 'общий'} ({user.name})", t.leader_id, notice=True)
     await notify(bot, t.leader_id, f"{pe('percent')} <b>Ваш процент тимлида: {money.fmt(teams.pct(t), 3)}%</b> — "
                                    "для новых сделок команды.")
     await team_card(bot, s, user, t, note=ok("Сохранено"))
@@ -515,7 +514,7 @@ async def cb_leave(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User):
             kicked = True
     audit.log(s, user.id, "team_remove", f"user:{u.id}", f"team {t.id}")
     events.add(s, f"team:{t.id}", "removed", f"Участник {u.name or '—'} ({u.id}) убран администрацией ({user.name})"
-               + (", удалён из чата" if kicked else ""), u.id, alert=True)
+               + (", удалён из чата" if kicked else ""), u.id, notice=True)
     await s.commit()
     await notify(bot, u.id, f"{pe('info')} Администрация убрала вас из команды «{esc(t.name)}».")
     await user_screen(bot, s, user, u, c, ok(f"Убран из команды «{esc(t.name)}»" + (" и из её чата" if kicked else "")))
@@ -630,7 +629,7 @@ async def set_admin(bot: Bot, s: AsyncSession, owner: User, u: User, on: bool) -
         return False
     audit.log(s, owner.id, "admin_grant" if on else "admin_revoke", f"user:{u.id}")
     events.add(s, f"user:{u.id}", "admin", ("Назначен администратором" if on else "Снят с администраторов")
-               + f" ({owner.name})", u.id, alert=True)
+               + f" ({owner.name})", u.id, notice=True)
     await s.commit()
     await admin_menu(bot, u.id, on)
     chats = [c for c in targets() if c < 0]
@@ -754,7 +753,7 @@ async def cb_terms_reset(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User
 
 async def _terms_changed(bot: Bot, s: AsyncSession, admin: User, u: User, what: str) -> None:
     audit.log(s, admin.id, "buyer_terms", f"user:{u.id}", what)
-    events.add(s, f"user:{u.id}", "terms", f"{what} ({admin.name})", u.id, alert=True)
+    events.add(s, f"user:{u.id}", "terms", f"{what} ({admin.name})", u.id, notice=True)
     rate, pct = settings.buyer_terms(u)
     await notify(bot, u.id, "\n".join([f"{pe('star')} <b>Ваши условия покупки изменены</b>",
                                        f"• Курс: <b>{money.fmt(rate)} ₽</b> за 1 USDT",

@@ -222,7 +222,7 @@ def ok(text: str) -> str:
 
 
 def warn(text: str) -> str:
-    return f"\n{pe('warn')} <i>{text}</i>"
+    return f"\n{pe('warn')} <b>{text}</b>"  # bold: italic is easy to miss
 
 
 def at(dt: datetime, fmt: str = "t") -> str:
@@ -521,15 +521,37 @@ def close_kb(extra=None) -> InlineKeyboardMarkup:
     return kb(extra, back("x", "Скрыть", "cross"))
 
 
+_DEAL_REF = re.compile(r"(?:[Сс]делк\w*|[Зз]аявк\w*|[Оо]рдер\w*)\s*(?:<[^>]+>)*#(\d+)")
+_OFFER = ("orq:take:", "orq:see:")  # a free request offered to a merchant: not his deal yet
+
+
+def with_app(uid: int, text: str, markup: InlineKeyboardMarkup) -> InlineKeyboardMarkup:
+    """A notification about a deal or a request gets «Открыть в приложении» right on it — unless it has an app
+    button already, goes to a group (web_app buttons work only in private chats) or the app is not configured."""
+    found = _DEAL_REF.search(text or "")
+    rows = [list(r) for r in markup.inline_keyboard]
+    flat = [b for r in rows for b in r]
+    if uid <= 0 or not found or any(b.web_app for b in flat):
+        return markup
+    offer = any((b.callback_data or "").startswith(_OFFER) for b in flat)
+    button = app_btn("Открыть в приложении", f"{'request' if offer else 'deal'}/{found.group(1)}", "live")
+    if button is None:
+        return markup
+    at = len(rows) - 1 if rows and any(isinstance(b, NavButton) for b in rows[-1]) else len(rows)
+    rows.insert(at, [button])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 async def notify(bot: Bot, uid: int, text: str, markup: InlineKeyboardMarkup | None = None,
                  silent: bool = False) -> Message | None:
     """Separate message (notification). Returns None if it could not be delivered (blocked bot etc.) or there is
-    nobody to deliver to."""
+    nobody to deliver to. A deal's notification opens the deal in the mini app (with_app)."""
     if not uid:
         return None
+    markup = with_app(uid, text, markup or close_kb())
     try:
         return await safe_text(lambda t: bot.send_message(
-            uid, t, reply_markup=markup or close_kb(), disable_notification=silent, disable_web_page_preview=True),
+            uid, t, reply_markup=markup, disable_notification=silent, disable_web_page_preview=True),
             clean(text))
     except TelegramAPIError:
         return None

@@ -97,7 +97,7 @@ async def gate_screen(bot: Bot, s: AsyncSession, user: User, state: FSMContext, 
         f"{TAGLINE}.",
         quote("• Покупайте USDT за рубли — продавец под защитой сделки",
               "• Продавайте USDT на свою карту или берите заявки на реквизиты под сумму",
-              "• Пополнение и вывод — USDT в сети TON"),
+              "• Пополнение и вывод — USDT в сети BEP-20 (BSC)"),
         "Чтобы начать, ответьте на 2–3 вопроса. Заявку рассмотрит администрация, ответ придёт сюда.",
         f"Подробнее — {doc('start', 'как начать работу')}.",
         "",
@@ -338,7 +338,7 @@ async def decide(bot: Bot, s: AsyncSession, admin: User, sid: int, approve: bool
         hint = (["• «USDT ⇄ RUB» — продажа USDT на свою карту",
                  "• «Ордерные реквизиты» — заявки покупателей под точную сумму"] if su.role == "seller" else
                 ["• «RUB ⇄ USDT» — введите сумму в рублях, бот сам подберёт реквизиты",
-                 "• «Кошелёк» — пополнение и вывод USDT в сети TON"])
+                 "• «Кошелёк» — пополнение и вывод USDT в сети BEP-20 (BSC)"])
         from bot.handlers.community import missing
         join = ("Последний шаг — вступить в чат и подписаться на инфо-канал: бот даст ссылки. "
                 if missing(u) else "")

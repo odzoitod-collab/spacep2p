@@ -245,10 +245,12 @@ def test_decisions_on_the_log_card_show_who_took_them(go):
         edit = named(b, "EditMessageText")[-1]
         assert edit.message_id == mid and "Одобрено · U1" in plain(edit.text)
         assert "одобрена — вы тимлид" in plain(b.session.last(OTHER))
-        await b.deliver()  # the card shows the decision from the data (a plain group: re-posted below, it rings)
-        last = [m for m in to(b, GROUP) if type(m).__name__ == "SendMessage" and "Команда" in plain(m.text)][-1]
+        await b.deliver()  # the card shows the decision from the data, edited in place (an admin's own act: no ring)
+        last = [m for m in to(b, GROUP) if type(m).__name__ in ("SendMessage", "EditMessageText")
+                and "Команда" in plain(m.text)][-1]
         assert "Решение: @u1 · U1 · 1" in plain(last.text) and "работает" in plain(last.text)
-        assert "atm:ok:1" not in [x.callback_data for row in last.reply_markup.inline_keyboard for x in row]
+        assert "atm:ok:1" not in [x.callback_data for row in (last.reply_markup.inline_keyboard
+                                                               if last.reply_markup else []) for x in row]
     go(fn)
 
 

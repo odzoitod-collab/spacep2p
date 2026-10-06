@@ -217,7 +217,7 @@ async def cb_client_action(c: CallbackQuery, bot: Bot, s: AsyncSession, user: Us
         cl.token_hash, cl.token_hint = None, None
         what, msg = "токен отозван", "API-токен отозван администрацией. Выпустите новый в разделе API."
     audit.log(s, user.id, "api_client", f"apc:{cl.id}", what)
-    events.add(s, f"apc:{cl.id}", "admin", f"{what} ({user.name})", cl.user_id, alert=True)
+    events.add(s, f"apc:{cl.id}", "admin", f"{what} ({user.name})", cl.user_id, notice=True)
     await s.commit()
     await notify(bot, cl.user_id, f"{pe('key')} {msg}")
     await client_screen(bot, s, user, cl, c, ok(what.capitalize()))
@@ -299,7 +299,7 @@ async def msg_terms(m: Message, bot: Bot, s: AsyncSession, user: User, state: FS
     setattr(cl, field, value)
     audit.log(s, user.id, "api_terms", f"apc:{cl.id}", f"{field}: {old} → {value}")
     events.add(s, f"apc:{cl.id}", "terms", f"{TERMS[field]}: {old if old is not None else 'общий'} → "
-               f"{value if value is not None else 'общий'} ({user.name})", cl.user_id, alert=True)
+               f"{value if value is not None else 'общий'} ({user.name})", cl.user_id, notice=True)
     rate, pct = settings.client_terms(cl)
     await notify(bot, cl.user_id, f"{pe('key')} <b>Условия Strait Pay API изменены</b>\nКурс {money.fmt(rate)} ₽ · "
                                   f"комиссия {money.fmt(pct, 3)}% — для новых заказов.")

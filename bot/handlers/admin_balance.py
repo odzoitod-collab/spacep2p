@@ -5,7 +5,8 @@ exact amount («+10», «-5», «=20») or zero. Mass actions — top up everyon
 a sum from everyone, zero everyone — go through a confirmation screen.
 
 Every change is an ordinary manual adjustment (admin.apply_adjustment): a numbered row, the journal entry, the
-history, the second admin's approval when the amount reaches «adjust_approval_usdt» (always for one's own balance).
+history, the second admin's approval when the amount reaches «adjust_approval_usdt» (always for one's own balance) —
+except for an owner: his changes go through at once.
 Frozen money is never touched — it moves only through deals. A mass action writes its adjustments quietly and posts
 one summary to «Действия админов» instead of two posts per user. The user gets a message with his new balance.
 """
@@ -24,7 +25,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from bot.emoji import back, btn, kb, pe
 from bot.handlers.wallet import parse_usdt
 from bot.models import Adjustment, User
-from bot.services import audit, money, settings
+from bot.services import admins, audit, money, settings
 from bot.services.admins import IsAdmin
 from bot.ui import card, cf, esc, notify, ok, quote, show, title, ulink, warn
 
@@ -153,8 +154,10 @@ async def balance_card(bot: Bot, s: AsyncSession, admin: User, u: User, src=None
              if u.frozen else "",
              cf("Не прокручено", f"{money.usdt(u.deposit_lock)} USDT", icon="refresh") if u.deposit_lock else ""),
         "",
-        "Кнопки меняют доступный баланс сразу, пользователь получит сообщение. Свой баланс проводит только другой "
-        "администратор" + (f", суммы от {money.usdt(limit)} USDT — тоже." if limit > 0 else "."),
+        "Кнопки меняют доступный баланс сразу, пользователь получит сообщение. "
+        + ("Вы владелец: всё проводится сразу, без второго администратора." if admins.is_owner(admin.id) else
+           "Свой баланс проводит только другой администратор" + (f", суммы от {money.usdt(limit)} USDT — тоже."
+                                                                 if limit > 0 else ".")),
     ]) + note, kb(back(f"bal:u:{u.id}", "Отмена", "cross")) if asking else kb(
         # the project's layout: two per row at most — so «−n / +n» pairs
         *[[btn(f"−{n}", f"bal:q:{u.id}:-{n}"), btn(f"+{n}", f"bal:q:{u.id}:{n}")] for n in STEPS],

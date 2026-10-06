@@ -101,7 +101,7 @@ def test_requisites_given_reset_the_misses(go):
     go(fn)
 
 
-def test_operator_actions_are_posted_to_the_admin_chat(go):
+def test_only_operator_problems_are_posted_to_the_admin_chat(go):
     async def fn(b):
         await ready(b)
         await merchant(b, M1, balance=D(0))
@@ -114,11 +114,15 @@ def test_operator_actions_are_posted_to_the_admin_chat(go):
         await b.run(cb(OP, f"opq:go:{d.id}"))
         await give(b, OP, d.id)
         await b.deliver()
-        posts = [plain(m.text) for m in b.session.calls if type(m).__name__ == "SendMessage" and m.chat_id == group
-                 and m.message_thread_id and "Оператор" in (m.text or "")]
-        accepted = next(p for p in posts if p.startswith("✅ Оператор принял ордер"))
-        assert f"Заявка: #{d.id} · 52 000 ₽ · 500 USDT" in accepted and f"Мерчант: @u{M1}" in accepted
-        assert any(p.startswith("🔑 Оператор выдал реквизиты") for p in posts)
+        def posts():
+            return [plain(m.text) for m in b.session.calls if type(m).__name__ == "SendMessage" and m.chat_id == group
+                    and m.message_thread_id and ("Оператор" in (m.text or "") or "Мерчант" in (m.text or ""))]
+        assert not any(p.startswith(("✅ Оператор принял ордер", "🔑 Оператор выдал реквизиты")) for p in posts())
+        d2 = await link_given(b, await request(b), f"{LINK}x")
+        await b.run(cb(OP, f"opq:go:{d2.id}"), cb(OP, f"opq:nr:{d2.id}"))
+        await b.deliver()
+        problem = next(p for p in posts() if p.startswith("❌ Мерчант не дал реквизиты"))
+        assert f"Заявка: #{d2.id}" in problem and f"мерчант {M1}: пропуск 1" in problem
     go(fn)
 
 
@@ -305,20 +309,20 @@ def test_the_chat_post_follows_the_request_step_by_step(go):
         assert "Новая заявка" in text and "Ищем мерчанта" in text and markup is not None
         await b.run(cb(M1, f"orq:take:{d.id}:B"))
         text, markup = post()
-        assert "✅ Мерчант взял заявку" in text and "⏳ Ссылка на Bybit-ордер получена — ждём ссылку до" in text
+        assert "✅ Мерчант взял заявку" in text and "⏳ Мерчант прислал Bybit-ордер — мерчант создаёт ордер — ссылка до" in text
         assert markup is None
         await b.run(msg(M1, LINK))
         await tasks.chat_posts(b.bot)
-        assert "⏳ Оператор выдал реквизиты — ждём оператора" in post()[0]
+        assert "⏳ Оператор выдал реквизиты — ордер получен — ждём, когда оператор его примет" in post()[0]
         await b.run(cb(OP, f"opq:go:{d.id}"))
         await tasks.chat_posts(b.bot)
-        assert "оператор проверяет ордер" in post()[0]
+        assert "оператор принял ордер и выдаёт реквизиты" in post()[0]
         await give(b, OP, d.id)
         await tasks.chat_posts(b.bot)
-        assert "✅ Оператор выдал реквизиты" in post()[0] and "⏳ Покупатель оплатил — ждём перевод и чек" in post()[0]
+        assert "✅ Оператор выдал реквизиты" in post()[0] and "⏳ Покупатель оплатил — реквизиты выданы — ждём перевод и PDF-чек" in post()[0]
         await b.run(cb(BUYER, f"dl:rc:{d.id}"), msg(BUYER, document=PDF))
         await tasks.chat_posts(b.bot)
-        assert "✅ Покупатель оплатил" in post()[0] and "⏳ Оплата подтверждена — чек на проверке" in post()[0]
+        assert "✅ Покупатель оплатил" in post()[0] and "⏳ Оплата подтверждена — чек получен — проверяют поступление" in post()[0]
         n = len(b.session.calls)
         await tasks.chat_posts(b.bot)  # nothing changed: no edit
         assert not [m for m in b.session.calls[n:] if getattr(m, "chat_id", None) == chat]

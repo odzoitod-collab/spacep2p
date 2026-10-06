@@ -11,20 +11,16 @@ SPEC: dict[str, tuple[str, str, str]] = {
     "seller_pct": ("5", "pct", "Процент мерчанта со статичной картой"),
     "order_rate": ("104", "dec", "Курс ордерного мерчанта за 1 USDT"),
     "platform_pct": ("6", "pct", "Процент площадки"),
-    "deposit_fee": ("1.5", "pct", "Комиссия пополнения"),
-    "deposit_min": ("1", "dec", "Минимальное пополнение"),
-    "withdraw_pct": ("1.5", "pct", "Комиссия вывода, %"),
     "deal_minutes": ("30", "int", "Время на оплату сделки"),
     "buyer_max_open": ("5", "int", "Неоплаченных сделок у покупателя"),
     "confirm_minutes": ("30", "int", "Покупатель может открыть спор через"),
     "escalate_minutes": ("1440", "int", "Автоспор, если продавец молчит"),
     "late_hold_minutes": ("30", "int", "Удержание залога после истечения"),
     "late_minutes": ("720", "int", "Приём позднего чека после срока"),
-    "adjust_approval_usdt": ("0", "dec", "Второй админ для корректировок от"),
+    "adjust_approval_usdt": ("0", "dec", "Второй админ для корректировок от (не для владельцев)"),
     "withdraw_turnover": ("1", "int0", "Вывод только прокрученного"),
     "online_minutes": ("60", "int0", "Автоконец смены без действий"),
-    "receipt_images": ("0", "int0", "Формат чеков"),
-    "log_all": ("1", "int0", "Лог-чат"),
+    "log_all": ("0", "int0", "Лог-чат"),
     "support": ("", "text", "Ник поддержки"),
     "manager": ("", "text", "Ник менеджера для вопросов"),
     "manual_url": ("https://telegra.ph/Strait-Pay--P2P-obmen-USDT--RUB-v-Telegram-09-27", "url", "Ссылка на инструкцию"),
@@ -48,9 +44,8 @@ SPEC: dict[str, tuple[str, str, str]] = {
     "rep_low": ("5", "dec", "Репутация: ниже — без Bybit-ордеров"),
     "rep_mid": ("7", "dec", "Репутация: ниже — Bybit с лимитом"),
     "rep_mid_max_rub": ("30000", "dec", "Репутация: лимит Bybit-заявки"),
-    "chain_withdraw_min": ("3", "dec", "Минимальный вывод"),
-    "chain_withdraw_fee": ("1", "dec", "Фикс. комиссия вывода"),
-    "ton_sweep_min": ("5", "dec", "Сбор с адресов пополнения от"),
+    "bsc_withdraw_min": ("5", "dec", "BEP-20: минимальный вывод"),
+    "bsc_withdraw_fee": ("1", "dec", "BEP-20: фикс. комиссия вывода"),
     "team_pct": ("1", "pct", "Тимлиду от сделок команды"),
     "chat_id": ("", "chat", "Чат сообщества"),
     "channel_id": ("", "chat", "Инфо-канал"),
@@ -65,7 +60,8 @@ SPEC: dict[str, tuple[str, str, str]] = {
         "подтверждения.\n"
         "<b>Продать</b>: пополните кошелёк, добавьте карту, выйдите на смену, подтверждайте поступления — или берите "
         "заявки под сумму как ордерный мерчант.\n"
-        "<b>Кошелёк</b>: пополнение на личный адрес USDT в сети TON, вывод на любой TON-кошелёк или биржу.",
+        "<b>Кошелёк</b>: пополнение на личный адрес USDT в сети BEP-20 (BSC), вывод на любой кошелёк или биржу в сети "
+        "BSC.",
         "html",
         "Текст «Как это работает»",
     ),
@@ -73,13 +69,13 @@ SPEC: dict[str, tuple[str, str, str]] = {
 
 # admin panel sections: (title, keys); every SPEC key is in exactly one section
 GROUPS: list[tuple[str, list[str]]] = [
-    ("Курс и комиссии", ["rate", "order_rate", "seller_pct", "platform_pct", "deposit_fee", "withdraw_pct",
-                         "chain_withdraw_fee", "team_pct"]),
+    ("Курс и комиссии", ["rate", "order_rate", "seller_pct", "platform_pct",
+                         "bsc_withdraw_fee", "team_pct"]),
     ("Сроки сделок", ["deal_minutes", "buyer_max_open", "abandon_limit", "abandon_pause_minutes", "card_parallel", "confirm_minutes", "escalate_minutes", "late_hold_minutes", "late_minutes",
                       "online_minutes"]),
-    ("Кошелёк и лимиты", ["deposit_min", "chain_withdraw_min", "ton_sweep_min", "card_min_rub",
+    ("Кошелёк и лимиты", ["bsc_withdraw_min", "card_min_rub",
                           "adjust_approval_usdt", "withdraw_turnover"]),
-    ("Правила и лог-чат", ["receipt_images", "log_all", "signup_review", "join_required"]),
+    ("Правила и лог-чат", ["log_all", "signup_review", "join_required"]),
     ("Тексты, поддержка, чат", ["support", "manager", "tutorial", "manual_url", "docs_url", "webapp_url", "webapp_link",
                                 "chat_id", "channel_id",
                                 "channel_autopost_hours"]),
@@ -95,8 +91,8 @@ HINTS = {
     "int0": "Целое число от 0 до 1440; 0 — выключено.",
     "text": "Ник без @, 5–32 латинских букв, цифр или _. «-» — убрать.",
     "html": "Текст до 3000 символов, можно с форматированием Telegram.",
-    "receipt_images": "1 — принимать PDF и фото/скриншоты, 0 — только PDF.",
-    "log_all": "1 — в лог-чат идут все шаги сделок, 0 — только проблемы.",
+    "log_all": "0 — в админ-чат только важное: проблемы, споры, заявки, крупные действия. 1 — ещё и каждый шаг "
+               "сделок, пополнений и выводов (много сообщений).",
     "signup_review": "1 — новый пользователь заполняет заявку (роль, оборот, скриншот) и ждёт одобрения в лог-чате, "
                      "0 — бот открыт всем сразу.",
     "docs_url": "Адрес страниц с инструкциями (их отдаёт API-сервер бота: /docs/buy, /docs/sell …). «-» — без ссылок.",
@@ -139,20 +135,13 @@ HINTS = {
     "rep_mid": "Средняя оценка ниже этой (но не ниже нижней) — Bybit-заявки только до лимита суммы.",
     "rep_mid_max_rub": "Максимальная сумма Bybit-заявки для мерчанта со средней репутацией, ₽.",
     "url": "Ссылка https://… (например, на статью в Telegraph). «-» — убрать ссылку из бота.",
-    "chain_withdraw_fee": "USDT сверх процента с каждого вывода. Покрывает газ: перевод USDT в сети TON стоит "
-                          "около 0,05 TON, его платит горячий кошелёк.",
-    "withdraw_pct": "Процент от суммы вывода. Удерживается из списываемой суммы.",
-    "deposit_min": "Переводы меньше этой суммы не зачисляются на баланс (защита от пыли) — пользователь видит это "
-                   "на экране пополнения.",
-    "ton_sweep_min": "USDT копятся на личных адресах пополнения и собираются на горячий кошелёк, когда на адресе "
-                     "набирается эта сумма: каждый сбор стоит ~0,1 TON газа. Зачисление на баланс — сразу, "
-                     "независимо от сбора.",
+    "bsc_withdraw_fee": "Вывод USDT в сети BEP-20 (BSC): только эта фиксированная сумма, без процента. Удерживается из "
+                        "суммы вывода, покрывает газ в BNB, который платит горячий кошелёк.",
+    "bsc_withdraw_min": "Меньше этой суммы в сети BEP-20 не вывести. Должна быть больше комиссии вывода BEP-20.",
     "team_pct": "Процент от суммы сделки (в USDT по курсу сделки), который тимлид получает с каждой завершённой "
                 "сделки участника команды. Платит площадка из своего дохода по сделке, не больше него.",
-    "deposit_fee": "Процент с каждого пополнения. Удерживается из поступившей суммы; погашение долга оператора — "
-                   "без комиссии.",
 }
-FLAGS = ("receipt_images", "log_all", "signup_review", "join_required", "withdraw_turnover")
+FLAGS = ("log_all", "signup_review", "join_required", "withdraw_turnover")
 RATES = ("rate", "order_rate")  # RUB per 1 USDT
 
 _cache: dict[str, str] = {}
@@ -208,8 +197,7 @@ def human(key: str, value: str | None = None) -> str:
     v = get(key) if value is None else value
     kind = SPEC[key][1]
     if key in FLAGS:
-        return {"receipt_images": {"1": "PDF и фото", "0": "только PDF"},
-                "log_all": {"1": "все события", "0": "только проблемы"},
+        return {"log_all": {"1": "все события", "0": "только проблемы"},
                 "signup_review": {"1": "по заявке", "0": "открыт всем"},
                 "join_required": {"1": "обязательно", "0": "по желанию"},
                 "withdraw_turnover": {"1": "включено", "0": "выключено"}}[key].get(v, v)

@@ -18,7 +18,7 @@ from bot import models, tasks  # noqa: E402
 from tests import harness  # noqa: E402
 from tests.harness import make_dp  # noqa: E402
 from bot.models import Deal, User, Withdrawal  # noqa: E402
-from bot.services import settings, ton  # noqa: E402
+from bot.services import bsc, settings  # noqa: E402
 
 ids = itertools.count(100)
 
@@ -65,9 +65,12 @@ async def scenario():
         await settings.put(s, "signup_review", "0")  # entry by application is covered by test_signup
         await s.commit()
         await settings.load(s)
-    chain = harness.FakeChain()
-    ton.chain = chain
-    ton.POLL, ton.WAIT = 0, 0.01
+    chain = harness.FakeBsc()
+
+    async def post(url, method, params):
+        return chain.handle(method, params)
+    bsc._post = post
+    bsc._use(harness.WORDS)
     chain.fund_hot(usdt="100")
     session = FakeSession()
     bot = Bot("123:abc", session=session, default=DefaultBotProperties(parse_mode="HTML"))
@@ -128,16 +131,19 @@ async def scenario():
     async with models.Session() as s:
         assert (await s.get(User, SELLER)).frozen == 0
 
-    # wallet: withdraw to a TON address (double click: one withdrawal), deposit to the personal address
-    await run(cb(BUYER, "w"), cb(BUYER, "w:out"), msg(BUYER, "UQBvW8Z5huBkMJYdnfAEM5JqTNkuWX3diqYENkWsIL0XglxD"),
-              cb(BUYER, "w:nomemo"), msg(BUYER, "10"), cb(BUYER, "w:go"), cb(BUYER, "w:go"), cb(BUYER, "w:in"))
-    chain.pay(BUYER, "100")
-    await tasks.ton_cycle(bot)
+    # wallet: withdraw to a BEP-20 address (double click: one withdrawal), deposit to the personal address
+    dest = "0xdD2FD4581271e230360230F9337D5c0430Bf44C0"
+    await run(cb(BUYER, "w"), cb(BUYER, "w:out"), msg(BUYER, "10"), msg(BUYER, dest), cb(BUYER, "wb:go"),
+              cb(BUYER, "wb:go"), cb(BUYER, "w:in"))
+    await tasks.bsc_tick(bot, 0)
+    chain.mine()
+    chain.pay("0x70997970C51812dc3A010C7d01b50e0d17dc79C8", "100")  # the buyer's deposit address (index 1)
+    await tasks.bsc_tick(bot, 0)
     await run(cb(BUYER, "w:h"))
-    assert [x[3] for x in chain.sent if x[:2] == ("gas", "USDT")] == [D("8.85")]  # 10 − 1.5% − 1 USDT
+    assert chain.usdt_of(dest) == D(9)  # 10 − the fixed 1 USDT
     async with models.Session() as s:
         assert (await s.get(Withdrawal, 1)).status == "done"
-        assert (await s.get(User, BUYER)).balance == D("131.6") - 10 + D("98.5")  # 100 − 1.5% fee
+        assert (await s.get(User, BUYER)).balance == D("131.6") - 10 + 100  # deposits come without a fee
 
     # admin panel
     await run(cb(ADMIN, "as"), cb(ADMIN, "as:rate"), msg(ADMIN, "95"))

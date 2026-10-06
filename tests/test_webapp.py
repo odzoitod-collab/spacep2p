@@ -101,18 +101,21 @@ def test_withdraw_cards_and_history_in_the_app(go):
         async with http(b) as c:
             w = await (await c.get("/app/api/wallet", headers=as_(SELLER))).json()
             assert D(w["balance"]["available"]) == D(200)
+            async with models.Session() as s:  # turnover has its own tests: here all of it is withdrawable
+                (await s.get(User, SELLER)).deposit_lock = D(0)
+                await s.commit()
             q = await (await c.get("/app/api/withdraw/quote?amount=50", headers=as_(SELLER))).json()
-            assert D(q["receive"]) == D("48.25") and not q["error"]
+            assert D(q["receive"]) == D(49) and D(q["fee"]) == D(1) and not q["error"]
             dep = await (await c.get("/app/api/deposit", headers=as_(SELLER))).json()
-            assert dep["address"].startswith("UQ") and dep["network"] == "TON"
+            assert dep["address"].startswith("0x") and dep["network"] == "BEP-20 (BSC)"
             own = {"amount": "50", "fee": q["fee"], "request_id": "7a6e0804-2bd0-4672-b79d-d97b2fd3c1b4",
                    "address": dep["address"]}
             assert (await c.post("/app/api/withdraw", headers=as_(SELLER), json=own)).status == 422  # our own address
             body = {"amount": "50", "fee": q["fee"], "request_id": "8a6e0804-2bd0-4672-b79d-d97b2fd3c1b4",
-                    "address": "UQBvW8Z5huBkMJYdnfAEM5JqTNkuWX3diqYENkWsIL0XglxD", "memo": "123"}
+                    "address": "0xdD2FD4581271e230360230F9337D5c0430Bf44C0"}
             r = await (await c.post("/app/api/withdraw", headers=as_(SELLER), json=body)).json()
             assert r["ok"] and D(r["available"]) == D(150) and r["withdrawal"]["cancellable"]
-            assert r["withdrawal"]["memo"] == "123"
+            assert D(r["withdrawal"]["receive"]) == D(49)
             again = await c.post("/app/api/withdraw", headers=as_(SELLER), json=body)  # the same request: once
             assert again.status == 409
             too_much = dict(body, amount="1000", request_id="9a6e0804-2bd0-4672-b79d-d97b2fd3c1b4")

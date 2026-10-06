@@ -28,10 +28,11 @@ def render(sn: finance.Snapshot) -> str:
         title(pe("stats"), "Финансы Strait Pay") + f" · {now().astimezone(MSK):%d.%m %H:%M} МСК",
         "",
         section("wallet", "Что есть"),
-        field("Горячий кошелёк TON — отсюда выводы", f"<b>{_u(sn.hot)}</b>"
-              + (f" · газ {money.fmt(sn.hot_ton, 4)} TON" if sn.hot_ton is not None else "")),
+        field("Горячий кошелёк BEP-20 — отсюда выводы", f"<b>{_u(sn.hot)}</b>"
+              + (f" · газ {money.fmt(sn.bnb, 5)} BNB" if sn.bnb is not None else "")),
+        field("Холодный кошелёк", f"<b>{_u(sn.cold)}</b>") if sn.cold is not None else None,
         field("На адресах пополнения, ещё не собрано", f"<b>{money.usdt(sn.unswept)} USDT</b>") if sn.unswept else None,
-        field("Долг операторов за Bybit-ордера", f"<b>{money.usdt(sn.op_debt)} USDT</b> — вернут на адреса долга "
+        field("Долг операторов за Bybit-ордера", f"<b>{money.usdt(sn.op_debt)} USDT</b> — погасят с баланса "
               "(в «есть» не входит, пока не погашен)") if sn.op_debt else None,
         field("Пришло через Bybit-ордера", f"24 ч {money.usdt(sn.bybit['24h'])} · 7 д {money.usdt(sn.bybit['7d'])} · "
               f"всего {money.usdt(sn.bybit['all'])} USDT") if sn.bybit["all"] else None,

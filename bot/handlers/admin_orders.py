@@ -13,7 +13,7 @@ from bot.services.admins import IsAdmin
 from bot.emoji import back, btn, kb, pe
 from bot.models import Deal, OrderMerchant, User, now
 from bot.services import audit, events, money, orders, settings
-from bot.ui import alink, at, card, cf, esc, notify, quote, show, title, ulink, verdict, warn
+from bot.ui import alink, at, card, cf, esc, notify, ok, quote, show, title, ulink, verdict, warn
 
 router = Router()
 router.message.filter(IsAdmin())
@@ -24,6 +24,7 @@ STATUS = {"pending": "на рассмотрении", "approved": "работа�
 
 class AdmOrders(StatesGroup):
     reason = State()
+    rating = State()
 
 
 @router.callback_query(F.data == "aoml")
@@ -65,7 +66,7 @@ async def merchant_card(bot: Bot, s: AsyncSession, admin: User, m: OrderMerchant
                 f"баланс {money.usdt(u.balance)} USDT · в работе сейчас {money.fmt(await orders.open_rub(s, u.id))} ₽",
                 f"выполнено {done_n} на {money.fmt(Decimal(done_rub))} ₽ (Bybit-ордером {bybit_n}) · споров {disputes}",
                 icon="stats"),
-             cf("Репутация", orders.rep_line(*await orders.reputation(s, m.user_id)), icon="star"),
+             cf("Рейтинг", *await orders.rep_text(s, m.user_id), icon="star"),
              cf("Пропуски реквизитов", f"{m.strikes} из {settings.get('strike_limit')} подряд" if m.strikes else "",
                 f"<b>пауза до {at(m.sleep_until, 'dt')}</b>" if orders.asleep(m) else "", icon="warn"),
              cf("Решение", f"анкета {at(m.created_at, 'dt')}"
@@ -78,6 +79,7 @@ async def merchant_card(bot: Bot, s: AsyncSession, admin: User, m: OrderMerchant
          btn("Отклонить", f"aom:no:{m.user_id}", "cross", style="danger")] if m.status == "pending" else None,
         btn("Снять паузу и пропуски", f"aom:wake:{m.user_id}", "ok", style="success")
         if orders.asleep(m) or m.strikes else None,
+        btn("Изменить рейтинг", f"art:{m.user_id}:om", "star", style="primary"),
         btn("Приостановить", f"aom:st:{m.user_id}:0", "pause", style="danger") if m.status == "approved" else None,
         btn("Возобновить", f"aom:st:{m.user_id}:1", "ok", style="success") if m.status == "suspended" else None,
         btn("История", f"aev:om:{m.user_id}", "list"),
@@ -99,7 +101,7 @@ async def cb_approve(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User):
         return await c.answer("Анкета уже рассмотрена", show_alert=True)
     m.status, m.admin_id, m.decided_at = "approved", user.id, now()
     audit.log(s, user.id, "om_approve", f"om:{m.user_id}")
-    events.add(s, f"om:{m.user_id}", "approved", f"Анкета одобрена ({user.name})", m.user_id, alert=True)
+    events.add(s, f"om:{m.user_id}", "approved", f"Анкета одобрена ({user.name})", m.user_id, notice=True)
     await s.commit()
     await notify(bot, m.user_id, "\n".join([
         f"{pe('ok')} <b>Вы — ордерный мерчант Strait Pay</b>",
@@ -133,7 +135,7 @@ async def msg_reject(m: Message, bot: Bot, s: AsyncSession, user: User, state: F
         return await show(bot, user, warn("Анкета уже рассмотрена"), kb(back("aoml", "Ордерные мерчанты")))
     om.status, om.admin_id, om.decided_at, om.reason = "rejected", user.id, now(), reason
     audit.log(s, user.id, "om_reject", f"om:{uid}", reason)
-    events.add(s, f"om:{uid}", "rejected", f"Анкета отклонена ({user.name}): {reason}", uid, alert=True)
+    events.add(s, f"om:{uid}", "rejected", f"Анкета отклонена ({user.name}): {reason}", uid, notice=True)
     await s.commit()
     await notify(bot, uid, f"{pe('cross')} <b>Анкета ордерного мерчанта отклонена.</b>\nПричина: {esc(reason)}")
     await merchant_card(bot, s, user, om, note="\n\n" + verdict("cross", "Отклонено", user))
@@ -161,9 +163,76 @@ async def cb_status(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User):
     m.status = "approved" if on == "1" else "suspended"
     what = "возобновлён" if on == "1" else "приостановлен"
     audit.log(s, user.id, "om_status", f"om:{uid}", what)
-    events.add(s, f"om:{uid}", "status", f"Ордерный мерчант {what} ({user.name})", m.user_id, alert=True)
+    events.add(s, f"om:{uid}", "status", f"Ордерный мерчант {what} ({user.name})", m.user_id, notice=True)
     await s.commit()
     await notify(bot, m.user_id, f"{pe('key')} Доступ ордерного мерчанта {what} администрацией."
                  + (" Взятые заявки завершите как обычно." if on == "0" else ""))
     await merchant_card(bot, s, user, m, c, "\n\n" + verdict("ok" if on == "1" else "pause", what.capitalize(), user))
 
+
+
+# ---------- a merchant's rating by hand ----------
+
+async def set_rating(bot: Bot, s: AsyncSession, admin: User, u: User, value: Decimal | None) -> str:
+    """A merchant's rating set (1–10) or back to the operators' average (None) — the bot and the mini app alike.
+    Commits, tells the merchant. Returns what happened."""
+    old, u.rating = u.rating, value
+    text = (f"рейтинг {money.fmt(value, 1)}/10 вручную" if value is not None else "ручной рейтинг убран")
+    audit.log(s, admin.id, "rating", f"user:{u.id}", f"{old if old is not None else 'авто'} → "
+                                                      f"{value if value is not None else 'авто'}")
+    events.add(s, f"om:{u.id}", "rating", f"Администратор {admin.id}: {text}", u.id, notice=True)
+    await s.commit()
+    if value is not None:
+        await notify(bot, u.id, f"{pe('star')} <b>Ваш рейтинг мерчанта: {orders.stars(value)} {money.fmt(value, 1)} из "
+                                "10</b>\nУстановлен администрацией.")
+    return text
+
+
+def _rating_text(u: User, rep: list[str], err: str = "") -> str:
+    return "\n".join([
+        title(pe("star"), f"Рейтинг · {ulink(u)}"),
+        "",
+        card(cf("Сейчас", *rep, icon="star")),
+        "",
+        quote("Отправьте рейтинг от 1 до 10, можно с десятой: <code>8.5</code>. Он заменит оценки операторов везде: в "
+              "карточках, ограничениях Bybit-заявок (ниже "
+              f"{settings.get('rep_low')} — только с баланса, ниже {settings.get('rep_mid')} — Bybit до "
+              f"{money.fmt(settings.dec('rep_mid_max_rub'))} ₽) и в очереди «лучшим первым».",
+              "<code>-</code> — убрать ручной рейтинг: снова по оценкам операторов."),
+    ]) + (warn(err) if err else "")
+
+
+@router.callback_query(F.data.regexp(r"^art:(\d+):(om|u)$"))
+async def cb_rating(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User, state: FSMContext):
+    _, uid, back_to = c.data.split(":")
+    u = await s.get(User, int(uid))
+    if not u:
+        return await c.answer("Пользователь не найден", show_alert=True)
+    await state.set_state(AdmOrders.rating)
+    await state.update_data(r_uid=u.id, r_back=back_to)
+    await show(bot, user, _rating_text(u, await orders.rep_text(s, u.id)),
+               kb(back(f"aom:{u.id}" if back_to == "om" else f"auv:{u.id}", "Отмена")), c)
+
+
+@router.message(AdmOrders.rating, F.text)
+async def msg_rating(m: Message, bot: Bot, s: AsyncSession, user: User, state: FSMContext):
+    data = await state.get_data()
+    u = await s.get(User, data["r_uid"], with_for_update=True)
+    back_cb = f"aom:{u.id}" if data["r_back"] == "om" else f"auv:{u.id}"
+    raw = (m.text or "").strip().replace(",", ".")
+    if raw == "-":
+        value = None
+    else:
+        try:
+            value = Decimal(raw).quantize(Decimal("0.1"))
+        except ArithmeticError:
+            value = Decimal(-1)
+        if not Decimal(1) <= value <= Decimal(10):
+            return await show(bot, user, _rating_text(u, await orders.rep_text(s, u.id), "Нужно число от 1 до 10"),
+                              kb(back(back_cb, "Отмена")))
+    await state.set_state(None)
+    text = await set_rating(bot, s, user, u, value)
+    if data["r_back"] == "om" and (om := await s.get(OrderMerchant, u.id)):
+        return await merchant_card(bot, s, user, om, note=ok(f"Готово: {text}"))
+    from bot.handlers.admin import user_screen
+    await user_screen(bot, s, user, u, note=ok(f"Готово: {text}"))

@@ -15,7 +15,7 @@ from bot.emoji import back, btn, kb, pe
 from bot.models import Card, Deal, User, now
 from bot.handlers.seller import mask, parse_rub
 from bot.services import audit, deals, events, money, settings
-from bot.ui import app_btn, at, clean, esc, notify, ok, person, quote, show, title, warn
+from bot.ui import app_btn, at, clean, esc, notify, ok, person, quote, section, show, title, warn
 
 router = Router()
 
@@ -75,24 +75,47 @@ class Evidence(StatesGroup):
 
 
 def status_of(d: Deal, viewer_id: int | None = None) -> tuple[str, str]:
-    """(icon, label): what the deal is waiting for right now, in the words of whoever looks at it."""
-    st, buyer = d.status, viewer_id is not None and viewer_id == d.buyer_id
+    """(icon, label): exactly where the deal is now and who it waits for — in the words of whoever looks at it
+    (the buyer, the merchant, the operator; anyone else — an admin, a log — sees the neutral words). Every list,
+    card, log and the mini app speak this one language."""
+    st = d.status
+    me = "buyer" if viewer_id is not None and viewer_id == d.buyer_id else \
+        "merchant" if viewer_id is not None and viewer_id == d.seller_id else \
+        "operator" if viewer_id is not None and viewer_id == d.operator_id else ""
     if st == "searching":
-        return "search", "Ищем мерчанта"
+        return "search", "Ищем мерчанта под вашу сумму" if me == "buyer" else "Ищет мерчанта — никто не взял"
     if st == "assigned":
         if not d.via_bybit:
-            return "clock", "Мерчант готовит реквизиты"
-        return "clock", ("Ждём ссылку на новый Bybit-ордер" if d.operator_id else "Ждём ссылку на Bybit-ордер")
+            return "clock", {"merchant": "Вы взяли — выдайте реквизиты",
+                             "buyer": "Мерчант взял заявку, готовит реквизиты"}.get(me, "Мерчант взял, готовит реквизиты")
+        again = bool(d.operator_id)  # the operator asked for a new order
+        return "clock", {"merchant": "Пришлите ссылку на новый Bybit-ордер" if again else "Пришлите ссылку на Bybit-ордер",
+                         "operator": "Мерчант пересоздаёт ордер"}.get(
+            me, "Мерчант пересоздаёт Bybit-ордер" if again else "Мерчант взял, создаёт Bybit-ордер")
     if st == "checking":
         if not d.bybit_url:
-            return "clock", "Оператор готовит реквизиты"
-        return ("search", "Оператор проверяет ордер") if d.operator_id else ("clock", "Ждём оператора")
+            return "clock", "Выдайте реквизиты" if me == "operator" else "Оператор готовит реквизиты"
+        if not d.operator_id:
+            return "clock", {"merchant": "Ордер отправлен — ждём оператора",
+                             "buyer": "Мерчант дал ордер — ждём оператора"}.get(me, "Ордер получен — ждёт оператора")
+        return "search", {"operator": "Выдайте реквизиты из ордера", "merchant": "Оператор принял ваш ордер",
+                          "buyer": "Оператор принял ордер, выдаёт реквизиты"}.get(me, "Оператор принял ордер, выдаёт реквизиты")
     if st == "waiting_payment":
-        return "clock", "Ждём ваш перевод" if buyer else "Ждём перевод покупателя"
+        return "clock", ("Переведите и прикрепите чек" if me == "buyer" else
+                         "Реквизиты выданы — ждём перевод" if d.is_order else "Ждём перевод покупателя")
     if st == "paid":
         if viewer_id is not None and viewer_id == deals.checker(d):
-            return "doc", "Ждёт вашей проверки"
-        return "doc", "Оператор проверяет оплату" if d.via_bybit else "Продавец проверяет оплату"
+            return "doc", "Чек пришёл — проверьте поступление"
+        who = "оператор" if d.via_bybit else "продавец"
+        return "doc", f"Чек отправлен — {who} проверяет" if me == "buyer" else f"Чек получен — {who} проверяет"
+    if st == "dispute":
+        return "flag", "Спор — решает администрация"
+    if st == "cancelled":
+        return "cross", {"no_merchant": "Закрыта: мерчант не нашёлся", "buyer_cancel": "Отменена покупателем",
+                         "operator_close": "Закрыта оператором", "dispute_seller": "Спор: в пользу продавца"}.get(
+            d.close_reason, "Отменена")
+    if st == "expired":
+        return "cross", "Время на оплату вышло" + (" — залог удерживается" if d.funds_held and me != "buyer" else "")
     return STATUS.get(st, ("info", st))
 
 
@@ -119,193 +142,143 @@ def exact(v: Decimal) -> str:
 
 
 def _money_block(d: Deal, buyer: bool) -> str:
+    """The money in one or two lines: what is transferred, what one gets or gives."""
     done, back_ = d.status == "completed", d.status in ("cancelled", "expired", "void") and not d.funds_held
+    rub = f"<b>{money.fmt(d.amount_rub)} ₽</b>"
     if buyer:
-        return quote(
-            f"{pe('ruble')} Сумма перевода: <b>{money.fmt(d.amount_rub)} ₽</b>",
-            f"{pe('swap')} Курс: {money.fmt(d.buyer_rate or d.rate)} ₽ · комиссия {money.fmt(d.platform_pct, 3)}%",
-            "" if back_ else f"{pe('dollar')} {'Получено' if done else 'Вы получите'}: "
-                             f"<b>{money.usdt(d.buyer_credit)} USDT</b>",
-        )
+        return quote(f"{pe('ruble')} {rub} → <b>{money.usdt(d.buyer_credit)} USDT</b>" + (" получено" if done else ""),
+                     f"{pe('swap')} курс {money.fmt(d.buyer_rate or d.rate)} ₽ · комиссия {money.fmt(d.platform_pct, 3)}%")
     if d.via_bybit:  # nothing is frozen: the USDT go through the Bybit order
-        return quote(
-            f"{pe('ruble')} Сумма перевода: <b>{money.fmt(d.amount_rub)} ₽</b>",
-            f"{pe('shop')} Bybit-ордер: <b>{money.usdt(d.seller_debit)} USDT</b> по {money.fmt(d.merchant_rate)} ₽"
-            + (f" · {_link(d)}" if d.bybit_url else ""),
-        )
-    frozen = (f"{pe('lock')} {'Списано с вас' if done else 'Возвращено из заморозки' if back_ else 'Удерживается' if d.funds_held else 'Заморожено у вас'}: "
-              f"<b>{money.usdt(d.seller_debit)} USDT</b>")
-    if d.merchant_rate is not None:  # order requisites: a fixed rate, no percent
-        return quote(f"{pe('ruble')} Сумма перевода: <b>{money.fmt(d.amount_rub)} ₽</b>", frozen,
-                     f"{pe('swap')} Ваш курс: <b>{money.fmt(d.merchant_rate)} ₽</b> за USDT")
-    return quote(
-        f"{pe('ruble')} Сумма перевода: <b>{money.fmt(d.amount_rub)} ₽</b>",
-        frozen,
-        f"{pe('up')} Ваш доход: <b>+{money.usdt(d.amount_rub / d.rate - d.seller_debit)} USDT</b>" if not back_ else "",
-    )
+        return quote(f"{pe('ruble')} {rub} = <b>{money.usdt(d.seller_debit)} USDT</b> по {money.fmt(d.merchant_rate)} ₽"
+                     + (f" · {_link(d)}" if d.bybit_url else ""))
+    lock = ("списано" if done else "вернулось" if back_ else "удерживается" if d.funds_held else "заморожено")
+    extra = (f"курс {money.fmt(d.merchant_rate)} ₽" if d.merchant_rate is not None else
+             "" if back_ else f"доход <b>+{money.usdt(d.amount_rub / d.rate - d.seller_debit)} USDT</b>")
+    return quote(f"{pe('ruble')} {rub} · {lock} <b>{money.usdt(d.seller_debit)} USDT</b>" + (f" · {extra}" if extra else ""))
 
 
 def _link(d: Deal) -> str:
     return f'<a href="{esc(d.bybit_url)}">ордер</a>'
 
 
-STAGES = {"searching": (1, "подбор реквизитов"), "assigned": (1, "подбор реквизитов"),
-          "checking": (1, "проверка реквизитов"), "waiting_payment": (1, "перевод и чек"),
-          "paid": (2, "проверка поступления")}
+def _progress(d: Deal) -> str:
+    """▰▰▰▱▱ шаг 4 из 5 — the way of an open deal (the same steps as the mini app)."""
+    if d.status not in deals.OPEN:
+        return ""
+    from bot.api.webapp import steps
+    way = steps(d)
+    done = sum(1 for x in way if x["state"] == "done")
+    return f"{'▰' * done}{'▱' * (len(way) - done)}  шаг {min(done + 1, len(way))} из {len(way)}"
+
+
+def _deadline(d: Deal, what: str = "до") -> str:
+    """⏱ до 14:05 · 9 мин — or nothing when the deal has no deadline."""
+    if deals.held(d):
+        return ""
+    return f"{pe('clock')} {what} <b>{at(d.expires_at)}</b> · осталось {minutes_left(d)} мин"
 
 
 def deal_text(d: Deal, card: Card, viewer_id: int, note: str = "") -> str:
+    """The deal as a card: who and how much, where it is now, and only what to do right now."""
     icon, label = status_of(d, viewer_id)
     # whoever checks the payment reads the checking steps, even on his own purchase
     buyer = viewer_id == d.buyer_id and not (d.status == "paid" and viewer_id == deals.checker(d))
     operator = not buyer and d.via_bybit and viewer_id == d.operator_id
-    merchant = not buyer and not operator  # the seller; in a Bybit order he only watches after giving the link
+    merchant = not buyer and not operator
     checks = not buyer and viewer_id == deals.checker(d)
-    stage = STAGES.get(d.status)
-    lines = [
-        title(pe("fire"), f"Сделка #{d.id} · {'покупка' if buyer else 'продажа'} USDT"),
-        f"{pe(icon)} <b>{label}</b>" + (f" · этап {stage[0]} из 3: {stage[1]}" if stage else ""),
-        "",
-        _money_block(d, buyer),
-        "",
-    ]
-    late = d.paid_at is not None and deals.aware(d.paid_at) > deals.aware(d.expires_at)
+    role = "покупка" if buyer else "оператор" if operator else "продажа"
     st = d.status
+    todo: list[str] = []  # what to do now: a few short lines
     if st == "searching":
-        lines += [f"{pe('search')} Ищем ордерного мерчанта под <b>{money.fmt(d.amount_rub)} ₽</b>"
-                  + (f" · перевод из {esc(d.sender_bank)}" if d.sender_bank else "") + f", до {at(d.expires_at)}.",
-                  "Обычно это несколько минут. Реквизиты придут уведомлением — до этого ничего не переводите."]
+        todo = ["Реквизиты придут уведомлением — до этого ничего не переводите."
+                + (f" Банк: {esc(d.sender_bank)}." if d.sender_bank else ""), _deadline(d, "поиск до")]
     elif st == "assigned" and buyer:
-        lines += [f"{pe('clock')} " + ("Мерчант создаёт Bybit-ордер под вашу сумму" if d.via_bybit else
-                                        "Мерчант взял заявку и выдаёт реквизиты") + f" ({due(d)}). Ничего не "
-                  "переводите, пока реквизиты не появятся здесь."]
+        todo = ["Реквизиты появятся здесь — до этого ничего не переводите."]
     elif st == "assigned" and d.via_bybit and operator:
-        lines += [f"{pe('clock')} Вы попросили пересоздать ордер: мерчант пришлёт новую ссылку до "
-                  f"<b>{at(d.expires_at)}</b> — она придёт вам. Не пришлёт — заявка уйдёт другим мерчантам."]
+        todo = [f"Мерчант пришлёт новую ссылку до <b>{at(d.expires_at)}</b>, иначе заявка уйдёт другим."]
     elif st == "assigned" and d.via_bybit:
-        lines += [f"{pe('fire')} <b>Вы взяли заявку.</b> Пришлите ссылку на ордер Bybit P2P до <b>{at(d.expires_at)}</b>"
-                  " — иначе заявка уйдёт другим мерчантам."
-                  + (" Оператор попросил <b>новый ордер</b>: создайте его и пришлите ссылку." if d.operator_id else ""),
-                  f"{pe('dollar')} Ордер: <b>{money.fmt(d.amount_rub)} ₽</b> = <b>{money.usdt(d.seller_debit)} USDT</b> "
-                  f"по {money.fmt(d.merchant_rate)} ₽. Баланс в боте не нужен."]
-    elif st == "checking" and buyer:
-        lines += [f"{pe('search')} Ордер под вашу сумму найден — оператор проверяет его и выдаст реквизиты"
-                  + (f" ({due(d)})" if due(d) else "") + ". Ничего не переводите, пока реквизиты не появятся здесь."]
-    elif st == "checking" and operator:
-        lines += [f"{pe('shop')} Ордер {_link(d)}: зайдите на <b>{money.usdt(d.seller_debit)} USDT</b> и выдайте "
-                  "покупателю реквизиты.",
-                  f"{pe('lock')} Срока нет — сделку ведёте вы: ордер не тот — «Пересоздать ордер», сделка не "
-                  "состоится — «Закрыть сделку»." if deals.held(d) else
-                  f"{pe('clock')} Выдайте реквизиты до <b>{at(d.expires_at)}</b>."]
-    elif st == "checking":
-        lines += [f"{pe('clock')} " + ("Оператор принял ваш ордер и выдаёт покупателю реквизиты." if d.operator_id
-                                        else f"Ссылка у операторов: первый принявший выдаст реквизиты, {due(d)}.")
-                  + " Держите ордер открытым — от вас пока ничего не нужно."]
+        todo = [f"{pe('fire')} Создайте ордер Bybit P2P на <b>{money.fmt(d.amount_rub)} ₽</b> и пришлите ссылку"
+                + (" — <b>нужен новый ордер</b>" if d.operator_id else ""),
+                _deadline(d) + " — иначе заявка уйдёт другим"]
     elif st == "assigned":
-        lines += [f"{pe('fire')} <b>Вы взяли заявку.</b> Выдайте реквизиты до <b>{at(d.expires_at)}</b> — иначе "
-                  "заявка уйдёт другим мерчантам, а заморозка снимется.",
-                  f"{pe('bank')} Покупатель переводит" + (f" из <b>{esc(d.sender_bank)}</b>" if d.sender_bank else "")
-                  + f" ровно {money.fmt(d.amount_rub)} ₽.",
-                  f"{pe('up')} Ваш доход: <b>+{money.usdt(d.amount_rub / d.rate - d.seller_debit)} USDT</b>"]
+        todo = [f"{pe('fire')} Выдайте реквизиты" + (f" · покупатель из <b>{esc(d.sender_bank)}</b>" if d.sender_bank else ""),
+                _deadline(d) + " — иначе заявка уйдёт другим"]
+    elif st == "checking" and buyer:
+        todo = ["Оператор выдаст реквизиты — до этого ничего не переводите."]
+    elif st == "checking" and operator:
+        todo = [f"{pe('shop')} Зайдите в {_link(d)} на <b>{money.usdt(d.seller_debit)} USDT</b> и выдайте реквизиты",
+                f"{pe('lock')} Срока нет: не тот ордер — «Пересоздать», не состоится — «Закрыть»" if deals.held(d)
+                else _deadline(d)]
+    elif st == "checking":
+        todo = ["Держите ордер открытым — от вас ничего не нужно."]
     elif st == "waiting_payment" and buyer:
-        lines += [
-            title(pe("card"), "Реквизиты для перевода"),
-            quote(
-                f"{pe('bank')} {esc(card.bank)} · {kind_label(card)}",
-                f"{pe('key')} <code>{esc(card.requisites)}</code>",
-                f"{pe('profile')} {esc(card.holder)}" if card.holder else "",
-                f"{pe('ruble')} Ровно: <code>{exact(d.amount_rub)}</code> ₽",
-            ),
-            f"{pe('clock')} Оплатите сейчас — сделку ведёт оператор." if deals.held(d) else
-            f"{pe('clock')} Оплатите до <b>{at(d.expires_at)}</b> (осталось {minutes_left(d)} мин).",
-            f"1. Переведите <b>ровно {money.fmt(d.amount_rub)} ₽</b> одним платежом на реквизиты выше. "
-            "Комментарий к переводу не пишите.",
-            "2. Скачайте в банке PDF-чек этого перевода и нажмите «Прикрепить PDF-чек».",
-            "Передумали или не получается перевести — отмените сделку <b>до</b> перевода.",
-        ]
+        todo = [section("card", "Куда переводить") + "\n" + quote(
+                    f"{pe('bank')} <b>{esc(card.bank)}</b> · {kind_label(card)}",
+                    f"{pe('key')} <code>{esc(card.requisites)}</code>",
+                    f"{pe('profile')} {esc(card.holder)}" if card.holder else "",
+                    f"{pe('ruble')} ровно <code>{exact(d.amount_rub)}</code> ₽"),
+                "\n1. Переведите ровно эту сумму одним платежом, без комментария",
+                "2. Нажмите «Прикрепить PDF-чек» и пришлите чек из банка",
+                "\n" + (_deadline(d, "оплатить до") or f"{pe('clock')} Оплатите сейчас — сделку ведёт оператор")]
     elif st == "waiting_payment":
-        lines += [f"{pe('clock')} Покупатель переводит на {esc(card.bank)} {mask(card)}"
-                  + (" — срока нет, сделку закрываете вы." if deals.held(d) and operator else
-                     "." if deals.held(d) else f" до <b>{at(d.expires_at)}</b>."),
-                  ("Чек получит оператор и проверит оплату в ордере — от вас ничего не нужно." if merchant
-                   else "Пока ничего делать не нужно: когда покупатель пришлёт чек, придёт уведомление с кнопками.")
-                  if d.via_bybit else
-                  "Пока ничего делать не нужно: когда покупатель пришлёт чек, придёт уведомление с кнопками.",
-                  "" if d.via_bybit else f"{pe('lock')} {money.usdt(d.seller_debit)} USDT заморожены под эту сделку."]
+        todo = [f"Покупатель переводит на {esc(card.bank)} {mask(card)}. "
+                + ("Чек проверит оператор — от вас ничего не нужно." if d.via_bybit and merchant else
+                   "Чек придёт уведомлением с кнопками."),
+                "" if deals.held(d) else _deadline(d, "оплата до")]
     elif st == "paid" and buyer:
-        lines.append(f"{pe('doc')} Чек отправлен продавцу {at(d.paid_at)}. Он проверяет поступление в банке — "
-                     "после подтверждения USDT сразу придут на баланс, мы сообщим.")
         open_at = deals.buyer_dispute_at(d)
-        if open_at and now() < open_at:
-            lines.append(f"Если продавец не ответит до <b>{at(open_at)}</b>, вы сможете открыть спор.")
-        else:
-            lines.append("Продавец долго не отвечает — можно открыть спор, решит администрация.")
+        todo = [f"{pe('doc')} Чек отправлен {at(d.paid_at)}. USDT придут сразу после подтверждения.",
+                f"Спор — если не ответят до <b>{at(open_at)}</b>." if open_at and now() < open_at
+                else "Долго не отвечают — можно открыть спор."]
     elif st == "paid" and not checks:
-        lines.append(f"{pe('doc')} Чек у оператора {at(d.paid_at)}: он проверяет оплату в ордере Bybit и подтвердит "
-                     "сделку. От вас ничего не нужно.")
-    elif st == "paid" and operator:
-        lines += [
-            f"{pe('warn')} <b>Проверьте оплату в ордере Bybit</b> {_link(d)} — не по чеку:",
-            f"1. Покупатель перевёл <b>{money.fmt(d.amount_rub)} ₽</b> на {esc(card.bank)} {mask(card)} после "
-            f"{at(d.created_at)}. Отметьте оплату в ордере и дождитесь, пока продавец отпустит "
-            f"<b>{money.usdt(d.seller_debit)} USDT</b>.",
-            f"2. USDT пришли — «Подтвердить», покупатель получит {money.usdt(d.buyer_credit)} USDT.",
-            "3. Оплаты нет или сумма другая — «Спор»: пришлите видео из ЛК или выписку, спор решится сразу.",
-        ]
+        todo = ["Чек у оператора — от вас ничего не нужно."]
     elif st == "paid":
-        lines += [
-            f"{pe('warn')} <b>Проверьте поступление в приложении банка</b> — не по чеку, а по истории операций:",
-            f"1. Найдите входящий перевод <b>{money.fmt(d.amount_rub)} ₽</b> на {esc(card.bank)} {mask(card)} "
-            f"после {at(d.created_at)}.",
-            f"2. Пришло ровно {money.fmt(d.amount_rub)} ₽ — «Деньги пришли», покупатель получит USDT.",
-            "3. Денег нет или сумма другая — «Не пришли», решит администрация.",
-            "Чек можно подделать: подтверждайте только по факту зачисления.",
-        ]
-        if late:
-            lines.append(f"{pe('clock')} Чек загружен после окончания срока оплаты.")
-        auto = deals.aware(d.paid_at) + timedelta(minutes=settings.num("escalate_minutes")) if d.paid_at else None
-        if auto:
-            lines.append(f"Без ответа до {at(auto, 'dt')} сделка уйдёт в спор автоматически.")
+        where = f"в ордере Bybit {_link(d)}" if operator else "в приложении банка"
+        auto = deals.aware(d.paid_at) + timedelta(minutes=settings.num("escalate_minutes")) if d.paid_at and not operator else None
+        todo = [f"{pe('warn')} <b>Проверьте {where}</b>: входящий <b>{money.fmt(d.amount_rub)} ₽</b> на "
+                f"{esc(card.bank)} {mask(card)} после {at(d.created_at)}",
+                ("Пришло ровно столько — «Оплата пришла — подтвердить». Нет или другая сумма — «Оплаты нет — спор»."
+                 if operator else "Пришло ровно столько — «Деньги пришли». Нет или другая сумма — «Не пришли»."),
+                "Подтверждайте по зачислению, а не по чеку: чек можно подделать.",
+                (f"{pe('clock')} Чек загружен после срока оплаты." if d.paid_at and deals.aware(d.paid_at) > deals.aware(d.expires_at) else ""),
+                f"Без ответа до {at(auto, 'dt')} — автоматически спор." if auto else ""]
     elif st == "dispute":
-        n = len(d.dispute_files or [])
-        lines += [
-            f"{pe('flag')} Причина: {REASONS.get(d.dispute_reason, '—')}"
-            + (f", пришло {money.fmt(d.dispute_amount_rub)} ₽" if d.dispute_amount_rub else ""),
-            "" if d.via_bybit else
-            f"{pe('lock')} {money.usdt(d.seller_debit)} USDT продавца заморожены до решения администрации.",
-            f"Материалов в споре: <b>{n}</b>. "
-            + ("Помогут видео из банка со списанием и выписка." if buyer
-               else "Поможет видео истории поступлений за время сделки."),
-            "Что дальше: администрация сверит чек и материалы обеих сторон и примет решение — "
-            "оно придёт уведомлением. " + ("Писать продавцу" if buyer else "Писать покупателю")
-            + " напрямую не нужно.",
-        ]
+        todo = [f"{pe('flag')} {REASONS.get(d.dispute_reason, '—')}"
+                + (f", пришло {money.fmt(d.dispute_amount_rub)} ₽" if d.dispute_amount_rub else "")
+                + f" · материалов: {len(d.dispute_files or [])}",
+                "Решение придёт уведомлением. " + ("Поможет видео списания из банка или выписка." if buyer
+                                                  else "Поможет видео истории поступлений.")]
     elif st == "completed":
-        lines.append(f"{pe('ok')} {money.usdt(d.buyer_credit)} USDT зачислены на ваш баланс." if buyer else
-                     f"{pe('ok')} Сделка проведена: {money.usdt(d.seller_debit)} USDT по Bybit-ордеру." if d.via_bybit else
-                     f"{pe('ok')} {money.usdt(d.seller_debit)} USDT списаны из заморозки, доход начислен.")
+        todo = [f"{pe('ok')} " + (f"{money.usdt(d.buyer_credit)} USDT на вашем балансе" if buyer else
+                                  f"Проведено: {money.usdt(d.seller_debit)} USDT по Bybit-ордеру" if d.via_bybit else
+                                  "USDT списаны из заморозки, доход начислен")]
     elif st == "cancelled":
-        lines.append("С вас ничего не списано." if buyer else "Сделка отменена, средства снова доступны.")
+        todo = ["С вас ничего не списано." if buyer else "Средства снова доступны."]
     elif st == "void":
-        lines.append("Не переводите по этой сделке деньги. Уже перевели — напишите в поддержку, указав номер сделки."
-                     if buyer else "Средства снова доступны.")
+        todo = ["Не переводите по этой сделке. Уже перевели — напишите в поддержку." if buyer else "Средства снова доступны."]
     elif st == "expired":
         until = deals.late_deadline(d)
         if buyer and until and now() < until:
-            lines += ["Время на оплату вышло, с вас ничего не списано.",
-                      f"{pe('warn')} <b>Уже перевели деньги?</b> Загрузите чек до {at(until, 'dt')} — "
-                      "сделка вернётся продавцу на проверку."]
+            todo = [f"{pe('warn')} <b>Уже перевели?</b> Прикрепите чек до {at(until, 'dt')} — сделка вернётся на проверку."]
+        elif not buyer and d.funds_held and d.hold_until:
+            todo = [f"{pe('lock')} Залог удерживается до <b>{at(d.hold_until)}</b>: придёт чек — сделка вернётся вам. "
+                    "Проверьте поступления в банке."]
         else:
-            lines.append("Время на оплату вышло." if buyer else "Покупатель не оплатил вовремя, средства снова доступны.")
-    if st == "expired" and not buyer and d.funds_held and d.hold_until:
-        lines[-1] = (f"{pe('lock')} Покупатель не оплатил вовремя. Залог {money.usdt(d.seller_debit)} USDT "
-                     f"удерживается до <b>{at(d.hold_until)}</b>: если покупатель всё-таки перевёл и пришлёт чек, "
-                     "сделка вернётся вам на проверку. Проверьте поступления в банке.")
-    if d.close_reason in CLOSE_REASONS:
-        lines.append(f"Итог: {CLOSE_REASONS[d.close_reason]}.")
+            todo = ["С вас ничего не списано." if buyer else "Средства снова доступны."]
+    if d.close_reason in CLOSE_REASONS and st not in deals.OPEN:
+        todo.append(f"Итог: {CLOSE_REASONS[d.close_reason]}.")
     if d.resolution:
-        lines.append(f"{pe('support')} Комментарий администрации: <i>{esc(d.resolution)}</i>")
-    return "\n".join(lines) + ("\n" + note if note else "")
+        todo.append(f"{pe('support')} Администрация: <b>{esc(d.resolution)}</b>")
+    lines = [
+        f"{pe('fire')} <b>Сделка #{d.id}</b> · {role} · {money.fmt(d.amount_rub)} ₽",
+        f"{pe(icon)} <b>{label}</b>",
+        _progress(d),
+        "",
+        _money_block(d, buyer),
+        "",
+        *[x for x in todo if x],
+    ]
+    return "\n".join(x for x in lines if x is not None).replace("\n\n\n", "\n\n").rstrip() + ("\n" + note if note else "")
 
 
 def deal_brief(d: Deal, card: Card, viewer_id: int, head: str) -> str:
@@ -313,7 +286,8 @@ def deal_brief(d: Deal, card: Card, viewer_id: int, head: str) -> str:
     buyer = viewer_id == d.buyer_id
     amount = (f"{money.fmt(d.amount_rub)} ₽ → {money.usdt(d.buyer_credit)} USDT" if buyer
               else f"{money.fmt(d.amount_rub)} ₽ на {esc(card.bank)} {mask(card)}")
-    return f"{pe('bell')} <b>{head}</b>\n{pe(STATUS[d.status][0])} Сделка #{d.id}: {amount}"
+    icon, label = status_of(d, viewer_id)
+    return f"{pe('bell')} <b>{head}</b>\n{pe(icon)} Сделка #{d.id}: {amount}\n{label}"
 
 
 def deal_kb(d: Deal, viewer_id: int, card: Card | None = None):
@@ -424,8 +398,8 @@ async def deals_screen(bot: Bot, s: AsyncSession, user: User, page: int = 0, src
     if page < pages - 1:
         nav.append(btn(f"{page + 2}/{pages}", f"deals:{page + 1}", "next"))
     await show(bot, user, text, kb(
-        *[btn(f"{'↓' if d.buyer_id == user.id else '↑'} #{d.id} · {money.fmt(d.amount_rub)} ₽ · {STATUS[d.status][1]}",
-              f"dl:{d.id}", STATUS[d.status][0]) for d in rows],
+        *[btn(f"{'↓' if d.buyer_id == user.id else '↑'} #{d.id} · {money.fmt(d.amount_rub)} ₽ · {status_of(d, user.id)[1]}",
+              f"dl:{d.id}", status_of(d, user.id)[0]) for d in rows],
         nav,
         back("menu", "В меню"),
     ), src)
@@ -442,16 +416,11 @@ async def cb_deal(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User, state
 
 # ---------- buyer: receipt ----------
 
-def images_allowed() -> bool:
-    return settings.get("receipt_images") == "1"
-
-
 def receipt_problem(m: Message) -> str | None:
+    """Receipts are PDF files only: a photo or a screenshot is easy to fake."""
     doc = m.document
-    if m.photo:
-        return None if images_allowed() else "Это фото, а нужен PDF-файл чека. " + HOW_PDF
-    if doc and images_allowed() and (doc.mime_type or "").startswith("image/"):
-        return None if (doc.file_size or 0) <= MAX_FILE else "Файл больше 20 МБ."
+    if m.photo or (doc and (doc.mime_type or "").startswith("image/")):
+        return "Это фото, а нужен PDF-файл чека — фото и скриншоты не принимаем. " + HOW_PDF
     if not doc:
         return "Отправьте чек файлом PDF. " + HOW_PDF
     if doc.mime_type != "application/pdf" and not (doc.file_name or "").lower().endswith(".pdf"):
@@ -495,8 +464,8 @@ async def send_receipt(bot: Bot, chat: int, fid: str, caption: str, markup=None,
 
 def _receipt_prompt(d: Deal, err: str = "") -> str:
     lines = [title(pe("clip"), f"Чек по сделке #{d.id}"), "",
-             f"Отправьте <b>PDF-файл</b>{' или фото' if images_allowed() else ''} чека о переводе "
-             f"<b>{money.fmt(d.amount_rub)} ₽</b>.", HOW_PDF]
+             f"Отправьте <b>PDF-файл</b> чека о переводе <b>{money.fmt(d.amount_rub)} ₽</b> — фото и скриншоты не "
+             "принимаются.", HOW_PDF]
     if d.status == "waiting_payment" and not deals.held(d):
         lines.append(f"{pe('clock')} Успейте до {at(d.expires_at)}.")
     return "\n".join(lines) + (warn(err) if err else "")
@@ -1063,7 +1032,7 @@ async def dispute_text(s: AsyncSession, d: Deal) -> str:
         flags = " · ЗАБАНЕН" if u.is_banned else ""
         return f"{esc(u.name)} (@{esc(u.username or '—')}, <code>{u.id}</code>) · сделок: {stats[u.id]}{flags}"
 
-    icon, label = STATUS[d.status]
+    icon, label = status_of(d)
     files = d.dispute_files or []
     by = {r: sum(1 for f in files if (f[2] if len(f) > 2 else "seller") == r) for r in ("buyer", "seller")}
     times = [f"создана {at(d.created_at, 'dt')}", f"оплатить до {at(d.expires_at, 't')}"]

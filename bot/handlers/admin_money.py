@@ -60,7 +60,7 @@ async def msg_debt(m: Message, bot: Bot, s: AsyncSession, user: User, state: FSM
         text = f"−{money.usdt(paid)} USDT"
     audit.log(s, user.id, "operator_debt", f"op:{uid}", f"{text}: {why}")
     events.add(s, f"op:{uid}", "debt_manual", f"Долг {text} вручную ({user.name}): {why} · всего "
-                                              f"{money.usdt(op.debt)} USDT", uid, alert=True)
+                                              f"{money.usdt(op.debt)} USDT", uid, notice=True)
     await s.commit()
     await notify(bot, uid, f"{pe('shop')} Администрация изменила ваш долг оператора: {text}. Причина: {esc(why)}. "
                            f"Долг сейчас: <b>{money.usdt(op.debt)} USDT</b>.")

@@ -20,7 +20,7 @@ def test_buyer_can_copy_requisites_and_amount(go):
         copies = [x.copy_text.text for row in last_markup(b, BUYER).inline_keyboard for x in row if x.copy_text]
         assert copies == ["4111111111111111", "10000"]
         text = plain(b.session.last(BUYER))
-        assert "этап 1 из 3" in text and "Комментарий к переводу не пишите" in text
+        assert "шаг 2 из 3" in text and "без комментария" in text
     go(fn)
 
 
@@ -39,7 +39,7 @@ def test_verdict_comment_reaches_both_sides(go):
         deal = await get_deal(d.id)
         assert deal.status == "completed" and deal.resolution == "Перевод найден в выписке продавца"
         for uid in (BUYER, SELLER):
-            assert "Комментарий администрации: Перевод найден в выписке продавца" in plain(b.session.last(uid))
+            assert "Администрация: Перевод найден в выписке продавца" in plain(b.session.last(uid))
     go(fn)
 
 

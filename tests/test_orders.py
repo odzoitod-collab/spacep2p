@@ -78,7 +78,7 @@ def test_full_order_requisites_flow(go):
         d = await request(b)
         assert d.status == "searching" and d.is_order and d.sender_bank is None and d.seller_id is None
         assert (d.merchant_rate, d.seller_debit, d.buyer_credit) == (D(104), D(500), D("488.8"))
-        assert "Ищем ордерного мерчанта" in plain(b.session.last(BUYER))
+        assert "Ищем мерчанта под вашу сумму" in plain(b.session.last(BUYER))
         assert offers(b, M1) and f"orq:take:{d.id}:b" in b.session.buttons(M1)
         offer = plain(offers(b, M1)[-1])
         assert "Доход" not in offer and "доход" not in offer  # the merchant's earnings are not ours to say

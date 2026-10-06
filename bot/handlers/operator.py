@@ -1,6 +1,5 @@
-"""Operator's cabinet («Оператор» in the menu): his debt for accepted Bybit orders and how to repay it (USDT to his
-personal debt address in TON — services/ton.py lowers the debt by every transfer — or from his balance), orders in
-work, free orders waiting for an operator, results.
+"""Operator's cabinet («Оператор» in the menu): his debt for accepted Bybit orders and how to repay it (from his
+balance, topped up with USDT BEP-20 like any user's), orders in work, free orders waiting for an operator, results.
 The debt itself is kept in services/operators.py."""
 from datetime import timedelta
 from decimal import Decimal
@@ -12,8 +11,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.emoji import back, btn, kb, pe
 from bot.models import Deal, Operator, User, now
-from bot.services import deals, events, money, operators, ton
-from bot.ui import at, esc, ok, quote, section, show, title, warn
+from bot.services import deals, events, money, operators
+from bot.ui import app_btn, at, esc, ok, quote, section, show, title, warn
 
 router = Router()
 WORK = {"assigned": "мерчант пересоздаёт ордер", "checking": "выдать реквизиты", "waiting_payment": "ждём оплату",
@@ -62,7 +61,8 @@ async def operator_screen(bot: Bot, s: AsyncSession, user: User, src=None, note:
         "",
         section("dollar", "Долг перед площадкой"),
         quote(f"• Принято по ордерам и не погашено: <b>{money.usdt(debt)} USDT</b>",
-              f"• Ваш баланс в боте: {money.usdt(user.balance)} USDT")
+              f"• Ваш баланс в боте: {money.usdt(user.balance)} USDT",
+              "• Гасится с баланса; не хватает — пополните кошелёк USDT в сети BEP-20 (BSC)")
         if debt else f"{pe('ok')} Долга нет.",
         "",
         section("stats", "Результаты"),
@@ -74,10 +74,11 @@ async def operator_screen(bot: Bot, s: AsyncSession, user: User, src=None, note:
           for st, icon, _ in GROUPS for d in by[st]],
         *([btn(f"Принять ордер #{d.id} · {money.fmt(d.amount_rub)} ₽", f"opq:go:{d.id}", "bell", style="success")
            for d in free] if active else []),
-        btn(f"Погасить переводом USDT · {money.usdt(debt)} USDT", "op:pay", "wallet") if debt else None,
-        btn(f"Погасить с баланса · {money.usdt(min(debt, user.balance))} USDT", "op:bal", "dollar")
+        btn(f"Погасить с баланса · {money.usdt(min(debt, user.balance))} USDT", "op:bal", "dollar", style="success")
         if debt and user.balance > 0 else None,
+        btn("Пополнить баланс (USDT BEP-20)", "w:in", "plus") if debt and user.balance < debt else None,
         [btn("Обновить", "op", "refresh"), btn("История долга", "op:h", "list")],
+        app_btn("Кабинет в приложении", "operator", "shop", style="primary", wide=True),
         back("menu", "В меню"),
     ), src)
 
@@ -87,49 +88,6 @@ async def cb_operator(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User):
     if not await allowed(s, user.id):
         return await c.answer("Кабинет оператора доступен только операторам", show_alert=True)
     await operator_screen(bot, s, user, c)
-
-
-@router.callback_query(F.data == "op:pay")
-async def cb_pay(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User):
-    """His personal debt address in TON: every USDT that comes there lowers the debt (services/ton.py)."""
-    if not await allowed(s, user.id):
-        return await c.answer("Кабинет оператора доступен только операторам", show_alert=True)
-    if ton.chain is None:
-        return await c.answer("Погашение переводом временно недоступно — погасите с баланса", show_alert=True)
-    op = await s.get(Operator, user.id)
-    a = await ton.personal(s, user.id, "debt")
-    await s.commit()
-    addr = ton.friendly(a.address)
-    await show(bot, user, "\n".join([
-        title(pe("wallet"), "Погашение долга переводом"),
-        "",
-        section("key", "Ваш адрес для погашения долга"),
-        f"<code>{addr}</code>",
-        "",
-        quote(f"• Долг: <b>{money.usdt(op.debt if op else Decimal(0))} USDT</b>",
-              "• Монета и сеть: только <b>USDT (Tether) в сети TON</b>",
-              "• Комиссии нет: вся сумма идёт в погашение"),
-        "Адрес постоянный и только ваш. Долг уменьшится автоматически после подтверждения в сети (1–2 минуты); "
-        "больше долга — разница придёт на баланс. Для пополнения баланса этот адрес не подходит: он гасит долг.",
-    ]), kb(btn("Скопировать адрес", icon="key", copy=addr, style="primary"),
-           btn("Проверить поступление", "op:chk", "refresh"), back("op", "Кабинет оператора")), c)
-
-
-@router.callback_query(F.data == "op:chk")
-async def cb_check(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User):
-    try:
-        found = await ton.check_user(s, user.id)
-    except ton.ChainError:
-        return await c.answer("Сеть сейчас не отвечает — погашение зачтём автоматически.", show_alert=True)
-    if found is None:
-        return await c.answer("Проверка уже идёт — погашение зачтём автоматически.", show_alert=True)
-    if not found:
-        return await c.answer("Новых поступлений пока нет. Перевод в сети TON подтверждается за 1–2 минуты.",
-                              show_alert=True)
-    await s.refresh(user)
-    paid = sum((d.credit for d in found if d.purpose == "debt"), Decimal(0))
-    await operator_screen(bot, s, user, c, ok(f"Погашено переводом: {money.usdt(paid)} USDT") if paid
-                          else ok("Поступление зачислено"))
 
 
 @router.callback_query(F.data == "op:bal")

@@ -52,6 +52,8 @@ class User(Base):
     # deposited USDT not yet turned over: a deposit adds to it, USDT that went to buyers in completed deals take it
     # off; only balance − deposit_lock can be withdrawn (services/money.withdrawable)
     deposit_lock: Mapped[Decimal] = mapped_column(USDT, default=Decimal(0), server_default=text("0"))
+    # a merchant's reputation set by an admin (1–10), instead of the operators' average; None = the average
+    rating: Mapped[Decimal | None] = mapped_column(Numeric(3, 1))
 
 
 class Card(Base):
@@ -136,26 +138,26 @@ class Deal(Base):
 
 
 class Deposit(Base):
-    """Money that came in. USDT on TON: one row per incoming transfer to a user's personal address, credited once by
-    its transaction hash (status paid; small = below deposit_min, not credited). Rows with invoice_id are the history
-    of the former xRocket invoices."""
+    """Money that came in. USDT BEP-20: one row per Transfer log to a user's deposit address, credited once
+    (tx_hash = bsc:<tx hash>:<log index>). Rows with network TON or an invoice_id are history (TON wallets, xRocket)."""
     __tablename__ = "deposits"
     __table_args__ = (Index("ux_deposits_tx_hash", "tx_hash", unique=True),)
     id: Mapped[int] = mapped_column(primary_key=True)
     user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"), index=True)
     invoice_id: Mapped[str | None] = mapped_column(String(64))
     amount: Mapped[Decimal] = mapped_column(USDT)  # received
-    credit: Mapped[Decimal] = mapped_column(USDT)  # to the balance (deposit: minus deposit_fee; debt: repaid)
-    link: Mapped[str | None] = mapped_column(String(256))  # TON: the transaction in an explorer
-    status: Mapped[str] = mapped_column(String(16), index=True, default="new")  # TON: paid | small
+    credit: Mapped[Decimal] = mapped_column(USDT)  # to the balance (BEP-20: all of it down to cents)
+    link: Mapped[str | None] = mapped_column(String(256))  # the transaction in an explorer
+    status: Mapped[str] = mapped_column(String(16), index=True, default="new")  # paid (history: small, new...)
     created_at: Mapped[datetime] = mapped_column(default=now)
     network: Mapped[str | None] = mapped_column(String(8))
-    address: Mapped[str | None] = mapped_column(String(128))  # TON: our address the transfer came to
+    address: Mapped[str | None] = mapped_column(String(128))  # our address the transfer came to
     expires_at: Mapped[datetime | None]
-    # deposit: credited to the balance minus deposit_fee; debt: an operator repays his debt (no fee)
+    # deposit: credited to the balance; debt: history — an operator repaid his debt by a TON transfer
     purpose: Mapped[str] = mapped_column(String(8), default="deposit", server_default="deposit")
-    tx_hash: Mapped[str | None] = mapped_column(String(64))  # TON: hex hash of the incoming transfer's transaction
-    source: Mapped[str | None] = mapped_column(String(70))  # TON: the sender's wallet (raw)
+    # bsc:<tx hash>:<log index> (history: TON hex hash)
+    tx_hash: Mapped[str | None] = mapped_column(String(80))
+    source: Mapped[str | None] = mapped_column(String(70))  # the sender's wallet
 
 
 class Withdrawal(Base):
@@ -167,21 +169,23 @@ class Withdrawal(Base):
     amount: Mapped[Decimal] = mapped_column(USDT)  # debited from balance
     fee: Mapped[Decimal] = mapped_column(USDT)
     cheque_id: Mapped[str | None] = mapped_column(String(64))  # history of xRocket cheques
-    link: Mapped[str | None] = mapped_column(String(256))  # TON: the transaction in an explorer
-    # ton: queued -> sending -> sent -> done; queued <- sending (the message expired unexecuted: sent again);
-    # failed = refunded; unknown = executed but not found on chain in time (an owner decides); cancelled = by the user
+    link: Mapped[str | None] = mapped_column(String(256))  # the transaction in an explorer
+    # bsc: queued -> sending (claimed) -> sent (signed, in the chain) -> done; back to queued only when the chain proved
+    # the transaction failed; failed = refunded; cancelled = by the user or an owner before anything was signed;
+    # unknown / pending: history of TON and xRocket — an owner decides
     status: Mapped[str] = mapped_column(String(16), default="queued")
     error: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(default=now)
-    # ton: USDT from the hot wallet to `address`; xrocket / chain: history of the former xRocket payouts
-    method: Mapped[str] = mapped_column(String(8), default="ton", server_default="ton")
+    # bsc: USDT BEP-20 from the hot wallet to `address`; ton / xrocket / chain: history
+    method: Mapped[str] = mapped_column(String(8), default="bsc", server_default="bsc")
     address: Mapped[str | None] = mapped_column(String(128))  # recipient
     memo: Mapped[str | None] = mapped_column(String(120))  # comment an exchange may require
     tx_hash: Mapped[str | None] = mapped_column(String(128))
     sent_at: Mapped[datetime | None]
     network: Mapped[str | None] = mapped_column(String(8))
     net_fee: Mapped[Decimal] = mapped_column(USDT, default=Decimal(0), server_default=text("0"))
-    transfer_id: Mapped[int | None]  # ton: the last message signed for it (ton_transfers.id = query_id on chain)
+    transfer_id: Mapped[int | None]  # bsc_txs.id of the last transaction signed for it (history: ton_transfers.id)
+    status_at: Mapped[datetime | None]  # bsc: when the status last changed (a stale «sending» goes back to the queue)
 
 
 class Ledger(Base):
@@ -264,49 +268,6 @@ class FsmState(Base):
     updated_at: Mapped[datetime] = mapped_column(default=now, onupdate=now)
 
 
-class TonAddress(Base):
-    """A personal USDT-on-TON address the bot made for a user: purpose deposit (his balance) or debt (an operator repays
-    his debt). Its key is derived from TON_SEED and the label, never stored; incoming USDT are collected (swept) to the
-    hot wallet."""
-    __tablename__ = "ton_addresses"
-    __table_args__ = (Index("ux_ton_addresses_user_purpose", "user_id", "purpose", unique=True),)
-    id: Mapped[int] = mapped_column(primary_key=True)
-    user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"), index=True)
-    purpose: Mapped[str] = mapped_column(String(8))  # deposit | debt
-    address: Mapped[str] = mapped_column(String(70), unique=True)  # raw 0:HEX upper case, as Toncenter returns it
-    unswept: Mapped[Decimal] = mapped_column(USDT, default=Decimal(0))  # USDT came here, not yet on the hot wallet
-    created_at: Mapped[datetime] = mapped_column(default=now)
-
-    @property
-    def label(self) -> str:
-        return f"{self.purpose}:{self.user_id}"
-
-
-class TonTransfer(Base):
-    """One message the bot signed for one of its wallets (services/ton.py). It is recorded before it is broadcast:
-    sending -> sent (the wallet executed it: its seqno moved) -> done (USDT seen on chain) | failed (the jetton transfer
-    was aborted, nothing moved) | unknown (not found on chain in time); sending -> expired (valid_until passed with the
-    seqno unmoved: never executed, and never will be)."""
-    __tablename__ = "ton_transfers"
-    __table_args__ = (Index("ix_ton_transfers_wallet_id", "wallet", "id"),)
-    id: Mapped[int] = mapped_column(primary_key=True)  # also the query_id of a jetton transfer
-    wallet: Mapped[str] = mapped_column(String(40))  # label: gas (the hot wallet) | deposit:<user> | debt:<user>
-    kind: Mapped[str] = mapped_column(String(8))  # payout | sweep | gas | admin
-    ref: Mapped[str] = mapped_column(String(32), index=True, default="")  # wd:<id> | addr:<ton_addresses.id> | ""
-    asset: Mapped[str] = mapped_column(String(4))  # USDT | TON
-    amount: Mapped[Decimal] = mapped_column(Numeric(20, 9))
-    to_address: Mapped[str] = mapped_column(String(70))  # raw
-    memo: Mapped[str | None] = mapped_column(String(120))
-    seqno: Mapped[int] = mapped_column(BigInteger)
-    valid_until: Mapped[int] = mapped_column(BigInteger)  # unix time
-    msg_hash: Mapped[str | None] = mapped_column(String(64))  # normalized external message hash (hex)
-    status: Mapped[str] = mapped_column(String(10), index=True, default="sending")
-    tx_hash: Mapped[str | None] = mapped_column(String(64))
-    error: Mapped[str | None] = mapped_column(Text)
-    created_at: Mapped[datetime] = mapped_column(default=now)
-    done_at: Mapped[datetime | None]
-
-
 class OrderMerchant(Base):
     """Merchant who gives requisites on request (order requisites). The row is also the application:
     pending -> approved | rejected; approved -> suspended by an admin. An approved merchant gets every request
@@ -328,6 +289,8 @@ class OrderMerchant(Base):
     # until sleep_until and takes no requests; requisites given resets the count
     strikes: Mapped[int] = mapped_column(default=0, server_default=text("0"))
     sleep_until: Mapped[datetime | None]
+    # left the line himself (the app's or the cabinet's switch): gets and takes no requests until he is back
+    offline: Mapped[bool] = mapped_column(default=False, server_default=false())
 
 
 class DealMessage(Base):
@@ -341,6 +304,14 @@ class DealMessage(Base):
     role: Mapped[str] = mapped_column(String(40))
     text: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(default=now)
+
+
+class DealRead(Base):
+    """How far a user has read a deal's chat (the last message id he saw in the app): the rest is unread."""
+    __tablename__ = "deal_reads"
+    deal_id: Mapped[int] = mapped_column(primary_key=True, autoincrement=False)
+    user_id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
+    last_id: Mapped[int] = mapped_column(default=0)
 
 
 class MerchantRating(Base):
@@ -375,8 +346,7 @@ class OrderOffer(Base):
 class Operator(Base):
     """Operator of Bybit-order deals, added by an admin (OPERATOR_IDS in .env still work). He enters the merchant's
     Bybit order, gives its requisites and confirms the payment: the order's USDT arrive on his Bybit account, so each
-    confirmed deal adds its seller_debit to his debt; he repays it with USDT to his personal debt address (TON) or
-    from his balance."""
+    confirmed deal adds its seller_debit to his debt; he repays it from his balance (topped up with USDT BEP-20)."""
     __tablename__ = "operators"
     __table_args__ = (CheckConstraint("debt >= 0", name="ck_operators_debt_nonneg"),)
     user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"), primary_key=True)
@@ -502,8 +472,107 @@ class LogMessage(Base):
 
 class Setting(Base):
     __tablename__ = "settings"
-    key: Mapped[str] = mapped_column(String(32), primary_key=True)
+    key: Mapped[str] = mapped_column(String(80), primary_key=True)
     value: Mapped[str] = mapped_column(Text)
+
+
+LIVE = text("status = 'pending'")
+
+
+class BscTx(Base):
+    """One transaction the bot signed on BNB Smart Chain (services/bsc.py), recorded with its raw bytes BEFORE it is
+    broadcast: pending -> confirmed | reverted (status 0, nothing moved) | replaced (its nonce went to another
+    transaction). An operation (kind, ref_id) never has two pending transactions."""
+    __tablename__ = "bsc_txs"
+    __table_args__ = (CheckConstraint("kind IN ('withdrawal','payout','gas','collect')", name="ck_bsc_txs_kind"),
+                      CheckConstraint("amount > 0", name="ck_bsc_txs_amount"),
+                      CheckConstraint("status IN ('pending','confirmed','reverted','replaced')",
+                                      name="ck_bsc_txs_status"),
+                      Index("uq_bsc_txs_live", "kind", "ref_id", unique=True, postgresql_where=LIVE, sqlite_where=LIVE))
+    id: Mapped[int] = mapped_column(primary_key=True)
+    kind: Mapped[str] = mapped_column(String(10))  # withdrawal | payout (bsc_payouts) | gas | collect
+    ref_id: Mapped[int] = mapped_column(BigInteger)  # withdrawals.id | bsc_payouts.id | bsc_deposit_wallets.id
+    from_address: Mapped[str | None] = mapped_column(String(42))  # None = the hot wallet
+    to_address: Mapped[str] = mapped_column(String(42))
+    amount: Mapped[Decimal] = mapped_column(Numeric(18, 6))  # USDT; gas: BNB
+    nonce: Mapped[int] = mapped_column(BigInteger)
+    tx_hash: Mapped[str] = mapped_column(String(66), unique=True)
+    raw_tx: Mapped[str] = mapped_column(Text)
+    gas_price: Mapped[int | None] = mapped_column(BigInteger)
+    gas_limit: Mapped[int | None] = mapped_column(BigInteger)
+    status: Mapped[str] = mapped_column(String(10), index=True, default="pending")
+    block_number: Mapped[int | None] = mapped_column(BigInteger)
+    replaced_seen_at: Mapped[datetime | None]
+    alerted: Mapped[bool] = mapped_column(default=False)
+    created_at: Mapped[datetime] = mapped_column(default=now)
+    updated_at: Mapped[datetime] = mapped_column(default=now, onupdate=now)
+
+
+class BscDepositWallet(Base):
+    """A user's permanent BEP-20 deposit address: m/44'/60'/0'/0/<hd_index> of the seed whose index 0 is
+    master_address. Only the address is stored, the key is derived from the seed when it signs."""
+    __tablename__ = "bsc_deposit_wallets"
+    __table_args__ = (Index("ux_bsc_dw_user_master", "user_id", "master_address", unique=True),
+                      Index("ux_bsc_dw_index_master", "hd_index", "master_address", unique=True))
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"))
+    hd_index: Mapped[int]
+    address: Mapped[str] = mapped_column(String(42), unique=True)
+    master_address: Mapped[str] = mapped_column(String(42))
+    created_at: Mapped[datetime] = mapped_column(default=now)
+
+
+class BscIncoming(Base):
+    """Every USDT Transfer log to our addresses, once (the primary key is the dedup): deposit (credited to a user),
+    collect (our own sweep to the hot wallet) or unmatched (the hot wallet topped up from outside)."""
+    __tablename__ = "bsc_incoming"
+    tx_hash: Mapped[str] = mapped_column(String(66), primary_key=True)
+    log_index: Mapped[int] = mapped_column(primary_key=True, autoincrement=False)
+    source: Mapped[str | None] = mapped_column(String(42))
+    destination: Mapped[str | None] = mapped_column(String(42))
+    amount_micro: Mapped[int] = mapped_column(BigInteger)
+    block_number: Mapped[int | None] = mapped_column(BigInteger)
+    utime: Mapped[int | None] = mapped_column(BigInteger)
+    kind: Mapped[str] = mapped_column(String(10), default="unmatched")
+    ref_id: Mapped[int | None] = mapped_column(BigInteger)  # deposits.id
+    logged: Mapped[bool] = mapped_column(default=False)
+    created_at: Mapped[datetime] = mapped_column(default=now)
+
+
+class BscPayout(Base):
+    """An outgoing USDT payment that is not a user's withdrawal (kind cold: the hot wallet's surplus to the cold
+    wallet): queued -> sending -> pending_chain -> sent; cancelled = taken off before anything was signed."""
+    __tablename__ = "bsc_payouts"
+    __table_args__ = (Index("ux_bsc_payouts_kind_ref", "kind", "ref_id", unique=True),
+                      CheckConstraint("amount > 0", name="ck_bsc_payouts_amount"),
+                      CheckConstraint("status IN ('queued','sending','pending_chain','sent','cancelled')",
+                                      name="ck_bsc_payouts_status"))
+    id: Mapped[int] = mapped_column(primary_key=True)
+    kind: Mapped[str] = mapped_column(String(16))
+    ref_id: Mapped[int] = mapped_column(BigInteger)
+    user_id: Mapped[int | None] = mapped_column(BigInteger)
+    address: Mapped[str] = mapped_column(String(42))
+    amount: Mapped[Decimal] = mapped_column(Numeric(18, 6))
+    gross: Mapped[Decimal | None] = mapped_column(Numeric(18, 2))
+    fee: Mapped[Decimal] = mapped_column(Numeric(18, 2), default=Decimal(0))
+    comment: Mapped[str | None] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(16), default="queued")
+    tx_hash: Mapped[str | None] = mapped_column(String(66))
+    status_at: Mapped[datetime] = mapped_column(default=now)
+    created_by: Mapped[int | None] = mapped_column(BigInteger)
+    created_at: Mapped[datetime] = mapped_column(default=now)
+    notified: Mapped[bool] = mapped_column(default=False)
+    logged: Mapped[bool] = mapped_column(default=False)
+
+
+class BscAuto(Base):
+    """A user's permanent BEP-20 wallet with auto-withdrawal: a balance at or over `threshold` goes there by itself."""
+    __tablename__ = "bsc_auto"
+    user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"), primary_key=True)
+    address: Mapped[str] = mapped_column(String(42))
+    threshold: Mapped[Decimal] = mapped_column(USDT, default=Decimal(10))
+    active: Mapped[bool] = mapped_column(default=False)
+    updated_at: Mapped[datetime] = mapped_column(default=now, onupdate=now)
 
 
 engine = None
@@ -716,6 +785,25 @@ MIGRATIONS: list[tuple[int, list[str]]] = [
         "CREATE UNIQUE INDEX IF NOT EXISTS ux_deposits_tx_hash ON deposits (tx_hash)",
         "ALTER TABLE withdrawals ADD COLUMN IF NOT EXISTS transfer_id INTEGER",
         "ALTER TABLE withdrawals ALTER COLUMN method SET DEFAULT 'ton'",
+    ]),
+    (20, [
+        # USDT BEP-20 next to TON (bsc_* tables come from create_all): deposits keyed bsc:<tx>:<log>, the scan cursor
+        # setting is keyed by the hot wallet's address, a withdrawal's status has a time
+        "ALTER TABLE deposits ALTER COLUMN tx_hash TYPE VARCHAR(80)",
+        "ALTER TABLE settings ALTER COLUMN key TYPE VARCHAR(80)",
+        "ALTER TABLE withdrawals ADD COLUMN IF NOT EXISTS status_at TIMESTAMP WITH TIME ZONE",
+    ]),
+    (21, [
+        # BEP-20 only: TON is gone (ton_* tables stay untouched as history); a merchant's manual rating; the admin
+        # chat gets only what matters; receipts are PDF only
+        "ALTER TABLE withdrawals ALTER COLUMN method SET DEFAULT 'bsc'",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS rating NUMERIC(3, 1)",
+        "UPDATE settings SET value = '0' WHERE key = 'log_all'",
+        "DELETE FROM settings WHERE key IN ('receipt_images', 'ton_api_key', 'ton_cursor')",
+    ]),
+    (22, [
+        # an order merchant leaves the line and comes back himself
+        "ALTER TABLE IF EXISTS order_merchants ADD COLUMN IF NOT EXISTS offline BOOLEAN NOT NULL DEFAULT false",
     ]),
 ]
 

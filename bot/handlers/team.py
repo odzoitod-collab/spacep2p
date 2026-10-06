@@ -18,7 +18,7 @@ from bot.emoji import back, btn, kb, pe
 from bot.models import Event, Team, User, now
 from bot.services import deals, events, money, settings, teams
 from bot import guides, ui
-from bot.ui import at, clean, deep_link, esc, field, ok, quote, section, show, title, warn
+from bot.ui import app_btn, at, clean, deep_link, esc, field, ok, quote, section, show, title, warn
 
 log = logging.getLogger(__name__)
 router = Router()
@@ -122,7 +122,8 @@ async def leader_screen(bot: Bot, s: AsyncSession, user: User, team: Team, src=N
         btn(f"На основной баланс · {money.usdt(user.team_balance)} USDT", "tm:out", "wallet", style="success")
         if user.team_balance > 0 else None,
         btn("Скопировать ссылку", icon="key", copy=link, style="primary"),
-        btn("Участники", "tm:m", "list"), back("menu", "В меню")), src)
+        btn("Участники", "tm:m", "list"), app_btn("Открыть приложение", "", "live", wide=True),
+        back("menu", "В меню")), src)
 
 
 @router.callback_query(F.data == "tm:out")

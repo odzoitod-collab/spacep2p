@@ -1,25 +1,23 @@
-"""Admin operation cards (withdrawal, deposit), event history, support tickets, CSV reports, alert rendering."""
+"""Admin operation cards (withdrawal, deposit), the BEP-20 cash desk, event history, support tickets, CSV reports."""
+import asyncio
 import csv
 import io
-from contextlib import suppress
 from datetime import timedelta
 from decimal import Decimal
 
 from aiogram import Bot, F, Router
-from aiogram.exceptions import TelegramAPIError
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import BufferedInputFile, CallbackQuery, Message
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from bot.config import config
 from bot.services.admins import IsAdmin
 from bot.emoji import back, btn, kb, pe
 from bot.handlers.admin import DEP_LABEL, WD_LABEL
-from bot.handlers.wallet import notify_withdrawal, parse_usdt
-from bot.models import Audit, Deal, Deposit, Event, Ledger, Ticket, TonAddress, TonTransfer, User, Withdrawal, now
-from bot.services import admins, audit, events, money, settings, ton
+from bot.handlers.wallet import notify_withdrawal
+from bot.models import Audit, BscTx, Deal, Deposit, Event, Ledger, Ticket, User, Withdrawal, now
+from bot.services import admins, audit, bsc, events, money
 from bot.ui import alink, at, cf, esc, files_to, notify, ok, quote, section, show, title, ulink, warn
 from bot.ui import card as fields
 
@@ -30,9 +28,6 @@ router.callback_query.filter(IsAdmin())
 
 class Ops(StatesGroup):
     reply = State()
-    token = State()
-    out_addr = State()
-    out_amount = State()
 
 
 def _who(u: User | None, uid: int) -> str:
@@ -57,7 +52,7 @@ async def cb_payments(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User):
         "Откройте операцию: карточка показывает всю цепочку и следующее действие. Поиск — «Найти» → "
         "<code>в482</code> / <code>п12</code>.",
     ]) + ("" if wds or deps else f"\n\n{pe('ok')} Пусто"), kb(
-        *[btn(f"Вывод #{w.id} · {'чек' if w.method == 'xrocket' else 'TON'} · {money.usdt(w.amount)} USDT · "
+        *[btn(f"Вывод #{w.id} · {'BEP-20' if w.method == 'bsc' else 'чек' if w.method == 'xrocket' else 'TON'} · {money.usdt(w.amount)} USDT · "
               f"{WD_LABEL.get(w.status, w.status)}", f"awv:{w.id}", "up",
               style="danger" if w.status in CHECK else None) for w in wds],
         *[btn(f"Пополнение #{d.id} · {money.usdt(d.amount)} USDT · {DEP_LABEL.get(d.status, d.status)}",
@@ -66,215 +61,79 @@ async def cb_payments(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User):
     ), c)
 
 
-# ---------- TON: the hot wallet, its balances, the payout queue, the Toncenter key, owner transfers ----------
+# ---------- the BEP-20 cash desk: balances, the payout queue, the seed (owners) ----------
 
-@router.callback_query(F.data.in_({"aton", "aton:go"}))
-async def cb_ton(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User, state: FSMContext):
+@router.callback_query(F.data == "acash")
+async def cb_desk(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User, state: FSMContext):
     await state.set_state(None)
-    note = ""
-    if c.data == "aton:go":  # one cycle now: credit, settle, collect, pay the queue
-        if ton.chain is None:
-            return await c.answer("TON_SEED не задан", show_alert=True)
-        await c.answer("Запускаем…")
-        from bot.tasks import ton_cycle
-        before = (await ton.queue_need(s))[0]
-        rep = await ton_cycle(bot)
-        left = (await ton.queue_need(s))[0]
-        audit.log(s, user.id, "ton_cycle", "", f"зачислено {len(rep.credited)}, очередь {before} → {left}")
-        await s.commit()
-        note = (ok(f"Цикл выполнен: зачислено поступлений {len(rep.credited)}, завершено выводов {len(rep.finished)}, "
-                   f"в очереди {left}") + (warn("; ".join(rep.errors)) if rep.errors else ""))
-    await ton_screen(bot, s, user, c, note)
+    await desk_screen(bot, s, user, c)
 
 
-async def ton_screen(bot: Bot, s: AsyncSession, admin: User, src=None, note: str = ""):
-    if not ton.enabled():
-        return await show(bot, admin, "\n".join([
-            title(pe("wallet"), "TON-кошелёк"),
-            "",
-            warn("TON_SEED не задан в .env — пополнения и выводы выключены."),
-            "",
-            quote("Создайте ключ: <code>python -m bot.services.ton seed</code>, впишите в .env строкой "
-                  "<code>TON_SEED=…</code> и перезапустите бота. Храните копию ключа офлайн: без него средства на "
-                  "кошельках бота не достать, а с ним их может вывести кто угодно."),
-        ]) + note, kb(back("a", "Админ-панель")), src)
-    hot = ton.friendly(ton.hot_address())
+async def desk_screen(bot: Bot, s: AsyncSession, admin: User, src=None, note: str = ""):
+    if not bsc.ready():
+        return await show(bot, admin, title(pe("wallet"), "Касса USDT · BEP-20") + "\n\n" + warn(
+            "Касса выключена" + (f": {esc(bsc.error)}" if bsc.error else " — запускается, обновите через минуту")),
+            kb(btn("Обновить", "acash", "refresh"), back("a", "Админ-панель")), src)
+    n, need = (await s.execute(select(func.count(Withdrawal.id), func.coalesce(func.sum(
+        Withdrawal.amount - Withdrawal.fee), 0)).where(Withdrawal.method == "bsc", Withdrawal.status == "queued"))).one()
+    moving = await s.scalar(select(func.count(Withdrawal.id)).where(Withdrawal.method == "bsc",
+                                                                   Withdrawal.status.in_(("sending", "sent"))))
     try:
-        usdt, gas = await ton.hot_balances(max_age=15)
-        status = f"работает · {'testnet' if config.ton_testnet else 'mainnet'}"
-        free = usdt - await ton.in_flight_usdt(s)
-        balances = f"<b>{money.fmt(gas, 4)} TON</b> (газ) · <b>{money.usdt(usdt)} USDT</b>" + (
-            f" · свободно {money.usdt(free)}" if free != usdt else "")
-    except Exception as e:  # noqa: BLE001 - shown to the admin as it is
-        usdt = free = None
-        status, balances = f"<b>нет ответа</b>: {esc(str(e)[:150])}", "неизвестно"
-    unswept, addrs = (await s.execute(select(func.coalesce(func.sum(TonAddress.unswept), 0),
-                                             func.count(TonAddress.id)))).one()
-    queued = (await s.scalars(select(Withdrawal).where(Withdrawal.method == "ton", Withdrawal.status == "queued")
-                              .order_by(Withdrawal.id).limit(15))).all()
-    n_queued, need = await ton.queue_need(s)
-    moving = await s.scalar(select(func.count(Withdrawal.id)).where(Withdrawal.method == "ton",
-                                                                    Withdrawal.status.in_(("sending", "sent"))))
-    unknown = await s.scalar(select(func.count(Withdrawal.id)).where(Withdrawal.status == "unknown"))
-    people = {u.id: u for u in (await s.scalars(select(User).where(User.id.in_({w.user_id for w in queued})))).all()}
-    key = ton.api_key()
-    owner = admins.is_owner(admin.id)
+        d = await asyncio.wait_for(bsc.desk(s), 10)
+        nums = [cf("USDT свободно", f"<b>{money.usdt(d.usdt)} USDT</b>", icon="dollar"),
+                cf("BNB на газ", f"<b>{d.bnb:.5f} BNB</b>" + (" — мало, пополните" if d.bnb < Decimal("0.003") else ""),
+                   icon="fire"),
+                cf("Холодный кошелёк", f"{money.usdt(d.cold)} USDT", icon="lock") if d.cold is not None else "",
+                cf("На адресах пополнения", f"{money.usdt(d.unswept)} USDT — соберутся сами", icon="down")
+                if d.unswept else "",
+                cf("Касса всего", f"<b>{money.usdt(d.total)} USDT</b>", icon="wallet")]
+    except Exception as e:  # noqa: BLE001 - the screen opens anyway
+        nums = [cf("Сеть", f"не ответила: {esc(str(e)[:150])}", icon="warn")]
     await show(bot, admin, "\n".join([
-        title(pe("wallet"), "TON-кошелёк · USDT"),
+        title(pe("wallet"), "Касса USDT · BEP-20"),
         "",
-        fields(cf("Статус", status, icon="info"),
-               cf("Ключ Toncenter", f"<code>{ton.hint(key)}</code>" + (f" · {ton.key_source()}" if key else
-                                                                         " — лимит 1 запрос/с, задайте ключ"), icon="key"),
-               cf("Горячий кошелёк — газ и выплаты", f"<code>{hot}</code>", balances, icon="wallet"),
-               cf("На адресах пополнения", f"{money.usdt(Decimal(unswept))} USDT ещё не собрано · адресов {addrs}",
-                  f"сбор от {settings.get('ton_sweep_min')} USDT на адресе", icon="down"),
-               cf("Очередь выводов", f"<b>{n_queued}</b> на {money.usdt(need)} USDT"
-                  + (f" · не хватает <b>{money.usdt(need - free)} USDT</b>" if free is not None and need > free else ""),
-                  f"в пути {moving}" + (f" · <b>на проверке {unknown}</b>" if unknown else ""), icon="clock")),
-        "\n".join(f"{i}. {alink('wd', w.id, f'#{w.id}')} · {money.usdt(w.amount - w.fee)} USDT · "
-                  f"{ulink(people.get(w.user_id), w.user_id)}" for i, w in enumerate(queued, 1)) if queued else "",
+        fields(cf("Горячий кошелёк", f"<code>{bsc.hot}</code>", icon="key"), *nums,
+               cf("Выводы", f"в очереди {n} на {money.usdt(Decimal(need))} USDT · в сети {moving}", icon="clock")),
         "",
-        quote("На горячий кошелёк пополняйте <b>TON</b> — им оплачивается газ всех переводов (держите от "
-              f"{ton.HOT_LOW} TON). USDT пользователей собираются на него с личных адресов сами; можно и докинуть USDT "
-              "сюда напрямую, если выводам не хватает. Выводы уходят по очереди сами, проверка каждые "
-              f"{20} с."),
-    ]).replace("\n\n\n", "\n\n") + note, kb(
-        btn("Скопировать адрес кошелька", icon="key", copy=hot, style="primary"),
-        btn("Запустить цикл сейчас", "aton:go", "refresh", style="success" if n_queued else None),
-        btn("Открыть в Tonviewer", url=ton.explorer_address(ton.hot_address()), icon="search"),
-        btn("Выводы на проверке", "awl:check", "warn", style="danger") if unknown else None,
-        [btn("Ключ Toncenter", "aton:key", "key") if owner else None,
-         btn("Вывести с кошелька", "aton:out", "up") if owner else None],
-        btn("Пополнения и выводы", "al", "list"),
+        quote("Пополнить кассу: USDT и немного BNB (~0,005) на адрес горячего кошелька, сеть BSC (BEP-20). В MetaMask "
+              "его можно смотреть, но не отправлять с него руками — займёт очередь транзакций бота."),
+    ]) + note, kb(
+        btn("Ключ кассы (seed)", "acash:key", "lock", style="danger") if admins.is_owner(admin.id) else None,
+        [btn("Скопировать адрес", icon="key", copy=bsc.hot), btn("BscScan", icon="search", url=bsc.address_url(bsc.hot))],
+        [btn("Пополнения и выводы", "al", "list"), btn("Обновить", "acash", "refresh")],
         back("a", "Админ-панель")), src)
 
 
-@router.callback_query(F.data == "aton:key")
-async def cb_key(c: CallbackQuery, bot: Bot, user: User, state: FSMContext):
+@router.callback_query(F.data.in_({"acash:key", "acash:key:go"}))
+async def cb_desk_key(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User):
+    """The seed of the cash desk: owners only, to their private chat, deleted after 2 minutes; asked twice."""
+    from bot.handlers.admin_bsc import KEY_TTL, send_key
     if not admins.is_owner(user.id):
-        return await c.answer("Менять ключ могут только владельцы", show_alert=True)
-    await state.set_state(Ops.token)
-    await show(bot, user, _key_text(), kb(back("aton", "Отмена")), c)
-
-
-def _key_text(err: str = "") -> str:
-    return "\n".join([
-        f"{pe('key')} <b>Ключ Toncenter API</b>",
-        "",
-        quote("Получите ключ в @tonapibot (бесплатно: 10 запросов/с) и пришлите его следующим сообщением. Бот проверит "
-              "его запросом к Toncenter и сразу удалит ваше сообщение. «-» — вернуть ключ из .env (TON_API_KEY)."),
-    ]) + (warn(err) if err else "")
-
-
-@router.message(Ops.token, F.text)
-async def msg_key(m: Message, bot: Bot, s: AsyncSession, user: User, state: FSMContext):
-    with suppress(TelegramAPIError):
-        await m.delete()  # a secret: gone at once, whatever happens next
-    key = m.text.strip()
-    if not admins.is_owner(user.id):
-        await state.set_state(None)
-        return await show(bot, user, warn("Менять ключ могут только владельцы"), kb(back("a", "Админ-панель")))
-    if key != "-":
-        if not 20 <= len(key) <= 200 or any(not (ch.isalnum() or ch in "-_") for ch in key):
-            return await show(bot, user, _key_text("Это не похоже на ключ — скопируйте его целиком"),
-                              kb(back("aton", "Отмена")))
-        try:
-            await ton.check_key(key)
-        except ton.ChainError as e:
-            return await show(bot, user, _key_text(f"Toncenter не принял ключ: {esc(str(e))}"), kb(back("aton", "Отмена")))
-    await state.set_state(None)
-    old = ton.api_key()
-    await settings.put(s, ton.API_KEY, "" if key == "-" else key)
-    new = ton.api_key()
-    audit.log(s, user.id, "ton_key", "", f"{ton.hint(old)} → {ton.hint(new)}")
-    events.add(s, "app:ton", "key", f"Ключ Toncenter сменён ({user.name}): {ton.hint(new)}", user.id, alert=True)
-    await s.commit()
-    async with ton.busy:  # never swap the client under a running cycle
-        await ton.start()
-    await ton_screen(bot, s, user, note=ok(f"Ключ принят: {ton.hint(new)}"))
-
-
-# owner transfers out of the hot wallet: asset -> address -> amount -> confirm
-
-@router.callback_query(F.data.in_({"aton:out", "aton:out:USDT", "aton:out:TON"}))
-async def cb_out(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User, state: FSMContext):
-    if not admins.is_owner(user.id):
-        return await c.answer("Выводить с кошелька могут только владельцы", show_alert=True)
-    if ton.chain is None:
-        return await c.answer("TON_SEED не задан", show_alert=True)
-    if c.data == "aton:out":
-        from bot.services import finance
-        sn = await finance.snapshot(s)
-        await state.set_state(None)
+        return await c.answer("Только владельцы", show_alert=True)
+    if c.data == "acash:key":
         return await show(bot, user, "\n".join([
-            title(pe("up"), "Вывод с горячего кошелька"),
+            title(pe("lock"), "Ключ кассы"),
             "",
-            quote(f"• Можно забрать без денег пользователей: <b>{money.usdt(max(sn.free, Decimal(0)))} USDT</b>",
-                  "• USDT нужны для выплат пользователям, TON — для газа: оставляйте запас"),
-            "Что выводим?",
-        ]), kb([btn("USDT", "aton:out:USDT", "dollar"), btn("TON", "aton:out:TON", "wallet")],
-               back("aton", "Отмена")), c)
-    await state.set_state(Ops.out_addr)
-    await state.update_data(out_asset=c.data.split(":")[2])
-    await show(bot, user, f"{pe('up')} <b>Вывод {c.data.split(':')[2]} с горячего кошелька</b>\n\nОтправьте адрес "
-                          "получателя в сети TON.", kb(back("aton", "Отмена")), c)
-
-
-@router.message(Ops.out_addr, F.text)
-async def msg_out_addr(m: Message, bot: Bot, s: AsyncSession, user: User, state: FSMContext):
-    addr = ton.parse_address(m.text)
-    if not addr or await ton.is_ours(s, addr):
-        return await show(bot, user, warn("Нужен внешний адрес TON (не адрес бота). Отправьте ещё раз."),
-                          kb(back("aton", "Отмена")))
-    await state.update_data(out_addr=addr)
-    await state.set_state(Ops.out_amount)
-    asset = (await state.get_data())["out_asset"]
-    await show(bot, user, f"Адрес: <code>{esc(addr)}</code>\n\nОтправьте сумму в {asset}.", kb(back("aton", "Отмена")))
-
-
-@router.message(Ops.out_amount, F.text)
-async def msg_out_amount(m: Message, bot: Bot, user: User, state: FSMContext):
-    data = await state.get_data()
-    v = parse_usdt(m.text)
-    if v is None or (data["out_asset"] == "TON" and v.as_tuple().exponent < -9):
-        return await show(bot, user, warn("Введите сумму числом"), kb(back("aton", "Отмена")))
-    await state.set_state(None)
-    await state.update_data(out_amount=str(v))
-    await show(bot, user, "\n".join([
-        title(pe("up"), "Подтвердите вывод с горячего кошелька"),
-        quote(f"• Сумма: <b>{format(v.normalize(), 'f')} {data['out_asset']}</b>",
-              f"• Адрес: <code>{esc(data['out_addr'])}</code>"),
-        f"{pe('warn')} Перевод в блокчейне не отменить.",
-    ]), kb(btn("Отправить", "aton:out:go", "ok", style="danger"), back("aton", "Отмена")))
-
-
-@router.callback_query(F.data == "aton:out:go")
-async def cb_out_go(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User, state: FSMContext):
-    data = await state.get_data()
-    await state.update_data(out_amount=None)
-    if not admins.is_owner(user.id) or not data.get("out_amount") or not data.get("out_addr"):
-        return await c.answer("Заявка устарела — начните заново", show_alert=True)
-    await c.answer("Отправляем…")
-    amount = Decimal(data["out_amount"]).normalize()
-    err = await ton.admin_send(s, user.id, data["out_asset"], data["out_addr"], amount)
-    audit.log(s, user.id, "ton_out", "", f"{amount:f} {data['out_asset']} → {data['out_addr']}" + (f": {err}" if err else ""))
-    await s.commit()
-    await ton_screen(bot, s, user, c, warn(err) if err else ok(f"Отправлено: {amount:f} {data['out_asset']} → "
-                                                                f"{ton.short(data['out_addr'])}. Итог — в «Сервис» "
-                                                                "админ-чата и в Tonviewer."))
+            quote("12 слов (seed) — полный доступ ко всем деньгам кассы: горячий кошелёк и все адреса пополнения. "
+                  "Импортируйте их в MetaMask, чтобы видеть кассу, и храните офлайн. Никому не пересылайте."),
+            f"Пришлю ключ вам в личку, сообщение удалится через {KEY_TTL // 60} мин.",
+        ]), kb(btn("Показать ключ", "acash:key:go", "lock", style="danger"), back("acash", "Отмена")), c)
+    err = await send_key(bot, s, user.id)
+    await c.answer(err or "Ключ в личке с ботом", show_alert=bool(err))
+    await desk_screen(bot, s, user, c, warn(err) if err else ok(f"Ключ отправлен в личку, удалится через "
+                                                                f"{KEY_TTL // 60} мин"))
 
 
 # ---------- withdrawal card ----------
 
 WD_NEXT = {
     "queued": "Списано у пользователя, ждёт отправки по очереди: уйдёт сам, как только горячему кошельку хватит USDT "
-              "и TON на газ.",
-    "sending": "Сообщение подписано и отправлено в сеть, ждём, когда кошелёк его исполнит. Если сеть не исполнит его "
-               "до срока — вывод вернётся в очередь (двойной отправки не будет).",
-    "sent": "Кошелёк исполнил перевод, ждём транзакцию USDT в сети (обычно до минуты).",
-    "unknown": "Кошелёк исполнил перевод, но транзакция USDT не найдена в сети. Деньги пользователя удержаны, "
-               "повтора не будет. Проверьте горячий кошелёк в Tonviewer: нашли перевод — «Подтвердить выполнение», "
-               "точно не ушёл — «Вернуть средства».",
+              "и BNB на газ. Пока ничего не подписано — владелец может снять: /bscq cancel номер.",
+    "sending": "Бот готовит транзакцию (несколько секунд).",
+    "sent": "Транзакция подписана и в сети, ждём подтверждения блока. Вернуться в очередь вывод может, только если сеть "
+            "докажет, что перевод не прошёл — двойной отправки не будет.",
+    "unknown": "Вывод старой сети (TON / xRocket) с неизвестным итогом. Проверьте перевод в обозревателе: нашли — "
+               "«Подтвердить выполнение», точно не ушёл — «Вернуть средства».",
     "done": "Выполнен: USDT получены на адрес пользователя.",
     "failed": "Не выполнен, сумма возвращена на баланс.",
     "cancelled": "Отменён пользователем до отправки, сумма возвращена.",
@@ -284,9 +143,11 @@ WD_NEXT = {
 async def withdrawal_screen(bot: Bot, s: AsyncSession, admin: User, wd: Withdrawal, src=None, note: str = ""):
     u = await s.get(User, wd.user_id)
     last = await s.scalar(select(Event).where(Event.ref == f"wd:{wd.id}").order_by(Event.id.desc()).limit(1))
-    trs = (await s.scalars(select(TonTransfer).where(TonTransfer.ref == f"wd:{wd.id}").order_by(TonTransfer.id))).all()
-    legacy = wd.method != "ton"
-    where = ("чек xRocket" if wd.method == "xrocket" else f"xRocket · {wd.network or 'TON'}") if legacy else "USDT · TON"
+    trs = (await s.scalars(select(BscTx).where(BscTx.kind == "withdrawal", BscTx.ref_id == wd.id)
+                           .order_by(BscTx.id))).all()
+    legacy = wd.method != "bsc"
+    where = "USDT · BEP-20" if not legacy else "чек xRocket" if wd.method == "xrocket" else \
+        f"{'TON' if wd.method == 'ton' else 'xRocket · ' + (wd.network or 'TON')} (история)"
     owner = admins.is_owner(admin.id)
     await show(bot, admin, "\n".join([
         title(pe("up"), f"Вывод {alink('wd', wd.id, f'#{wd.id}')}") + f" · {WD_LABEL.get(wd.status, wd.status)}",
@@ -299,19 +160,16 @@ async def withdrawal_screen(bot: Bot, s: AsyncSession, admin: User, wd: Withdraw
                f"memo <code>{esc(wd.memo)}</code>" if wd.memo else "", icon="swap"),
             cf("Когда", f"создан {at(wd.created_at, 'dt')}" + (f" · отправлен {at(wd.sent_at, 'dt')}" if wd.sent_at else ""),
                icon="clock"),
-            cf("Сеть", *[f"#{t.id} · seqno {t.seqno} · {TR_LABEL.get(t.status, t.status)}"
-                         + (f" · tx <code>{t.tx_hash[:16]}…</code>" if t.tx_hash else "") for t in trs],
+            cf("Сеть", *[f"nonce {t.nonce} · {TR_LABEL.get(t.status, t.status)} · tx <code>{t.tx_hash[:16]}…</code>"
+                         for t in trs],
                f"tx: <code>{esc(wd.tx_hash)}</code>" if wd.tx_hash else "",
                f"ошибка: {esc(wd.error[:200])}" if wd.error else "", icon="key"),
             cf("Последнее событие", f"{esc(last.text[:150])} · {at(last.created_at, 'dt')}", icon="list") if last else "",
         ),
         "",
-        quote(WD_NEXT[wd.status]) if wd.status in WD_NEXT and not legacy else
-        quote("Вывод времён xRocket, итог неизвестен: проверьте его в приложении xRocket и решите вручную.")
-        if legacy and decidable(wd) else quote("Вывод времён xRocket — только история.") if legacy else "",
+        quote(WD_NEXT[wd.status]) if wd.status in WD_NEXT and (not legacy or decidable(wd)) else
+        quote("Вывод старой сети — только история.") if legacy else "",
     ]) + note, kb(
-        btn("Проверить в сети", f"wt:{wd.id}", "refresh", style="primary")
-        if not legacy and wd.status in ("queued", "sending", "sent", "unknown") else None,
         [btn("Подтвердить выполнение", f"wk:done:{wd.id}", "ok"), btn("Вернуть средства", f"wk:rf:{wd.id}", "cross")]
         if owner and decidable(wd) else None,
         btn("Транзакция", icon="search", url=wd.link) if wd.link else None,
@@ -321,12 +179,13 @@ async def withdrawal_screen(bot: Bot, s: AsyncSession, admin: User, wd: Withdraw
 
 
 def decidable(wd: Withdrawal) -> bool:
-    """An owner settles it by hand: TON could not find it on chain, or xRocket was switched off with it open."""
-    return wd.status == "unknown" or (wd.method != "ton" and wd.status in ("pending", "sent"))
+    """An owner settles it by hand: a withdrawal of a network that is gone (TON, xRocket) left with an open outcome.
+    A BEP-20 one never: the chain settles it."""
+    return wd.method != "bsc" and wd.status in ("unknown", "pending", "sent", "sending")
 
 
-TR_LABEL = {"sending": "в сети, ждём исполнения", "sent": "исполнено, ждём транзакцию", "done": "выполнено",
-            "failed": "отклонено сетью", "expired": "не исполнено (истёк срок)", "unknown": "не найдено в сети"}
+TR_LABEL = {"pending": "в сети, ждём блок", "confirmed": "подтверждена", "reverted": "откатилась, USDT не ушли",
+            "replaced": "nonce занят другой транзакцией"}
 
 
 @router.callback_query(F.data.regexp(r"^awv:(\d+)$"))
@@ -335,22 +194,6 @@ async def cb_withdrawal(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User)
     if not wd:
         return await c.answer("Вывод не найден", show_alert=True)
     await withdrawal_screen(bot, s, user, wd, c)
-
-
-@router.callback_query(F.data.regexp(r"^wt:(\d+)$"))
-async def cb_chain_check(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User):
-    """Run the TON cycle now: it settles this withdrawal like every other one."""
-    wid = int(c.data.split(":")[1])
-    if ton.chain is None:
-        return await c.answer("TON_SEED не задан", show_alert=True)
-    await c.answer("Проверяем…")
-    from bot.tasks import ton_cycle
-    rep = await ton_cycle(bot)
-    wd = await s.get(Withdrawal, wid, populate_existing=True)
-    audit.log(s, user.id, "wd_check", f"wd:{wid}", wd.status)
-    await s.commit()
-    await withdrawal_screen(bot, s, user, wd, c, (warn("; ".join(rep.errors)) if rep.errors else
-                                                  ok(f"Проверено: {WD_LABEL.get(wd.status, wd.status)}")))
 
 
 @router.callback_query(F.data.regexp(r"^wk:(done|rf)(2?):(\d+)$"))
@@ -371,27 +214,34 @@ async def cb_unknown(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User):
                   f"Верните, только если убедились ({where_check(wd)}), что USDT НЕ ушли: иначе пользователь "
                   f"получит {money.usdt(wd.amount)} USDT дважды."),
         ]), kb(btn("Да, подтверждаю", f"wk:{action}2:{wid}", "ok", style="danger"), back(f"awv:{wid}", "Отмена")), c)
+    await settle(bot, s, user, wd, action)
+    await withdrawal_screen(bot, s, user, wd, c, ok("Готово"))
+
+
+async def settle(bot: Bot, s: AsyncSession, user: User, wd: Withdrawal, action: str) -> str:
+    """An owner's decision on a decidable withdrawal (locked by the caller): done | refund. Commits, tells the user."""
+    wid = wd.id
     if action == "done":
         wd.status = "done"
         if wd.fee:
             money.platform(s, wd.fee, "withdraw_fee", f"wd:{wid}")
-        events.add(s, f"wd:{wid}", "done", f"Выполнение подтверждено владельцем {user.id} вручную", wd.user_id, alert=True)
+        events.add(s, f"wd:{wid}", "done", f"Выполнение подтверждено владельцем {user.id} вручную", wd.user_id, notice=True)
         audit.log(s, user.id, "wd_confirm", f"wd:{wid}", str(wd.amount))
         result = "done"
     else:
         wd.status, wd.error = "failed", f"Возврат владельцем {user.id}: перевод не найден ({where_check(wd)})"
         await money.add(s, wd.user_id, wd.amount, "withdraw_refund", f"wd:{wid}")
         events.add(s, f"wd:{wid}", "refunded", f"{money.usdt(wd.amount)} USDT возвращены владельцем {user.id}: перевод "
-                   "не найден в сети", wd.user_id, alert=True)
+                   "не найден в сети", wd.user_id, notice=True)
         audit.log(s, user.id, "wd_refund", f"wd:{wid}", str(wd.amount))
         result = "refunded"
     await s.commit()
     await notify_withdrawal(bot, wd, result)
-    await withdrawal_screen(bot, s, user, wd, c, ok("Готово"))
+    return result
 
 
 def where_check(wd: Withdrawal) -> str:
-    return "в Tonviewer, горячий кошелёк" if wd.method == "ton" else "в приложении xRocket"
+    return "в Tonviewer, горячий TON-кошелёк" if wd.method == "ton" else "в приложении xRocket"
 
 
 # ---------- deposit card ----------
@@ -400,11 +250,12 @@ async def deposit_screen(bot: Bot, s: AsyncSession, admin: User, dep: Deposit, s
     u = await s.get(User, dep.user_id)
     debt = dep.purpose == "debt"
     if dep.tx_hash:
-        how = [f"USDT · TON на {'адрес долга' if debt else 'личный адрес'} <code>{esc(dep.address or '—')}</code>",
-               f"от <code>{esc(ton.friendly(dep.source))}</code>" if dep.source else ""]
+        net = "BEP-20" if dep.network == "BEP20" else "TON (история)"
+        how = [f"USDT · {net} на {'адрес долга' if debt else 'личный адрес'} <code>{esc(dep.address or '—')}</code>",
+               f"от <code>{esc(dep.source)}</code>" if dep.source else ""]
         nxt = {"paid": "Погашено в долг оператора." if debt else "Зачислено на баланс пользователя.",
-               "small": f"Меньше минимума {settings.get('deposit_min')} USDT — не зачислено. Если нужно, зачислите "
-                        "корректировкой баланса."}.get(dep.status, "")
+               "small": "Меньше минимума — не зачислено. Если нужно, зачислите корректировкой баланса."}.get(
+            dep.status, "")
     else:
         how, nxt = [f"счёт xRocket {esc(dep.invoice_id or '—')}" + (f" · {esc(dep.network)}" if dep.network else "")], \
             "Пополнение времён xRocket — только история."

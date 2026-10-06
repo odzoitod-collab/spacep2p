@@ -27,7 +27,8 @@ def test_forum_topics_and_live_cards(go, monkeypatch):
         d = await create_deal(b)
         await b.deliver()
         created = {m.name for m in calls(b, "CreateForumTopic")}
-        assert "💱 Сделки" in created and "👤 Пользователи" in created and "💳 Карты" in created
+        assert "💱 Сделки" in created and "💳 Карты" in created
+        assert "👤 Пользователи" not in created  # somebody starting the bot is no news: only his application is
         card = [m for m in calls(b, "SendMessage") if f"Сделка #{d.id}" in plain(m.text)][0]
         assert "Ждём перевод" in plain(card.text) and "4111" not in card.text  # status, no requisites
         async with models.Session() as s:
@@ -38,7 +39,7 @@ def test_forum_topics_and_live_cards(go, monkeypatch):
         await b.run(cb(BUYER, f"dl:rc:{d.id}"), msg(BUYER, document=PDF))
         await b.deliver()
         edit = calls(b, "EditMessageText")[-1]
-        assert edit.message_id == lm.msg_id and "Чек у продавца" in plain(edit.text)  # the same card, new status
+        assert edit.message_id == lm.msg_id and "Чек получен — продавец проверяет" in plain(edit.text)  # the same card, new status
         assert not [m for m in calls(b, "SendMessage") if f"Сделка #{d.id}" in plain(m.text) and m is not card
                     and m.message_thread_id == deals_thread]
 
@@ -123,7 +124,7 @@ def test_setts_sets_up_the_log_chat_from_the_group(go):
         assert f"без изменений {len(logchat.TOPICS)}" in plain(calls(b, "SendMessage", group)[-1].text)
         await ready(b)
         await b.deliver()  # logs now go to the new group, into topics
-        assert [m for m in calls(b, "SendMessage", group) if "Пользователь #" in plain(m.text) and m.message_thread_id]
+        assert [m for m in calls(b, "SendMessage", group) if "Карта #" in plain(m.text) and m.message_thread_id]
 
         plain_group = -100888
         await b.run(group_msg(ADMIN, plain_group, "/setts"))

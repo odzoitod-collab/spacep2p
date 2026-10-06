@@ -8,9 +8,9 @@ from aiogram.types import Chat, Message, Update
 from sqlalchemy import select
 
 from bot import models, tasks
-from bot.models import Deposit, Ledger, Operator, User
-from bot.services import money, operators, ton
-from tests.harness import cb, ids, msg, plain, tg
+from bot.models import Ledger, Operator, User
+from bot.services import money, operators
+from tests.harness import bsc_tick, cb, deposit, ids, msg, plain, tg
 from tests.test_orders import LINK, deal, give, merchant, request
 from tests.test_scenarios import ADMIN, BUYER, OTHER, PDF, create_deal, ready, user
 
@@ -60,25 +60,22 @@ def test_operators_from_the_panel_first_accept_wins_and_the_debt_is_repaid(go):
 
         await b.run(cb(OPB, "op"))
         text = plain(b.session.last(OPB))
-        assert "не погашено: 500 USDT" in text and "op:pay" in b.session.buttons(OPB)
-        await b.run(cb(OPB, "op:pay"))
-        assert ton.friendly(ton.address(f"debt:{OPB}")) in plain(b.session.last(OPB))
-        assert "Долг: 500 USDT" in plain(b.session.last(OPB))
-        b.chain.pay(OPB, "520", purpose="debt")
-        await tasks.ton_cycle(b.bot)
+        assert "не погашено: 500 USDT" in text and "w:in" in b.session.buttons(OPB)  # top up, then repay
+        await deposit(b, OPB, "520")
         async with models.Session() as s:
-            assert (await s.get(Operator, OPB)).debt == 0
-            assert (await s.get(Deposit, 1)).purpose == "debt"
-            assert (await s.get(User, OPB)).balance == D(20)  # paid above the debt: to his balance, no fee
-        assert "Долг погашен: 520 USDT" in plain(b.session.last(OPB))
+            assert (await s.get(User, OPB)).balance == D(520)
+        await b.run(cb(OPB, "op"), cb(OPB, "op:bal"), cb(OPB, "op:bal2"))
+        async with models.Session() as s:
+            assert (await s.get(Operator, OPB)).debt == 0 and (await s.get(User, OPB)).balance == D(20)
 
-        async with models.Session() as s:  # another order later: repaid from the balance this time
+        async with models.Session() as s:  # another order later: repaid from the balance again
             await operators.accrue(s, OPB, D(50), "deal:99")
             await s.commit()
         await b.run(cb(OPB, "op"), cb(OPB, "op:bal"), cb(OPB, "op:bal2"))
         async with models.Session() as s:
             assert (await s.get(Operator, OPB)).debt == D(30) and (await s.get(User, OPB)).balance == 0
-            assert await s.scalar(select(Ledger.delta).where(Ledger.kind == "debt_repay")) == D(-20)
+            assert list((await s.scalars(select(Ledger.delta).where(Ledger.kind == "debt_repay")
+                                         .order_by(Ledger.id))).all()) == [D(-500), D(-20)]
 
         await b.run(cb(ADMIN, f"aop:{OPA}"), cb(ADMIN, f"aop:st:{OPA}:0"))
         async with models.Session() as s:
@@ -193,7 +190,7 @@ def test_personal_buyer_terms_with_a_loss_guard(go):
     go(fn)
 
 
-def test_withdrawal_fee_is_one_and_a_half_percent_plus_fixed(go):
+def test_withdrawal_fee_is_fixed_one_usdt(go):
     async def fn(b):
         await ready(b)
         async with models.Session() as s:
@@ -201,13 +198,15 @@ def test_withdrawal_fee_is_one_and_a_half_percent_plus_fixed(go):
             await s.commit()
         b.chain.fund_hot(usdt="500")
         await b.run(cb(BUYER, "w"), cb(BUYER, "w:out"))
-        assert "Комиссия: 1.5% + 1 USDT" in plain(b.session.last(BUYER))
-        await b.run(msg(BUYER, "UQBvW8Z5huBkMJYdnfAEM5JqTNkuWX3diqYENkWsIL0XglxD"), cb(BUYER, "w:nomemo"),
-                    msg(BUYER, "100"))
-        assert "Придёт: 97.5 USDT" in plain(b.session.last(BUYER))
-        await b.run(cb(BUYER, "w:go"))
-        await tasks.ton_cycle(b.bot)
-        assert b.chain.sent[-1][3] == D("97.5")
+        assert "Комиссия: 1 USDT" in plain(b.session.last(BUYER))
+        dest = "0xdD2FD4581271e230360230F9337D5c0430Bf44C0"
+        await b.run(msg(BUYER, "100"), msg(BUYER, dest))
+        assert "К получению: 99 USDT" in plain(b.session.last(BUYER))
+        await b.run(cb(BUYER, "wb:go"))
+        await bsc_tick(b)
+        b.chain.mine()
+        await bsc_tick(b)
+        assert b.chain.usdt_of(dest) == D(99)
         async with models.Session() as s:
-            assert await s.scalar(select(Ledger.delta).where(Ledger.kind == "withdraw_fee")) == D("2.5")
+            assert await s.scalar(select(Ledger.delta).where(Ledger.kind == "withdraw_fee")) == D(1)
     go(fn)

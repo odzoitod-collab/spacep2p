@@ -14,7 +14,7 @@ from bot.handlers.deal import deal_screen, on_deal_created
 from bot.handlers.seller import parse_rub, seller_menu
 from bot.models import Card, Deal, User
 from bot.services import deals, events, money, settings
-from bot.ui import doc, esc, person, quote, show, title, warn
+from bot.ui import app_btn, doc, esc, person, quote, show, title, warn
 
 router = Router()
 
@@ -60,6 +60,7 @@ async def buy_screen(bot: Bot, s: AsyncSession, user: User, state: FSMContext, s
         f"(от {money.fmt(lo)} до {money.fmt(hi)} ₽). Подробнее — {doc('buy', 'как купить USDT')}.",
         f"{pe('info')} Открытых сделок: <b>{len(active)}</b> — можно вести несколько сразу." if active else "",
     ]) + note, kb(*[btn(f"Сделка #{d.id} · {money.fmt(d.amount_rub)} ₽", f"dl:{d.id}", "fire") for d in active[:3]],
+                  app_btn("Купить в приложении", "buy", "swap", style="primary", wide=True),
                   back("menu", "В меню")), src)
 
 

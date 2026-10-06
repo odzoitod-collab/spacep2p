@@ -22,7 +22,7 @@ Order merchants have no percent: they sell at the fixed order_rate, seller_debit
 terms are fixed when the request is created. While searching/assigned/checking, expires_at is the stage deadline.
 """
 from datetime import timedelta
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 from urllib.parse import urlsplit
 
 from sqlalchemy import delete, func, select
@@ -100,7 +100,18 @@ REP_WINDOW = 30  # the reputation is the average of this many latest scores
 
 
 async def reputation(s: AsyncSession, uid: int) -> tuple[Decimal | None, int]:
-    """(average of the latest scores or None while there are fewer than rep_min_count, how many scores in all)."""
+    """(the rating an admin set, else the average of the latest scores or None while there are fewer than
+    rep_min_count; how many scores in all)."""
+    from bot.models import MerchantRating
+    manual = await s.scalar(select(User.rating).where(User.id == uid))
+    if manual is not None:
+        return Decimal(manual), await s.scalar(select(func.count(MerchantRating.id)).where(
+            MerchantRating.merchant_id == uid, MerchantRating.score.is_not(None)))
+    return await auto_reputation(s, uid)
+
+
+async def auto_reputation(s: AsyncSession, uid: int) -> tuple[Decimal | None, int]:
+    """The operators' average only, whatever an admin set."""
     from bot.models import MerchantRating
     scores = list((await s.scalars(select(MerchantRating.score).where(
         MerchantRating.merchant_id == uid, MerchantRating.score.is_not(None))
@@ -124,9 +135,27 @@ async def auto_score(s: AsyncSession, d: Deal, merchant: int, score: int) -> Non
         s.add(MerchantRating(deal_id=d.id, merchant_id=merchant, operator_id=0, gave=False, score=score))
 
 
+def stars(rep: Decimal) -> str:
+    """10 points as 5 stars: 8.5 -> ★★★★☆."""
+    n = int((Decimal(rep) / 2).to_integral_value(ROUND_HALF_UP))
+    return "★" * n + "☆" * (5 - n)
+
+
 def rep_line(rep: Decimal | None, total: int) -> str:
-    return f"★ {money.fmt(rep, 1)} из 10 · оценок {total}" if rep is not None else \
+    return f"{stars(rep)} <b>{money.fmt(rep, 1)}</b> из 10 · оценок {total}" if rep is not None else \
         f"пока нет ({total} из {settings.get('rep_min_count')} оценок)"
+
+
+async def rep_text(s: AsyncSession, uid: int) -> list[str]:
+    """The reputation for admins: what counts now and where it comes from."""
+    manual = await s.scalar(select(User.rating).where(User.id == uid))
+    auto, total = await auto_reputation(s, uid)
+    by_ops = (f"по оценкам операторов: {money.fmt(auto, 1)} ({total})" if auto is not None else
+              f"оценок операторов {total} из {settings.get('rep_min_count')} — авто-рейтинга ещё нет")
+    if manual is None:
+        return [rep_line(auto, total) if auto is not None else f"пока нет — {by_ops}",
+                "считается по оценкам операторов"]
+    return [f"{stars(manual)} <b>{money.fmt(Decimal(manual), 1)}</b> из 10 · <b>выставлен вручную</b>", by_ops]
 
 
 def bybit_problem(rep: Decimal | None, d: Deal) -> str:
@@ -156,6 +185,8 @@ def fit_problem(m: OrderMerchant | None, u: User, d: Deal, bybit: bool) -> str:
     if asleep(m):
         return (f"пауза до {deals.aware(m.sleep_until).astimezone(deals.MSK):%d.%m %H:%M} МСК — "
                 f"{settings.num('strike_limit')} раза подряд не дали реквизиты по своему ордеру")
+    if m.offline:
+        return "вы не на линии — включите приём заявок в кабинете"
     if not bybit and u.balance < d.seller_debit:  # a Bybit order needs no balance in the bot
         return (f"для работы с баланса нужно {money.usdt(d.seller_debit)} USDT свободных, у вас "
                 f"{money.usdt(u.balance)} — возьмите через Bybit-ордер")
@@ -169,7 +200,7 @@ async def eligible(s: AsyncSession, d: Deal) -> list[tuple[OrderMerchant, User]]
         OrderOffer.deal_id == d.id, OrderOffer.kind == "merchant"))).all())
     rows = (await s.execute(select(OrderMerchant, User).join(User, User.id == OrderMerchant.user_id).where(
         OrderMerchant.status == "approved", ~User.is_banned))).all()
-    return [(m, u) for m, u in rows if u.id != d.buyer_id and u.id not in seen and not asleep(m)]
+    return [(m, u) for m, u in rows if u.id != d.buyer_id and u.id not in seen and not asleep(m) and not m.offline]
 
 
 async def merchant_score(s: AsyncSession, uid: int, done: int) -> Decimal:

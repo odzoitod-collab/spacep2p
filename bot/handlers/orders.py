@@ -68,14 +68,16 @@ CLOSED_TEXT = {"completed": "Выполнена — покупатель пол�
 
 def _steps(d: Deal) -> list[tuple[str, str]]:
     """The way of this request, step by step: (step, what it is waiting for when it is the current one)."""
-    take = ("Мерчант взял заявку", "ждём мерчанта")
+    take = ("Мерчант взял заявку", "ищем мерчанта — заявку ещё никто не взял")
     if d.via_bybit and d.status != "searching":
-        mid = [("Ссылка на Bybit-ордер получена", f"ждём ссылку до {d.expires_at.astimezone(deals.MSK):%H:%M} МСК"
-                if d.status == "assigned" else ""),
-               ("Оператор выдал реквизиты", "оператор проверяет ордер" if d.operator_id else "ждём оператора")]
+        mid = [("Мерчант прислал Bybit-ордер", f"мерчант создаёт ордер — ссылка до "
+                f"{d.expires_at.astimezone(deals.MSK):%H:%M} МСК" if d.status == "assigned" else ""),
+               ("Оператор выдал реквизиты", "оператор принял ордер и выдаёт реквизиты" if d.operator_id
+                else "ордер получен — ждём, когда оператор его примет")]
     else:
-        mid = [("Реквизиты выданы", "мерчант готовит реквизиты")]
-    return [take, *mid, ("Покупатель оплатил", "ждём перевод и чек"), ("Оплата подтверждена", "чек на проверке")]
+        mid = [("Реквизиты выданы", "мерчант взял заявку и готовит реквизиты")]
+    return [take, *mid, ("Покупатель оплатил", "реквизиты выданы — ждём перевод и PDF-чек"),
+            ("Оплата подтверждена", "чек получен — проверяют поступление")]
 
 
 def _done(d: Deal) -> int:
@@ -111,7 +113,7 @@ def chat_text(d: Deal) -> str:
         lines.append(section("list", "Ход заявки"))
         for i, (step, wait) in enumerate(steps):
             mark_ = "✅" if i < done else "⏳" if i == done else "▫️"
-            lines.append(f"{mark(mark_)} {step}" + (f" — <i>{wait}</i>" if i == done and wait else ""))
+            lines.append(f"{mark(mark_)} {step}" + (f" — <b>{wait}</b>" if i == done and wait else ""))
         if d.status == "dispute":
             lines.append(f"{pe('flag')} <b>Спор</b> — решает администрация")
     return "\n".join(x for x in lines if x)
@@ -1140,7 +1142,7 @@ async def merchant_screen(bot: Bot, s: AsyncSession, user: User, src=None, note:
     searching = (await s.scalars(select(Deal).where(Deal.status == "searching", Deal.buyer_id != user.id,
                                                     Deal.expires_at >= now()).order_by(Deal.id).limit(5))).all()
     sleeping = orders.asleep(m)
-    active = m.status == "approved" and not sleeping
+    active = m.status == "approved" and not sleeping and not m.offline
     cover = money.max_rub_fixed(user.balance, settings.dec("order_rate"))
     limit = settings.get("strike_limit")
     rep, rated = await orders.reputation(s, user.id)
@@ -1149,6 +1151,7 @@ async def merchant_screen(bot: Bot, s: AsyncSession, user: User, src=None, note:
         title(pe("key"), "Ордерный кабинет"),
         f"{pe('pause')} <b>Пауза до {at(m.sleep_until, 'dt')}</b>: {limit} раза подряд в ордере не было реквизитов"
         if sleeping else f"{pe('live')} <b>На линии: заявки приходят все</b>" if active
+        else f"{pe('pause')} <b>Вы не на линии</b> — заявки не приходят, взять нельзя" if m.status == "approved"
         else f"{pe('pause')} <b>Приостановлено администрацией</b>",
         "",
         section("percent", "Условия"),
@@ -1172,7 +1175,10 @@ async def merchant_screen(bot: Bot, s: AsyncSession, user: User, src=None, note:
               f"dl:{d.id}", "fire", style="primary" if d.status == "assigned" else None) for d in working],
         *[btn(f"Свободна #{d.id} · {money.fmt(d.amount_rub)} ₽ · {money.usdt(d.seller_debit)} USDT", f"orq:see:{d.id}",
               "bell") for d in searching] if active else [],
+        (btn("Выйти с линии", "om:line:0", "pause") if not m.offline else
+         btn("Выйти на линию", "om:line:1", "live", style="success")) if m.status == "approved" else None,
         btn(f"Время на оплату · {m.pay_minutes} мин", "om:pay", "clock", wide=True),
+        app_btn("Заявки в приложении", "orders", "key", style="primary", wide=True),
         back("menu", "В меню"),
     ), src)
 
@@ -1180,6 +1186,17 @@ async def merchant_screen(bot: Bot, s: AsyncSession, user: User, src=None, note:
 @router.callback_query(F.data.regexp(r"^orq:see:(\d+)$"))
 async def cb_see(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User):
     await take_screen(bot, s, user, int(c.data.split(":")[2]), c)
+
+
+@router.callback_query(F.data.regexp(r"^om:line:([01])$"))
+async def cb_line(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User):
+    m = await s.get(OrderMerchant, user.id, with_for_update=True)
+    if not m or m.status != "approved":
+        return await c.answer("Кабинет недоступен", show_alert=True)
+    m.offline = c.data.endswith(":0")
+    await s.commit()
+    await merchant_screen(bot, s, user, c, ok("Вы не на линии: новые заявки не приходят. Взятые — доведите до конца."
+                                              if m.offline else "Вы на линии: заявки снова приходят."))
 
 
 @router.callback_query(F.data == "om:pay")

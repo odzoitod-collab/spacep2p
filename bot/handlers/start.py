@@ -123,7 +123,7 @@ async def info_screen(bot: Bot, user: User, src=None):
         field("Курс", f"<b>{money.fmt(rate)} ₽</b> · комиссия {money.fmt(pct, 3)}%"),
         field("Мерчанту", f"{settings.get('seller_pct')}% по карте · ордер по {money.fmt(settings.dec('order_rate'))} ₽"),
         field("Сделка", f"оплата {settings.get('deal_minutes')} мин · спор через {settings.get('confirm_minutes')} мин"),
-        field("Кошелёк", f"USDT · TON · пополнение {settings.get('deposit_fee')}% · вывод {withdraw_terms()}"),
+        field("Кошелёк", f"USDT · BEP-20 (BSC) · пополнение без комиссии · вывод {withdraw_terms()}"),
         field("Тимлиду", f"{settings.get('team_pct')}% со сделок команды"),
         "",
         quote(f"Вопросы — менеджеру @{esc(settings.get('manager') or settings.get('support'))}: номер сделки и ваш ID "
@@ -131,6 +131,7 @@ async def info_screen(bot: Bot, user: User, src=None):
     ]), kb(btn("Инструкции", "info:g", "edu", style="primary"),
            [btn("Менеджер", url=manager_url()) if manager_url() else None,
             btn("Поддержка", url=url) if url and url != manager_url() else None],
+           app_btn("Инструкции в приложении", "guides", "edu", wide=True),
            back("menu", "В меню")), src)
 
 

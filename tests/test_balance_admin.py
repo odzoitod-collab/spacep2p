@@ -8,7 +8,7 @@ from bot import models
 from bot.handlers import admin_balance
 from bot.handlers.admin_balance import parse_change
 from bot.models import Adjustment, Event, Ledger
-from bot.services import money, settings
+from bot.services import admins, money, settings
 from tests.harness import cb, msg, plain
 from tests.test_scenarios import ADMIN, BUYER, OTHER, SELLER, create_deal, ready, user
 
@@ -74,12 +74,25 @@ def test_one_user_quick_exact_and_zero(go):
     go(fn)
 
 
-def test_own_balance_waits_for_second_admin(go):
+STAFF = 40  # an admin granted in the panel, not an owner
+
+
+async def staff(b):
+    await b.run(msg(STAFF, "/start"))
+    async with models.Session() as s:
+        await admins.grant(s, STAFF)
+        await s.commit()
+
+
+def test_own_balance_waits_for_second_admin_unless_owner(go):
     async def fn(b):
         await ready(b)
+        await staff(b)
+        await b.run(cb(STAFF, f"bal:q:{STAFF}:50"))
+        assert (await user(STAFF)).balance == 0
+        assert "Ждёт подтверждения второго администратора" in plain(b.session.last(STAFF))
         await b.run(cb(ADMIN, f"bal:q:{ADMIN}:50"))
-        assert (await user(ADMIN)).balance == 0
-        assert "Ждёт подтверждения второго администратора" in plain(b.session.last(ADMIN))
+        assert (await user(ADMIN)).balance == D(50)  # an owner: at once
     go(fn)
 
 
@@ -121,8 +134,7 @@ def test_mass_all_reaches_everyone_but_banned(go):
         await b.run(cb(ADMIN, "bal:m:all"), msg(ADMIN, "2"))
         await b.run(cb(ADMIN, next(x for x in b.session.buttons(ADMIN) if x.startswith("bal:x:"))))
         assert [(await user(u)).balance for u in (SELLER, BUYER, OTHER)] == [D(202), D(2), D(0)]
-        assert (await user(ADMIN)).balance == 0  # own balance: a second admin first
-        assert "ждут второго администратора 1" in plain(b.session.last(ADMIN))
+        assert (await user(ADMIN)).balance == D(2)  # an owner: his own balance too, no second admin
     go(fn)
 
 
@@ -132,8 +144,9 @@ def test_threshold_applies_to_mass_actions(go):
         async with models.Session() as s:
             await settings.put(s, "adjust_approval_usdt", "100")
             await s.commit()
-        await b.run(cb(ADMIN, "bal:m:zero"))
-        await b.run(cb(ADMIN, next(x for x in b.session.buttons(ADMIN) if x.startswith("bal:x:"))))
+        await staff(b)
+        await b.run(cb(STAFF, "bal:m:zero"))
+        await b.run(cb(STAFF, next(x for x in b.session.buttons(STAFF) if x.startswith("bal:x:"))))
         assert (await user(SELLER)).balance == D(200)  # 200 ≥ 100: waits for the second admin
         async with models.Session() as s:
             assert (await s.scalar(select(Adjustment))).status == "pending"

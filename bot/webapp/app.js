@@ -1,7 +1,9 @@
 /* Strait Pay mini app. No build step: one file, the Telegram SDK and our JSON API (/app/api, bot/api/webapp*.py).
    Sign-in is Telegram's initData sent with every request; the bot checks it and applies its own rules.
    Every screen renders with a token: a slow answer for a screen the user already left is thrown away, and every
-   request has a timeout — a screen never hangs on its skeleton. Errors of the page itself go to the bot's log. */
+   request has a timeout — a screen never hangs on its skeleton. Errors of the page itself go to the bot's log.
+   Look: light / dark theme (auto from Telegram), a bottom bar on the phone, a sidebar from 960px; the deal chat and
+   files open full screen with a clear close button. */
 "use strict";
 
 const tg = window.Telegram && window.Telegram.WebApp;
@@ -9,7 +11,103 @@ const $app = document.getElementById("app");
 const $nav = document.getElementById("nav");
 const $navIn = $nav.querySelector(".in") || $nav;
 const $toast = document.getElementById("toast");
-const S = { me: null, seq: 0, timers: [], drafts: {}, stack: [], ava: null, sheet: null, keep: false, chatSeen: {}, tab: {}, reported: 0 };
+const $side = document.getElementById("side");
+const S = { me: null, seq: 0, timers: [], drafts: {}, stack: [], ava: null, sheet: null, keep: false, chatSeen: {}, tab: {}, reported: 0, viewer: null };
+const store = {
+  get(k, d) { try { const v = localStorage.getItem("sp:" + k); return v == null ? d : v; } catch (e) { return d; } },
+  set(k, v) { try { localStorage.setItem("sp:" + k, v); } catch (e) { /* storage off */ } },
+};
+
+/* ---------- theme: auto (Telegram / system), light or dark ---------- */
+
+function themeMode() { return store.get("theme", "auto"); }
+function applyTheme() {
+  const mode = themeMode();
+  const sys = (tg && tg.colorScheme) || (window.matchMedia && matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+  const dark = mode === "dark" || (mode === "auto" && sys === "dark");
+  document.documentElement.dataset.theme = dark ? "dark" : "light";
+  const paper = dark ? "#0a1120" : "#f1f5fb";
+  try {
+    if (tg && tg.setHeaderColor) { tg.setHeaderColor(paper); tg.setBackgroundColor(paper); }
+    if (tg && tg.isVersionAtLeast && tg.isVersionAtLeast("7.10")) tg.setBottomBarColor(dark ? "#0e1626" : "#ffffff");
+  } catch (e) { /* older clients */ }
+}
+function setTheme(mode) { store.set("theme", mode); applyTheme(); if (typeof MB !== "undefined") MB.show(); }
+
+/* ---------- the visible height: the chat composer stays above the keyboard ---------- */
+
+function syncHeight() {
+  const h = (window.visualViewport && window.visualViewport.height) || (tg && tg.viewportHeight) || window.innerHeight;
+  document.documentElement.style.setProperty("--app-h", Math.round(h) + "px");
+}
+
+/* ---------- full screen: Telegram 8.0+, a browser's own otherwise; always a clear way out ---------- */
+
+const fs = {
+  can() { return !!((tg && tg.requestFullscreen && tg.isVersionAtLeast && tg.isVersionAtLeast("8.0")) || document.documentElement.requestFullscreen); },
+  on() { return !!((tg && tg.isFullscreen) || document.fullscreenElement); },
+  toggle() {
+    try {
+      if (tg && tg.requestFullscreen && tg.isVersionAtLeast("8.0")) { if (tg.isFullscreen) tg.exitFullscreen(); else tg.requestFullscreen(); return; }
+    } catch (e) { /* fall back to the browser */ }
+    if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
+    else if (document.documentElement.requestFullscreen) document.documentElement.requestFullscreen().catch(() => toast("Полный экран недоступен", true));
+  },
+  sync() {
+    let pill = document.getElementById("fsx");
+    if (fs.on() && !pill) {
+      pill = document.createElement("button");
+      pill.id = "fsx"; pill.className = "fs-exit";
+      pill.innerHTML = `${ic("x")}Свернуть полный экран`;
+      pill.onclick = () => fs.toggle();
+      document.body.appendChild(pill);
+    } else if (!fs.on() && pill) pill.remove();
+    document.querySelectorAll("[data-fs]").forEach((b) => { b.innerHTML = ic(fs.on() ? "shrink" : "expand"); b.setAttribute("aria-label", fs.on() ? "Свернуть" : "Во весь экран"); });
+    syncHeight();
+  },
+};
+/* ---------- Telegram's own bottom button: the screen's main action under the thumb ---------- */
+
+const MB = {
+  fn: null, cfg: null,
+  ok() { return !!(tg && tg.initData && tg.MainButton && tg.isVersionAtLeast && tg.isVersionAtLeast("6.1") && tg.platform !== "unknown"); },
+  set(text, fn, opts = {}) {
+    if (!MB.ok()) return false;
+    MB.cfg = { text, active: opts.active !== false, red: !!opts.red, shine: !!opts.shine };
+    MB.fn = fn;
+    MB.show();
+    return true;
+  },
+  active(on, text) { if (!MB.cfg) return; MB.cfg.active = on; if (text) MB.cfg.text = text; MB.show(); },
+  show() {
+    if (!MB.cfg || !MB.ok()) return;
+    try {
+      if (S.sheet || S.viewer) { tg.MainButton.hide(); return; }
+      const dark = document.documentElement.dataset.theme === "dark";
+      const color = MB.cfg.red ? (dark ? "#ff6b62" : "#d83b31") : (dark ? "#4b90ff" : "#1b6fe8");
+      tg.MainButton.setParams({ text: MB.cfg.text.slice(0, 60), color: MB.cfg.active ? color : (dark ? "#24324c" : "#c7d3e6"),
+        text_color: "#ffffff", is_active: MB.cfg.active, is_visible: true, has_shine_effect: MB.cfg.shine && MB.cfg.active });
+    } catch (e) { /* an old client */ }
+  },
+  clear() { MB.cfg = null; MB.fn = null; try { if (MB.ok()) { tg.MainButton.hideProgress(); tg.MainButton.hide(); } } catch (e) { /* old client */ } },
+  async click() {
+    if (!MB.fn || !MB.cfg || !MB.cfg.active) return;
+    haptic("tap");
+    try { await MB.fn(); } catch (e) { report(e, "main-button"); }
+  },
+  /* the page's own button moves to Telegram's: hidden here, clicked from there */
+  take(btn, opts = {}) {
+    if (!btn || !MB.ok()) return false;
+    const label = btn.textContent.trim();
+    const input = btn.tagName === "LABEL" ? btn.querySelector("input[type=file]") : null;
+    if (input && tg.platform === "ios") return false;  // iOS opens a file picker only from a tap inside the page
+    MB.set(label, () => (input ? input.click() : btn.click()), opts);
+    btn.hidden = true;
+    return true;
+  },
+};
+
+const fsBtn = () => (fs.can() ? `<button class="ibtn" data-fs aria-label="Во весь экран">${ic(fs.on() ? "shrink" : "expand")}</button>` : "");
 
 /* ---------- small helpers ---------- */
 
@@ -29,6 +127,13 @@ function when(iso) {
   if (d.toDateString() === y.toDateString()) return `вчера, ${hm}`;
   return `${d.getDate()} ${MONTHS[d.getMonth()]}${d.getFullYear() !== now.getFullYear() ? " " + d.getFullYear() : ""}, ${hm}`;
 }
+function dayLabel(iso) {
+  const d = new Date(iso), now = new Date(), y = new Date(now); y.setDate(now.getDate() - 1);
+  if (d.toDateString() === now.toDateString()) return "Сегодня";
+  if (d.toDateString() === y.toDateString()) return "Вчера";
+  return `${d.getDate()} ${MONTHS[d.getMonth()]}${d.getFullYear() !== now.getFullYear() ? " " + d.getFullYear() : ""}`;
+}
+const hm = (iso) => new Date(iso).toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" });
 const left = (iso) => Math.max(0, Math.floor((new Date(iso) - Date.now()) / 1000));
 const mmss = (s) => `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`;
 const haptic = (kind) => {
@@ -82,7 +187,7 @@ async function copy(text, what) {
   toast(`${what || "Текст"} скопирован${what && /а$/.test(what) ? "а" : ""}`);
 }
 
-function every(ms, fn) { S.timers.push(setInterval(fn, ms)); }
+function every(ms, fn) { S.timers.push(setInterval(() => { if (!document.hidden) fn(); }, ms)); }  // asleep in the background
 function clearTimers() { S.timers.forEach(clearInterval); S.timers = []; }
 
 /* ---------- the API: a timeout on every request, one retry for reads ---------- */
@@ -171,14 +276,39 @@ const P = {
   image: '<rect x="3.5" y="4.5" width="17" height="15" rx="2"/><circle cx="9" cy="10" r="1.6"/><path d="m20.5 16-5-5L7 19.5"/>',
   scale: '<path d="M12 4v16M7 20h10M5 7h14"/><path d="m5 7-2.5 6a2.5 2.5 0 0 0 5 0L5 7ZM19 7l-2.5 6a2.5 2.5 0 0 0 5 0L19 7Z"/>',
   alert: '<path d="M12 4 2.8 19.5h18.4L12 4Z"/><path d="M12 10v4.5M12 17h.01"/>',
+  expand: '<path d="M4.5 9V4.5H9M15 4.5h4.5V9M19.5 15v4.5H15M9 19.5H4.5V15"/>',
+  shrink: '<path d="M9 4.5V9H4.5M19.5 9H15V4.5M15 19.5V15h4.5M4.5 15H9v4.5"/>',
+  sun: '<circle cx="12" cy="12" r="4"/><path d="M12 2.5v2M12 19.5v2M4.6 4.6 6 6M18 18l1.4 1.4M2.5 12h2M19.5 12h2M4.6 19.4 6 18M18 6l1.4-1.4"/>',
+  moon: '<path d="M19.5 14.5A8 8 0 0 1 9.5 4.5a8 8 0 1 0 10 10Z"/>',
+  auto: '<circle cx="12" cy="12" r="8.5"/><path d="M12 3.5v17A8.5 8.5 0 0 0 12 3.5Z" fill="currentColor"/>',
+  key: '<circle cx="8" cy="15" r="4"/><path d="m11 12 8.5-8.5M16 7l2.5 2.5M14 9l2 2"/>',
+  ban: '<circle cx="12" cy="12" r="8.5"/><path d="m6 6 12 12"/>',
+  coin: '<ellipse cx="12" cy="7" rx="7" ry="3"/><path d="M5 7v5c0 1.7 3.1 3 7 3s7-1.3 7-3V7M5 12v5c0 1.7 3.1 3 7 3s7-1.3 7-3v-5"/>',
+  download: '<path d="M12 4v11M7 10.5l5 5 5-5M5 19.5h14"/>',
+  zoomin: '<circle cx="11" cy="11" r="6.5"/><path d="m16 16 4 4M8.5 11h5M11 8.5v5"/>',
+  zoomout: '<circle cx="11" cy="11" r="6.5"/><path d="m16 16 4 4M8.5 11h5"/>',
+  home2: '<path d="M4 10.5 12 4l8 6.5V19a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1v-8.5Z"/>',
+  back: '<path d="M15 5.5 8.5 12l6.5 6.5"/>',
+  orders: '<path d="M6 4.5h12a1 1 0 0 1 1 1V20l-3-2-3 2-3-2-3 2-2-1.3V5.5a1 1 0 0 1 1-1Z"/><path d="M9 9h6M9 12.5h6"/>',
 };
+/* the logo: the strait between two shores */
+const LOGO = '<svg viewBox="0 0 36 36" aria-hidden="true"><rect width="36" height="36" rx="11" fill="var(--accent)"/><path d="M7 14c3.5-3 7.5-3 11 0s7.5 3 11 0M7 22c3.5-3 7.5-3 11 0s7.5 3 11 0" fill="none" stroke="#fff" stroke-width="2.4" stroke-linecap="round"/></svg>';
+/* the empty states: a small animated picture instead of a gray icon */
+const ART = {
+  deals: '<path class="ring" d="M44 6a26 26 0 1 1-.1 0" fill="none" stroke="currentColor" stroke-opacity=".18" stroke-width="2" stroke-dasharray="4 6"/><g class="float"><rect x="26" y="18" width="36" height="28" rx="7" fill="var(--accent-soft)" stroke="currentColor" stroke-width="2"/><path d="M33 28h22M33 35h14" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/></g>',
+  bell: '<path class="ring" d="M44 6a26 26 0 1 1-.1 0" fill="none" stroke="currentColor" stroke-opacity=".18" stroke-width="2" stroke-dasharray="4 6"/><g class="float"><path d="M34 40V31a10 10 0 0 1 20 0v9l3 4H31l3-4Z" fill="var(--accent-soft)" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/><path d="M41 48a3.5 3.5 0 0 0 6 0" stroke="currentColor" stroke-width="2" stroke-linecap="round" fill="none"/></g>',
+  ok: '<path class="ring" d="M44 6a26 26 0 1 1-.1 0" fill="none" stroke="currentColor" stroke-opacity=".18" stroke-width="2" stroke-dasharray="4 6"/><g class="float"><circle cx="44" cy="32" r="15" fill="var(--accent-soft)" stroke="currentColor" stroke-width="2"/><path d="m37 32 5 5 9-10" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></g>',
+};
+const art = (name) => `<svg class="art" viewBox="0 0 88 64" aria-hidden="true">${ART[name] || ART.deals}</svg>`;
+const WAVES = '<svg class="waves" viewBox="0 0 400 70" preserveAspectRatio="none" aria-hidden="true"><path d="M0 40c50-22 100-22 150 0s100 22 150 0 70-18 100-6v36H0Z" fill="rgba(255,255,255,.22)"/><path d="M0 50c60-18 110-18 160 0s110 18 160 0 60-12 80-6v26H0Z" fill="rgba(255,255,255,.18)"/></svg>';
+const LOADER = '<svg class="loader" viewBox="0 0 50 50" aria-hidden="true"><circle cx="25" cy="25" r="20" fill="none" stroke="currentColor" stroke-width="4"/></svg>';
 const ic = (name, cls) => `<svg${cls ? ` class="${cls}"` : ""} viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${P[name] || ""}</svg>`;
 const chev = () => ic("chev", "chev");
 
 /* ---------- pieces of screens ---------- */
 
 const ROLE = { buyer: ["Покупка", "down", "sea"], seller: ["Продажа", "up", "red"], operator: ["Ордер", "shield", "blue"], admin: ["Сделка", "deals", ""], offer: ["Заявка", "bell", "amber"] };
-const TONE = { searching: "blue", assigned: "blue", checking: "blue", waiting_payment: "amber", paid: "blue", dispute: "red", completed: "sea", cancelled: "", expired: "", void: "" };
+const TONE = { searching: "blue", assigned: "blue", checking: "blue", waiting_payment: "amber", paid: "accent", dispute: "red", completed: "green", cancelled: "", expired: "", void: "" };
 const PROGRESS = { searching: 15, assigned: 30, checking: 45, waiting_payment: 55, paid: 80, dispute: 80, completed: 100 };
 
 function tgUser() { return (tg && tg.initDataUnsafe && tg.initDataUnsafe.user) || {}; }
@@ -210,12 +340,45 @@ function dealRow(d, quiet) {
   return `<button class="row" data-go="${d.role === "offer" ? "request" : "deal"}/${d.id}">
     <span class="ic ${d.action ? "amber" : tone}">${ic(icon)}</span>
     <span class="mid"><b>${label} #${d.id}${d.bybit ? " · Bybit" : ""}</b><small>${d.action && quiet !== true ? "<span style='color:var(--amber)'>Нужно действие · </span>" : ""}${esc(d.status_text)} · ${when(d.created_at)}</small></span>
-    <span class="end"><b>${rub(d.amount_rub)}</b><small>${usdt(d.debit || d.usdt)} USDT</small></span>
+    <span class="end"><b>${rub(d.amount_rub)}</b><small data-usdt="${usdt(d.debit || d.usdt)} USDT">${unreadOf(d) ? `<span class="unread">${ic("chat")}${unreadOf(d)}</span>` : `${usdt(d.debit || d.usdt)} USDT`}</small></span>
     ${p != null && p < 100 ? `<span class="strait"><i style="width:${p}%"></i></span>` : ""}
   </button>`;
 }
 
-function empty(icon, text, action) { return `<div class="empty">${ic(icon)}${esc(text)}${action || ""}</div>`; }
+/* unread chat messages: the server's count, refreshed in the background */
+const unreadOf = (d) => (S.unreadBy && S.unreadBy[d.id] != null ? S.unreadBy[d.id] : d.unread || 0);
+
+async function refreshUnread() {
+  if (!tg || !tg.initData || document.hidden) return;
+  try {
+    const r = await api("chat/unread");
+    const before = S.unreadTotal;
+    S.unreadBy = Object.fromEntries(Object.entries(r.deals).map(([k, v]) => [Number(k), v]));
+    S.unreadTotal = r.total;
+    if (S.me) S.me.counts.unread = r.total;
+    drawBadges();
+    $app.querySelectorAll('.row[data-go^="deal/"]').forEach((row) => {  // rows already on the screen
+      const k = S.unreadBy[Number(row.dataset.go.split("/")[1])] || 0, slot = row.querySelector(".end small");
+      const chip = slot && slot.querySelector(".unread");
+      if (!slot || (!k && !chip)) return;
+      if (k) slot.innerHTML = `<span class="unread">${ic("chat")}${k}</span>`;
+      else { const d = slot.dataset.usdt; if (d) slot.textContent = d; }
+    });
+    if (before != null && r.total > before) haptic("tap");
+  } catch (e) { /* the next round */ }
+}
+
+function drawBadges() {
+  const k = counts();
+  [["deals", k.deals], ["orders", k.orders], ["admin", k.admin]].forEach(([t, v]) => {
+    document.querySelectorAll(`[data-tab='${t}'] .badge, [data-side='${t}'] .badge`).forEach((b) => { b.textContent = v; b.hidden = !v; });
+  });
+}
+
+function empty(icon, text, action) {
+  const pic = { bell: "bell", check: "ok", ok: "ok" }[icon] || "deals";
+  return `<div class="empty">${art(pic)}${esc(text)}${action || ""}</div>`;
+}
 const sec = (title, extra) => `<div class="sec"><h2>${title}</h2>${extra || ""}</div>`;
 const tag = (text, tone, icon) => `<span class="tag ${tone || ""}">${icon ? ic(icon) : ""}${esc(text)}</span>`;
 const kv = (k, v) => `<div class="kv"><span>${k}</span><b>${v}</b></div>`;
@@ -228,9 +391,15 @@ const SK = {
   deal: () => `<div class="sk" style="height:24px;width:40%;margin:8px 0 14px"></div><div class="sk" style="height:38px;width:62%"></div><div class="sk" style="height:6px;margin:16px 0"></div><div class="sk" style="height:150px"></div><div class="sk" style="height:44px;margin-top:12px"></div>`,
 };
 
+function topBar(p) {
+  if (p === "") return "";
+  const root = isRoot(p);
+  return `<div class="top">${root ? "" : `<button class="ibtn" data-back aria-label="Назад">${ic("back")}</button><button class="ibtn" data-go="" aria-label="Главная">${ic("home2")}</button>`}<span class="sp"></span>${fsBtn()}</div>`;
+}
+
 function view(c, html, opts = {}) {
   if (!c.alive()) return false;
-  $app.innerHTML = `<div class="screen">${html}</div>`;
+  $app.innerHTML = `<div class="screen">${topBar(path())}${html}</div>`;
   if (!opts.keepScroll) window.scrollTo(0, 0);
   return true;
 }
@@ -256,6 +425,7 @@ function failView(c, e) {
 
 function gate(text) {
   $nav.hidden = true;
+  $side.innerHTML = "";
   $app.innerHTML = `<div class="screen gate"><img src="/docs/static/logo.png" alt="Strait Pay"><h1>Strait Pay</h1><p>${esc(text)}</p>
     <button class="btn" data-act="close">${ic("bot")}Вернуться в бота</button></div>`;
   on("[data-act=close]", () => (tg && tg.close ? tg.close() : null));
@@ -274,11 +444,13 @@ function sheet(html) {
   veil.className = "veil";
   const sh = document.createElement("div");
   sh.className = "sheet";
-  sh.innerHTML = `<div class="in"><div class="grip"></div>${html}</div>`;
+  sh.innerHTML = `<div class="in"><div class="grip"></div><button class="x" data-x aria-label="Закрыть">${ic("x")}</button>${html}</div>`;
+  sh.querySelector("[data-x]").onclick = () => closeSheet();
   veil.onclick = () => closeSheet();
   document.body.append(veil, sh);
   S.sheet = { veil, sh };
   syncBack();
+  MB.show();
   return sh;
 }
 
@@ -286,53 +458,66 @@ function closeSheet(animate = true) {
   const cur = S.sheet;
   if (!cur) return;
   S.sheet = null;
-  if (!animate) { cur.veil.remove(); cur.sh.remove(); syncBack(); return; }
+  if (!animate) { cur.veil.remove(); cur.sh.remove(); syncBack(); MB.show(); return; }
   cur.veil.classList.add("closing"); cur.sh.classList.add("closing");
   setTimeout(() => { cur.veil.remove(); cur.sh.remove(); }, 200);
   syncBack();
+  MB.show();
 }
 
 /* ---------- screens: home ---------- */
 
 async function home(c) {
-  const [m, list] = await Promise.all([me(true), api("deals?scope=active")]);
-  const u = tgUser(), b = m.balance, w = m.work || {};
+  const [m, list, hist] = await Promise.all([me(true), api("deals?scope=active"), api("history").catch(() => ({ items: [] }))]);
+  const u = tgUser(), b = m.balance, w = m.work || {}, r = m.roles;
   const locked = n(b.withdrawable) < n(b.available);
   const action = list.deals.filter((d) => d.action);
-  const rest = list.deals.filter((d) => !d.action).slice(0, 5);
+  const rest = list.deals.filter((d) => !d.action).slice(0, 6);
   const work = [
-    m.roles.admin && w.disputes ? `<button class="row" data-go="admin"><span class="ic red">${ic("scale")}</span><span class="mid"><b>Споры ждут решения</b><small>Администрирование</small></span><span class="end"><b>${w.disputes}</b></span></button>` : "",
-    m.roles.operator && w.free_orders ? `<button class="row" data-go="operator"><span class="ic blue">${ic("shield")}</span><span class="mid"><b>Bybit-ордера ждут оператора</b><small>Кабинет оператора</small></span><span class="end"><b>${w.free_orders}</b></span></button>` : "",
-    m.roles.merchant === "approved" && w.offers ? `<button class="row" data-go="orders"><span class="ic amber">${ic("bell")}</span><span class="mid"><b>Свободные заявки</b><small>Ордерные реквизиты</small></span><span class="end"><b>${w.offers}</b></span></button>` : "",
+    r.admin && w.disputes ? `<button class="row" data-go="admin"><span class="ic red">${ic("scale")}</span><span class="mid"><b>Споры ждут решения</b><small>Администрирование</small></span><span class="end"><b>${w.disputes}</b></span></button>` : "",
+    r.operator && w.free_orders ? `<button class="row" data-go="operator"><span class="ic blue">${ic("shield")}</span><span class="mid"><b>Bybit-ордера ждут оператора</b><small>Кабинет оператора</small></span><span class="end"><b>${w.free_orders}</b></span></button>` : "",
+    r.merchant === "approved" && w.offers && w.line ? `<button class="row" data-go="orders"><span class="ic amber">${ic("bell")}</span><span class="mid"><b>Свободные заявки</b><small>Нажмите, чтобы взять</small></span><span class="end"><b>${w.offers}</b></span></button>` : "",
   ].join("");
-  if (!view(c, `
-    <div class="bar">
-      <button class="who" data-go="profile">${avatar()}<div><b>${esc(u.first_name || m.user.name || "Профиль")}</b><small>${m.user.username ? "@" + esc(m.user.username) : "ID " + m.user.id}</small></div></button>
-      ${m.links.manager ? `<button class="ibtn" data-open="${esc(m.links.manager)}" aria-label="Менеджер">${ic("headset")}</button>` : ""}
-    </div>
-    <section class="balance">
+  const line = r.merchant === "approved" ? `<div class="line"><span class="dot ${w.line ? "on" : ""}"></span><div class="mid"><b>${w.line ? "На линии" : "Не на линии"}</b><small>${w.line ? "Заявки покупателей приходят вам" : "Заявки не приходят — включите, когда готовы"}</small></div><button class="sw green ${w.line ? "on" : ""}" id="line" aria-label="На линии"></button></div>`
+    : r.seller ? `<div class="line"><span class="dot ${m.user.online ? "on" : ""}"></span><div class="mid"><b>${m.user.online ? "На смене" : "Не на смене"}</b><small>${m.user.online ? `Карт в потоке: ${w.cards_on || 0}` : "Покупатели не видят ваши карты"}</small></div><button class="sw green ${m.user.online ? "on" : ""}" id="shift" aria-label="Смена"></button></div>` : "";
+  const left = `
+    <section class="balance">${WAVES}
       <div class="lbl"><span>Баланс</span><span class="num">1 USDT = ${NF.format(n(m.rate.rate))} ₽</span></div>
       <div class="sum">${usdt(b.available)}<small>USDT</small></div>
       <div class="sub">≈ ${rub(n(b.available) * n(m.rate.rate))}${m.rate.own ? " · ваши условия" : ""}</div>
       ${n(b.frozen) || locked || b.debt || n(b.team) ? `<div class="facts">
         ${n(b.frozen) ? tag(`В сделках ${usdt(b.frozen)}`, "", "lock") : ""}
-        ${locked ? tag(`Можно вывести ${usdt(b.withdrawable)}`, "blue") : ""}
-        ${b.debt ? tag(`Долг оператора ${usdt(b.debt)}`, "red") : ""}
-        ${n(b.team) ? tag(`Командный ${usdt(b.team)}`, "sea") : ""}</div>` : ""}
+        ${locked ? tag(`Можно вывести ${usdt(b.withdrawable)}`) : ""}
+        ${b.debt ? tag(`Долг оператора ${usdt(b.debt)}`) : ""}
+        ${n(b.team) ? tag(`Командный ${usdt(b.team)}`) : ""}</div>` : ""}
     </section>
     <div class="quick">
-      <button data-go="deposit">${ic("down")}Пополнить</button>
-      <button data-go="withdraw">${ic("up")}Вывести</button>
-      <button data-go="buy">${ic("swap")}Купить</button>
-      <button data-go="history">${ic("clock")}История</button>
+      <button data-go="deposit"><span>${ic("down")}</span>Пополнить</button>
+      <button data-go="withdraw"><span>${ic("up")}</span>Вывести</button>
+      <button data-go="buy"><span>${ic("swap")}</span>Купить</button>
+      <button data-go="${r.merchant === "approved" ? "orders" : "sell"}"><span>${ic(r.merchant === "approved" ? "orders" : "card")}</span>${r.merchant === "approved" ? "Заявки" : "Продать"}</button>
     </div>
-    ${work ? `${sec("Работа")}<div class="list">${work}</div>` : ""}
+    ${line}
+    ${work ? `${sec("Работа")}<div class="list">${work}</div>` : ""}`;
+  const right = `
     ${action.length ? `${sec("Нужно ваше действие")}<div class="list">${action.map((d) => dealRow(d, true)).join("")}</div>` : ""}
     ${sec("Активные сделки", list.deals.length ? `<button data-go="deals">Все</button>` : "")}
     <div class="list">${rest.length ? rest.map(dealRow).join("") : action.length ? empty("check", "Остальные сделки закрыты") :
       empty("swap", "Открытых сделок нет", `<button class="btn sm" data-go="buy" style="margin:12px auto 0">${ic("swap")}Купить USDT</button>`)}</div>
+    ${sec("История", hist.items.length ? `<button data-go="history">Вся история</button>` : "")}
+    <div class="list">${hist.items.length ? hist.items.slice(0, 6).map(historyRow).join("") : empty("clock", "Операций пока нет")}</div>`;
+  if (!view(c, `
+    <div class="bar">
+      <button class="who" data-go="profile">${avatar()}<div><b>${esc(u.first_name || m.user.name || "Профиль")}</b><small>${m.user.username ? "@" + esc(m.user.username) : "ID " + m.user.id}</small></div></button>
+      ${m.links.manager ? `<button class="ibtn" data-open="${esc(m.links.manager)}" aria-label="Менеджер">${ic("headset")}</button>` : ""}
+      ${fsBtn()}
+    </div>
+    <div class="grid2"><div class="col">${left}</div><div class="col">${right}</div></div>
     <div class="foot">Strait Pay · P2P-обмен USDT ⇄ RUB</div>`)) return;
   setBadge(m.counts.action);
+  drawNav(path());
+  on("#line", (sw) => busy(sw, async () => { try { await api("merchant", { body: { online: !w.line } }); haptic("success"); toast(w.line ? "Вы не на линии — заявки не приходят" : "Вы на линии — заявки приходят"); S.keep = true; render(); } catch (e) { toast(e.message, true); } }));
+  on("#shift", (sw) => busy(sw, async () => { try { await api("shift", { body: { online: !m.user.online } }); haptic("success"); S.keep = true; render(); } catch (e) { toast(e.message, true); } }));
   every(15000, async () => {
     try { const f = await api("deals?scope=active"); if (c.alive() && JSON.stringify(f.deals) !== JSON.stringify(list.deals)) { S.keep = true; render(); } } catch (e) { /* next tick */ }
   });
@@ -361,7 +546,7 @@ async function exchange(c, side) {
   const quote = debounce(async () => {
     const v = amountOf(input.value);
     q = null;
-    if (!v) { out.innerHTML = `<p class="hint">Комиссия ${esc(m.rate.pct)}%. Реквизиты продавца появятся после создания сделки.</p>`; return; }
+    if (!v) { MB.clear(); out.innerHTML = `<p class="hint">Комиссия ${esc(m.rate.pct)}%. Реквизиты продавца появятся после создания сделки.</p>`; return; }
     try {
       const r = await api(`buy/quote?amount=${encodeURIComponent(v)}`);
       if (!c.alive() || amountOf(input.value) !== v) return;
@@ -377,7 +562,8 @@ async function exchange(c, side) {
         <button class="btn" id="go">${q.mode === "card" ? "Создать сделку" : "Найти реквизиты"}</button>
         <p class="hint">Переводите только после создания и только на показанные реквизиты, одним платежом.</p>`;
       on("#go", (btn) => busy(btn, create));
-    } catch (e) { if (c.alive()) out.innerHTML = `<p class="err">${esc(e.message)}</p>`; }
+      MB.take(out.querySelector("#go"), { shine: true });
+    } catch (e) { MB.clear(); if (c.alive()) out.innerHTML = `<p class="err">${esc(e.message)}</p>`; }
   }, 300);
   const create = async () => {
     if (!q) return;
@@ -410,8 +596,17 @@ async function dealsScreen(c) {
   if (!view(c, `${titleBlock("Сделки")}
     <div class="seg"><button data-scope="active" class="${scope === "active" ? "on" : ""}">Активные</button><button data-scope="history" class="${scope === "history" ? "on" : ""}">Завершённые</button></div>
     <div class="chips">${[["all", "Все"], ["buy", "Покупки"], ["sell", "Продажи"], ["op", "Ордера"]].map(([k, t]) => `<button class="chip ${k === filter ? "on" : ""}" data-f="${k}">${t}</button>`).join("")}</div>
+    <label class="field" style="margin-top:10px"><div class="inp">${ic("search").replace("<svg", '<svg style="width:18px;height:18px;color:var(--muted)"')}<input id="ds" inputmode="numeric" placeholder="Номер сделки или сумма" autocomplete="off"></div></label>
     <div class="list" id="dl" style="margin-top:10px">${shown(list.deals).length ? shown(list.deals).map(dealRow).join("") : empty("deals", scope === "active" ? "Открытых сделок нет" : "Завершённых сделок пока нет", scope === "active" ? `<button class="btn sm" data-go="buy" style="margin:12px auto 0">${ic("swap")}Купить USDT</button>` : "")}</div>
     ${list.deals.length >= 30 ? `<button class="btn line" id="more">Показать ещё</button>` : ""}`)) return;
+  const ds = $app.querySelector("#ds");
+  ds.oninput = () => {
+    const q = ds.value.replace(/[\s#₽]/g, "");
+    $app.querySelectorAll("#dl > .row").forEach((row) => {
+      const id = (row.dataset.go || "").split("/")[1] || "", amount = row.querySelector(".end b") ? row.querySelector(".end b").textContent.replace(/\D/g, "") : "";
+      row.hidden = !!q && !id.startsWith(q) && !amount.includes(q);
+    });
+  };
   on("[data-scope]", (b) => { S.dealScope = b.dataset.scope; haptic("select"); render(); });
   on("[data-f]", (b) => { S.dealFilter = b.dataset.f; haptic("select"); render(); });
   on("#more", (more) => busy(more, async () => {
@@ -441,6 +636,7 @@ function requisites(d) {
     ${r.holder ? kv("Получатель", esc(r.holder)) : ""}
     <button class="req" data-copy="${esc(r.number)}" data-what="${label}"><span class="v"><small>${label} — нажмите, чтобы скопировать</small><span class="mono">${esc(r.type === "card" ? r.number.replace(/(\d{4})(?=\d)/g, "$1 ") : r.number)}</span></span>${ic("copy")}</button>
     <button class="req" data-copy="${exact}" data-what="Сумма"><span class="v"><small>Ровно эта сумма, одним переводом</small><span class="mono">${rub(d.amount_rub)}</span></span>${ic("copy")}</button>
+    <button class="btn soft" data-copy="${esc(`${r.bank} · ${r.number}${r.holder ? " · " + r.holder : ""} · ${exact} ₽`)}" data-what="Реквизиты">${ic("copy")}Скопировать всё одной строкой</button>
   </div>`;
 }
 
@@ -465,7 +661,7 @@ function stepsList(d) {
 function dealActions(d) {
   const has = (a) => d.actions.includes(a);
   const out = [];
-  if (has("receipt") || has("late_receipt")) out.push(`<label class="btn" style="cursor:pointer">${ic("clip")}${has("late_receipt") ? "Я перевёл — прикрепить чек" : "Прикрепить чек (PDF)"}<input type="file" id="file" accept="application/pdf,image/jpeg,image/png" hidden></label>`);
+  if (has("receipt") || has("late_receipt")) out.push(`<label class="btn" style="cursor:pointer">${ic("clip")}${has("late_receipt") ? "Я перевёл — прикрепить чек" : "Прикрепить чек (PDF)"}<input type="file" id="file" accept="application/pdf" hidden></label>`);
   if (has("take")) out.push(`<button class="btn" data-a="take">${ic("check")}Взять заявку</button>`);
   if (has("accept")) out.push(`<button class="btn" data-a="accept">${ic("check")}Принять ордер</button>`);
   if (has("link")) out.push(`<button class="btn" data-a="link">${ic("link")}Отправить ссылку на ордер Bybit</button>`);
@@ -473,7 +669,7 @@ function dealActions(d) {
   if (has("confirm")) out.push(`<button class="btn" data-a="confirm">${ic("check")}${d.bybit ? "Оплата пришла — подтвердить" : "Деньги пришли — подтвердить"}</button>`);
   if (has("resolve")) out.push(`<button class="btn ink" data-a="resolve">${ic("scale")}Решение по сделке</button>`);
   const second = [];
-  if (has("receipt_view")) second.push(`<button class="btn line" data-a="receipt">${ic("file")}Чек</button>`);
+  if (has("receipt_view")) second.push(`<button class="btn line" data-a="receipt">${ic("file")}Смотреть чек</button>`);
   if (has("dispute")) second.push(`<button class="btn line red" data-a="dispute">${ic("flag")}Спор</button>`);
   if (has("evidence")) second.push(`<button class="btn line" data-a="evidence">${ic("clip")}Доказательства</button>`);
   if (has("pass_on")) second.push(`<button class="btn line" data-a="pass_on">${ic("search")}Другой мерчант</button>`);
@@ -489,9 +685,6 @@ function dealActions(d) {
 async function dealScreen(c, id, tab, offer) {
   const { deal: d } = await api(offer ? `requests/${id}` : `deals/${id}`);
   S.dealSeen = JSON.stringify(d);
-  const key = `${offer ? "r" : "d"}${id}`;
-  tab = tab || S.tab[key] || "deal";
-  S.tab[key] = tab;
   const chat = d.actions.includes("chat");
   const [label] = ROLE[d.role] || ROLE.admin;
   const timer = d.expires_at && ["waiting_payment", "searching", "assigned", "checking"].includes(d.status);
@@ -501,26 +694,50 @@ async function dealScreen(c, id, tab, offer) {
     <div class="deal-head"><h1>${label} #${d.id}${d.bybit ? " · Bybit" : ""}</h1>${tag(d.status_text, TONE[d.status])}</div>
     <div class="amount"><div class="rub">${rub(d.amount_rub)}</div><div class="to">${amountLine(d)}</div></div>
     ${straitBar(d)}
+    ${d.status === "completed" ? `<div class="done-mark"><svg viewBox="0 0 36 36" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><circle class="c" cx="18" cy="18" r="16"/><path class="k" d="m11 18.5 5 5 9-10"/></svg>Сделка завершена</div>` : ""}
     ${timer ? `<div class="timer-line" id="tl"><span>${what}</span><b id="timer">${mmss(left(d.expires_at))}</b></div>` : ""}
     ${d.held && d.role !== "buyer" ? `<p class="hint">${ic("lock").replace("<svg", '<svg style="width:13px;height:13px;vertical-align:-2px"')} Срока нет: сделку ведёт и закрывает оператор.</p>` : ""}
-    ${chat ? `<div class="tabs"><button data-tab="deal" class="${tab === "deal" ? "on" : ""}">Сделка</button><button data-tab="chat" class="${tab === "chat" ? "on" : ""}">Чат<span class="badge" id="unread" hidden></span></button></div>` : ""}
-    <div id="pane">${tab === "chat" && chat ? `<div class="chat" id="chat">${SK.rows(2)}</div>` : dealPane(d)}</div>
-    ${tab === "chat" && chat ? "" : dealActions(d)}`;
+    ${chat ? `<button class="chat-open" data-go="deal/${d.id}/chat">${ic("chat")}<span class="sp">Чат сделки<small id="chatline">Покупатель, продавец${d.bybit ? ", оператор" : ""} и администрация</small></span><span class="badge" id="unread" hidden></span>${chev()}</button>` : ""}
+    <div id="pane">${dealPane(d)}</div>
+    ${dealActions(d)}`;
   if (!view(c, html, { keepScroll: S.keep })) return;
   if (timer) every(1000, () => { const t = $app.querySelector("#timer"); if (!t) return; const sLeft = left(d.expires_at); t.textContent = mmss(sLeft); $app.querySelector("#tl").classList.toggle("low", sLeft < 180); });
-  on("[data-tab]", (b) => { S.tab[key] = b.dataset.tab; haptic("select"); S.keep = true; render(); });
   bindDeal(c, d, offer);
-  if (chat) await chatPane(c, d, tab === "chat");
+  MB.take($app.querySelector(".dock > .btn"), { shine: true });
+  if (chat) chatUnread(c, d);
   if (!offer && ["searching", "assigned", "checking", "waiting_payment", "paid", "dispute"].includes(d.status)) {
     every(5000, async () => {
       try {
         const fresh = await api(`deals/${id}`);
         if (!c.alive() || JSON.stringify(fresh.deal) === S.dealSeen) return;
+        if (fresh.deal.status !== d.status) { haptic("success"); toast(`Сделка #${id}: ${fresh.deal.status_text}`); }
         const typing = document.activeElement && /INPUT|TEXTAREA/.test(document.activeElement.tagName);
-        if (!typing && !S.sheet) { S.keep = true; render(); }
+        if (!typing && !S.sheet && !S.viewer) { S.keep = true; render(); }
       } catch (e) { /* the next tick tries again */ }
     });
   }
+}
+
+function withDays(msgs) {
+  let day = "";
+  return msgs.map((m) => { const d = dayLabel(m.at); const sep = d !== day ? `<div class="day">${d}</div>` : ""; day = d; return sep + msgHtml(m); }).join("");
+}
+
+/* the unread counter of the deal's chat on the deal screen */
+async function chatUnread(c, d) {
+  let data;
+  try { [data] = await Promise.all([api(`deals/${d.id}/chat`), refreshUnread()]); } catch (e) { return; }
+  if (!c.alive()) return;
+  const show = () => {
+    const k = unreadOf(d);
+    const badge = $app.querySelector("#unread"), line = $app.querySelector("#chatline");
+    if (badge) { badge.textContent = k; badge.hidden = !k; }
+    const lastMsg = data.messages[data.messages.length - 1];
+    if (line && lastMsg) line.textContent = `${lastMsg.mine ? "Вы" : lastMsg.role}: ${lastMsg.text}`.slice(0, 80);
+  };
+  show();
+  let last = data.messages.length ? data.messages[data.messages.length - 1].id : 0;
+  every(6000, async () => { try { const r = await api(`deals/${d.id}/chat?after=${last}`); if (r.messages.length) { data.messages.push(...r.messages); last = r.messages[r.messages.length - 1].id; await refreshUnread(); show(); } } catch (e) { /* retry */ } });
 }
 
 function dealPane(d) {
@@ -541,7 +758,7 @@ function dealPane(d) {
       ${d.resolution ? `<p class="hint" style="margin-top:8px">Решение: ${esc(d.resolution)}</p>` : ""}</div>`);
   else if (d.resolution) parts.push(`<div class="box pad" style="margin-top:12px"><p class="hint" style="margin:0">Решение: ${esc(d.resolution)}</p></div>`);
   if (d.parties) parts.push(`${sec("Участники")}<div class="list">${d.parties.map((p) => `<div class="row"><span class="ic">${ic("user")}</span><span class="mid"><b>${esc(p.name || "—")}</b><small>${esc(p.role)} · ${p.username ? "@" + esc(p.username) + " · " : ""}ID ${p.id}</small></span><button class="link-btn" data-copy="${p.id}" data-what="ID">ID</button></div>`).join("")}</div>`);
-  if (d.files && d.files.length) parts.push(`${sec("Материалы")}<div class="list">${d.files.map((f) => `<button class="row" data-file="${f.n}" data-kind="${f.kind}"><span class="ic">${ic({ photo: "image", video: "video", document: "file", text: "chat" }[f.kind] || "file")}</span><span class="mid"><b>${esc(f.title)}</b><small>${f.kind === "text" ? esc(f.text) : f.kind === "document" ? "откроется в чате с ботом" : "посмотреть"}</small></span>${chev()}</button>`).join("")}</div>`);
+  if (d.files && d.files.length) parts.push(`${sec("Материалы")}<div class="list">${d.files.map((f) => `<button class="row" data-file="${f.n}" data-kind="${f.kind}"><span class="ic">${ic({ photo: "image", video: "video", document: "file", text: "chat" }[f.kind] || "file")}</span><span class="mid"><b>${esc(f.title)}</b><small>${f.kind === "text" ? esc(f.text) : "посмотреть"}</small></span>${chev()}</button>`).join("")}</div>`);
   parts.push(`${sec("Детали")}<div class="box pad">
       ${kv("Курс", `<span class="num">${NF.format(n(d.rate))} ₽</span>`)}
       ${d.sender_bank && !d.take ? kv("Банк покупателя", esc(d.sender_bank)) : ""}
@@ -613,21 +830,97 @@ function bindDeal(c, d, offer) {
   });
 }
 
+/* ---------- the viewer: a receipt or evidence full screen, PDFs drawn in the page (pdf.js) ---------- */
+
+function closeViewer(animate = true) {
+  const v = S.viewer;
+  if (!v) return;
+  S.viewer = null;
+  v.urls.forEach((u) => URL.revokeObjectURL(u));
+  if (animate) { v.el.style.opacity = "0"; v.el.style.transition = "opacity .15s"; setTimeout(() => v.el.remove(), 150); } else v.el.remove();
+  syncBack();
+  MB.show();
+}
+
+function openViewer(title, d, nKey) {
+  closeViewer(false);
+  const el = document.createElement("div");
+  el.className = "viewer";
+  el.innerHTML = `<div class="vbar"><b>${esc(title)}</b>
+      <button class="vbtn" data-z="-1" aria-label="Уменьшить" hidden>${ic("zoomout")}</button><button class="vbtn" data-z="1" aria-label="Увеличить" hidden>${ic("zoomin")}</button>
+      <button class="vbtn" data-send aria-label="В чат с ботом">${ic("send")}</button>
+      <button class="vbtn close" data-close>${ic("x")}Закрыть</button></div>
+    <div class="vbody">${LOADER}</div>`;
+  document.body.appendChild(el);
+  const v = { el, body: el.querySelector(".vbody"), urls: [], zoom: 1, doc: null };
+  el.querySelector("[data-close]").onclick = () => closeViewer();
+  el.querySelector("[data-send]").onclick = () => sendFile(d, nKey);
+  el.querySelectorAll("[data-z]").forEach((b) => { b.onclick = () => { v.zoom = Math.min(3, Math.max(0.6, v.zoom + n(b.dataset.z) * 0.35)); drawPdf(v); }; });
+  S.viewer = v;
+  syncBack();
+  MB.show();
+  return v;
+}
+
+const loaded = {};
+function loadScript(name, global, fail) {
+  if (window[global]) return Promise.resolve(window[global]);
+  loaded[name] = loaded[name] || new Promise((ok, bad) => {
+    const sc = document.createElement("script");
+    sc.src = "/app/vendor/" + name;
+    sc.onload = () => ok(window[global]);
+    sc.onerror = () => { delete loaded[name]; bad(new Error(fail)); };
+    document.head.appendChild(sc);
+  });
+  return loaded[name];
+}
+
+async function loadPdfJs() {
+  const lib = await loadScript("pdf.min.js", "pdfjsLib", "Просмотр PDF не загрузился — отправьте файл в чат с ботом");
+  lib.GlobalWorkerOptions.workerSrc = "/app/vendor/pdf.worker.min.js";
+  return lib;
+}
+
+async function drawPdf(v) {
+  if (!v.doc || S.viewer !== v) return;
+  const dpr = Math.min(window.devicePixelRatio || 1, 2.5);
+  const width = Math.min(v.body.clientWidth - 24, 980) * v.zoom;
+  const pages = [];
+  for (let i = 1; i <= Math.min(v.doc.numPages, 20); i++) {
+    const page = await v.doc.getPage(i);
+    const base = page.getViewport({ scale: 1 });
+    const vp = page.getViewport({ scale: (width / base.width) * dpr });
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.floor(vp.width); canvas.height = Math.floor(vp.height);
+    canvas.style.width = Math.floor(vp.width / dpr) + "px";
+    await page.render({ canvasContext: canvas.getContext("2d"), viewport: vp }).promise;
+    pages.push(canvas);
+  }
+  if (S.viewer !== v) return;
+  v.body.innerHTML = "";
+  pages.forEach((cv) => v.body.appendChild(cv));
+  if (v.doc.numPages > 20) v.body.insertAdjacentHTML("beforeend", `<div class="vmsg">Показаны 20 страниц из ${v.doc.numPages} — весь файл: «В чат с ботом»</div>`);
+}
+
 async function openFile(d, nKey, kind) {
   if (kind === "text") { const f = (d.files || []).find((x) => String(x.n) === String(nKey)); if (f) sheet(`<h3>${esc(f.title)}</h3><p style="white-space:pre-wrap">${esc(f.text)}</p>`); return; }
-  if (kind === "photo" || kind === "video") {
-    const sh = sheet(`<h3>${nKey === "r" ? "Чек покупателя" : "Материал спора"}</h3><div class="sk" style="height:220px;margin-top:8px" id="media"></div>
-      <button class="btn line" id="tochat">${ic("send")}Отправить в чат с ботом</button>`);
-    on("#tochat", (b) => busy(b, () => sendFile(d, nKey)), sh);
-    try {
-      const blob = await api(`deals/${d.id}/files/${nKey}`, { raw: true });
-      const url = URL.createObjectURL(blob);
-      const slot = sh.querySelector("#media");
-      if (slot) slot.outerHTML = kind === "photo" ? `<img class="media" src="${url}" alt="">` : `<video class="media" src="${url}" controls playsinline></video>`;
-    } catch (e) { const slot = sh.querySelector("#media"); if (slot) slot.outerHTML = `<p class="err">${esc(e.message)}</p>`; }
-    return;
+  const v = openViewer(nKey === "r" ? `Чек · сделка #${d.id}` : `Материал спора · #${d.id}`, d, nKey);
+  try {
+    const blob = await api(`deals/${d.id}/files/${nKey}`, { raw: true });
+    if (S.viewer !== v) return;
+    if (blob.type === "application/pdf") {
+      const lib = await loadPdfJs();
+      v.doc = await lib.getDocument({ data: new Uint8Array(await blob.arrayBuffer()), isEvalSupported: false }).promise;
+      v.el.querySelectorAll("[data-z]").forEach((b) => { b.hidden = false; });
+      await drawPdf(v);
+      return;
+    }
+    const url = URL.createObjectURL(blob);
+    v.urls.push(url);
+    v.body.innerHTML = blob.type.startsWith("video") ? `<video src="${url}" controls playsinline autoplay></video>` : `<img src="${url}" alt="">`;
+  } catch (e) {
+    if (S.viewer === v) v.body.innerHTML = `<div class="vmsg">${esc(e.message)}<br><br>Нажмите ${ic("send").replace("<svg", '<svg style="width:15px;height:15px;vertical-align:-3px"')} — файл придёт в чат с ботом.</div>`;
   }
-  sendFile(d, nKey);
 }
 
 async function sendFile(d, nKey) {
@@ -656,6 +949,7 @@ function giveSheet(d) {
   const sh = sheet(`<h3>Реквизиты для покупателя</h3><p class="hint" style="margin-top:0">${rub(d.amount_rub)}${d.sender_bank ? ` · перевод из ${esc(d.sender_bank)}` : ""}. Покупатель увидит их сразу.</p>
     <div class="seg" style="margin-top:10px"><button data-k="card" class="on">Карта</button><button data-k="sbp">СБП</button></div>
     <label class="field" style="margin-top:0"><span id="numlbl">Номер карты</span><div class="inp"><input id="gnum" class="mono" inputmode="numeric" autocomplete="off" placeholder="2200 7001 2345 6781" value="${esc(draft.num || "")}"></div></label>
+    <div class="hint" id="gnumhint"></div>
     <label class="field"><span>Банк</span><div class="inp"><input id="gbank" autocomplete="off" placeholder="Сбербанк" value="${esc(draft.bank || "")}"></div></label>
     <div class="chips" style="margin-top:6px">${BANKS.map((b) => `<button class="chip" data-bank="${esc(b)}">${esc(b)}</button>`).join("")}</div>
     <label class="field"><span>Получатель (по желанию)</span><div class="inp"><input id="gholder" autocomplete="off" placeholder="Иван Иванович И." value="${esc(draft.holder || "")}"></div></label>
@@ -664,6 +958,7 @@ function giveSheet(d) {
     <button class="btn" id="gsend">${ic("send")}Выдать реквизиты</button>`);
   const num = sh.querySelector("#gnum"), bank = sh.querySelector("#gbank"), holder = sh.querySelector("#gholder");
   const save = () => { S.drafts["give" + d.id] = { num: num.value, bank: bank.value, holder: holder.value }; };
+  bindNumber(num, sh.querySelector("#gnumhint"), () => kind === "sbp");
   [num, bank, holder].forEach((x) => { x.oninput = save; });
   on("[data-k]", (b) => {
     kind = b.dataset.k;
@@ -671,6 +966,7 @@ function giveSheet(d) {
     sh.querySelector("#numlbl").textContent = kind === "sbp" ? "Телефон СБП" : "Номер карты";
     num.placeholder = kind === "sbp" ? "+7 900 123-45-67" : "2200 7001 2345 6781";
     num.inputMode = kind === "sbp" ? "tel" : "numeric";
+    num.value = ""; num.dispatchEvent(new Event("input"));
   }, sh);
   on("[data-bank]", (b) => { bank.value = b.dataset.bank; save(); haptic("select"); }, sh);
   on("[data-min]", (b) => { minutes = n(b.dataset.min); sh.querySelectorAll("[data-min]").forEach((x) => x.classList.toggle("on", x === b)); }, sh);
@@ -778,55 +1074,60 @@ function resolveSheet(d) {
   }), sh);
 }
 
-/* chat inside the deal: the buyer, the merchant, the operator and the administration */
+/* the deal's chat: the buyer, the merchant, the operator and the administration — a full-height view: the feed
+   scrolls on its own, the composer stays at the bottom, above the keyboard */
 
 function msgHtml(m) {
-  return `<div class="msg ${m.mine ? "me" : /админ/i.test(m.role) ? "adm" : ""}" data-id="${m.id}"><div class="who">${esc(m.mine ? "Вы" : m.role)}</div><div class="t">${esc(m.text)}</div><time>${when(m.at)}</time></div>`;
+  return `<div class="msg ${m.mine ? "me" : /админ/i.test(m.role) ? "adm" : ""}" data-id="${m.id}">${m.mine ? "" : `<div class="who">${esc(m.role)}</div>`}<div class="t">${esc(m.text)}</div><time>${hm(m.at)}</time></div>`;
 }
 
-async function chatPane(c, d, visible) {
-  const id = d.id;
-  let data;
-  try { data = await api(`deals/${id}/chat`); } catch (e) { if (visible && c.alive()) $app.querySelector("#pane").innerHTML = `<p class="err">${esc(e.message)}</p>`; return; }
+async function chatScreen(c, id) {
+  $app.innerHTML = `<div class="chatview"><div class="top"><button class="ibtn" data-back aria-label="Назад">${ic("back")}</button><h2>Чат · сделка #${id}</h2>${fsBtn()}</div><div class="feed">${LOADER}</div></div>`;
+  const [{ deal: d }, data] = await Promise.all([api(`deals/${id}`), api(`deals/${id}/chat?read=1`)]);
+  if (S.unreadBy) { S.unreadTotal = Math.max(0, (S.unreadTotal || 0) - (S.unreadBy[id] || 0)); S.unreadBy[id] = 0; drawBadges(); }
   if (!c.alive()) return;
   let last = data.messages.length ? data.messages[data.messages.length - 1].id : 0;
-  const badge = $app.querySelector("#unread");
-  const seen = () => { S.chatSeen[id] = last; if (badge) badge.hidden = true; };
-  const showUnread = () => {
-    const k = data.messages.filter((m) => m.id > (S.chatSeen[id] || 0) && !m.mine).length;
-    if (badge) { badge.textContent = k; badge.hidden = !k || visible; }
-  };
-  if (!visible) {
-    showUnread();
-    every(6000, async () => { try { const r = await api(`deals/${id}/chat?after=${last}`); if (r.messages.length) { data.messages.push(...r.messages); last = r.messages[r.messages.length - 1].id; showUnread(); } } catch (e) { /* retry */ } });
-    return;
-  }
   const quick = QUICK[d.role] || QUICK.admin;
-  $app.querySelector("#pane").innerHTML = `
-    <p class="hint" style="margin-top:0">${esc(data.members.join(" · "))}. Ссылки и @юзернеймы не проходят — общайтесь только здесь.</p>
-    <div class="chat" id="chat">${data.messages.length ? data.messages.map(msgHtml).join("") : empty("chat", "Сообщений пока нет — напишите первым")}</div>
-    ${data.open ? `<div class="compose"><div class="quick-replies">${quick.map((q) => `<button class="chip" data-q="${esc(q)}">${esc(q)}</button>`).join("")}</div>
-      <div class="in"><div class="inp"><textarea id="text" rows="1" maxlength="1000" placeholder="Сообщение">${esc(S.drafts[id] || "")}</textarea></div>
-      <button class="send" id="send" aria-label="Отправить">${ic("send")}</button></div></div>` : `<p class="hint">Сделка закрыта — чат только для чтения.</p>`}`;
-  seen();
-  const box = $app.querySelector("#chat");
-  const bottom = () => window.scrollTo(0, document.body.scrollHeight);
+  $app.innerHTML = `<div class="chatview">
+    <div class="top"><button class="ibtn" data-back aria-label="Назад">${ic("back")}</button>
+      <h2>Чат · сделка #${d.id}<small>${esc(data.members.join(" · "))}</small></h2>${fsBtn()}</div>
+    <div class="feed" id="feed"><div class="note">Ссылки и @юзернеймы не проходят — общайтесь только здесь. ${rub(d.amount_rub)} · ${esc(d.status_text)}</div>
+      ${withDays(data.messages)}${data.messages.length ? "" : `<div class="note" id="none">Сообщений пока нет — напишите первым</div>`}</div>
+    <button class="jump" id="jump" hidden>${ic("down")}<span>Новые сообщения</span></button>
+    ${data.open ? `<div class="bottom"><div class="quick-replies">${quick.map((q) => `<button class="chip" data-q="${esc(q)}">${esc(q)}</button>`).join("")}</div>
+      <div class="compose"><div class="inp"><textarea id="text" rows="1" maxlength="1000" placeholder="Сообщение" enterkeyhint="send">${esc(S.drafts[id] || "")}</textarea></div>
+      <button class="send" id="send" aria-label="Отправить">${ic("send")}</button></div></div>` : `<div class="bottom"><p class="hint" style="margin:0;text-align:center">Сделка закрыта — чат только для чтения</p></div>`}
+  </div>`;
+  const feed = $app.querySelector("#feed"), jump = $app.querySelector("#jump");
+  const bottom = () => { feed.scrollTop = feed.scrollHeight; jump.hidden = true; };
+  jump.onclick = () => { feed.scrollTo({ top: feed.scrollHeight, behavior: "smooth" }); jump.hidden = true; };
+  feed.onscroll = () => { if (feed.scrollHeight - feed.scrollTop - feed.clientHeight < 60) jump.hidden = true; };
+  const seen = () => { S.chatSeen[id] = last; };
   const add = (msgs) => {
-    const fresh = msgs.filter((m) => !box.querySelector(`[data-id="${m.id}"]`));
+    const fresh = msgs.filter((m) => !feed.querySelector(`[data-id="${m.id}"]`));
     if (!fresh.length) return;
-    const none = box.querySelector(".empty");
+    const none = feed.querySelector("#none");
     if (none) none.remove();
-    fresh.forEach((m) => box.insertAdjacentHTML("beforeend", msgHtml(m)));
+    const near = feed.scrollHeight - feed.scrollTop - feed.clientHeight < 120;
+    fresh.forEach((m) => {
+      const lastDay = feed.dataset.day;
+      if (dayLabel(m.at) !== lastDay) { feed.insertAdjacentHTML("beforeend", `<div class="day">${dayLabel(m.at)}</div>`); feed.dataset.day = dayLabel(m.at); }
+      feed.insertAdjacentHTML("beforeend", msgHtml(m));
+    });
     last = Math.max(last, msgs[msgs.length - 1].id);
-    seen(); bottom();
+    seen();
+    if (near || fresh.some((m) => m.mine)) bottom();
+    else { jump.hidden = false; haptic("tap"); }
   };
-  bottom();
-  every(3000, async () => { try { add((await api(`deals/${id}/chat?after=${last}`)).messages); } catch (e) { /* retry */ } });
+  feed.dataset.day = data.messages.length ? dayLabel(data.messages[data.messages.length - 1].at) : "";
+  seen(); bottom();
+  every(2500, async () => { try { add((await api(`deals/${id}/chat?after=${last}&read=1`)).messages); } catch (e) { /* retry */ } });
   const text = $app.querySelector("#text");
   const send = $app.querySelector("#send");
   if (!text) return;
-  const grow = () => { text.style.height = "auto"; text.style.height = Math.min(text.scrollHeight, 110) + "px"; };
+  const grow = () => { text.style.height = "auto"; text.style.height = Math.min(text.scrollHeight, 120) + "px"; };
   text.oninput = () => { S.drafts[id] = text.value; grow(); };
+  text.onfocus = () => setTimeout(() => { syncHeight(); bottom(); }, 250);  // the keyboard is opening
   grow();
   const post = async (v) => {
     if (!v) return;
@@ -838,6 +1139,7 @@ async function chatPane(c, d, visible) {
       haptic("tap");
     } catch (e) { toast(e.message, true); }
     send.disabled = false;
+    text.focus();
   };
   send.onclick = () => post(text.value.trim());
   text.onkeydown = (e) => { if (e.key === "Enter" && !e.shiftKey && !/Mobi/.test(navigator.userAgent)) { e.preventDefault(); post(text.value.trim()); } };
@@ -848,65 +1150,143 @@ async function chatPane(c, d, visible) {
 
 async function depositScreen(c) {
   const [w, d] = await Promise.all([api("wallet"), api("deposit")]);
-  if (!view(c, `${titleBlock("Пополнить", `USDT в сети TON · комиссия ${esc(w.deposit.fee)} · от ${esc(w.deposit.min)} USDT`)}
-    <div class="box pad" style="margin-top:10px">
-      ${kv("Сеть и монета", "TON · только USDT")}
-      <button class="req" data-copy="${esc(d.address)}" data-what="Адрес"><span class="v"><small>Ваш личный адрес — нажмите, чтобы скопировать</small><span class="mono">${esc(d.address)}</span></span>${ic("copy")}</button>
-    </div>
-    <button class="btn" data-copy="${esc(d.address)}" data-what="Адрес">${ic("copy")}Скопировать адрес</button>
-    <p class="hint">Адрес постоянный и только ваш, memo не нужен. Зачислим автоматически через 1–2 минуты после подтверждения в сети. Меньше ${esc(w.deposit.min)} USDT, другая монета или сеть — не зачислятся.</p>
-    <button class="btn line" id="check">${ic("refresh")}Проверить поступление</button>
-    ${w.deposits.length ? `${sec("Последние поступления")}<div class="list">${w.deposits.map((x) => `<button class="row" ${x.link ? `data-open="${esc(x.link)}"` : ""}>
-      <span class="ic ${x.status === "paid" ? "sea" : "amber"}">${ic(x.status === "paid" ? "down" : "info")}</span><span class="mid"><b>${usdt(x.amount)} USDT</b><small>#${x.id} · ${when(x.created_at)}</small></span>
-      <span class="end"><b class="${x.status === "paid" ? "plus" : ""}">${x.status === "paid" ? "+" + usdt(x.credit) : "не зачислено"}</b></span></button>`).join("")}</div>` : ""}`)) return;
+  const parts = d.address.slice(2).match(/.{1,4}/g) || [];
+  if (!view(c, `${titleBlock("Пополнить", "USDT в сети BEP-20 (BSC) · без комиссии · зачисление за секунды")}
+    <div class="grid2"><div class="col">
+      <div class="box pad qrbox" style="margin-top:10px">
+        <div class="qr" id="qr">${LOADER}</div>
+        <div class="netline">${tag("USDT", "accent")}${tag("BNB Smart Chain · BEP-20", "blue")}</div>
+        <button class="req addr" data-copy="${esc(d.address)}" data-what="Адрес"><span class="v"><small>Ваш личный адрес — нажмите, чтобы скопировать</small>
+          <span class="mono"><b>0x</b>${parts.map((x, i) => (i === 0 || i === parts.length - 1 ? `<b>${esc(x)}</b>` : esc(x))).join(" ")}</span></span>${ic("copy")}</button>
+        <button class="btn" data-copy="${esc(d.address)}" data-what="Адрес">${ic("copy")}Скопировать адрес</button>
+      </div>
+    </div><div class="col">
+      ${sec("Как пополнить")}<div class="box pad"><ol class="steps">
+        <li class="done"><span class="d">1</span><span>На бирже или в кошельке выберите <b>USDT</b> и сеть <b>BSC (BEP20)</b></span></li>
+        <li class="done"><span class="d">2</span><span>Вставьте адрес или отсканируйте QR. Сверьте начало и конец адреса</span></li>
+        <li class="done"><span class="d">3</span><span>Зачислим автоматически и пришлём уведомление — обычно через несколько секунд</span></li></ol>
+        <p class="hint" style="margin-top:4px">Адрес постоянный и только ваш. Другая монета или другая сеть не зачислятся.</p></div>
+      <button class="btn line" id="check">${ic("refresh")}Проверить поступление</button>
+      ${w.deposits.length ? `${sec("Последние поступления")}<div class="list">${w.deposits.map((x) => `<button class="row" ${x.link ? `data-open="${esc(x.link)}"` : ""}>
+        <span class="ic ${x.status === "paid" ? "green" : "amber"}">${ic(x.status === "paid" ? "down" : "info")}</span><span class="mid"><b>${usdt(x.amount)} USDT</b><small>#${x.id} · ${when(x.created_at)}</small></span>
+        <span class="end"><b class="${x.status === "paid" ? "plus" : ""}">${x.status === "paid" ? "+" + usdt(x.credit) : "не зачислено"}</b></span></button>`).join("")}</div>` : ""}
+    </div></div>`)) return;
+  loadScript("qrcode.min.js", "qrcode", "QR не загрузился").then((qrcode) => {
+    const box = $app.querySelector("#qr");
+    if (!box || !c.alive()) return;
+    const q = qrcode(0, "M");
+    q.addData(d.address);
+    q.make();
+    box.innerHTML = q.createSvgTag({ cellSize: 6, margin: 2, scalable: true }) + `<span class="qrlogo">${LOGO}</span>`;
+  }).catch(() => { const box = $app.querySelector("#qr"); if (box) box.remove(); });
   on("#check", (b) => busy(b, async () => {
     try {
       const r = await api("deposit?check=1");
       if (r.checked === null) toast("Проверка уже идёт — зачислим автоматически");
-      else if (!r.checked.length) toast("Новых поступлений пока нет — зачислим автоматически");
+      else if (!r.checked.length) toast("За последние 10 минут поступлений нет — зачислим автоматически");
       else { toast(`Зачислено: ${r.checked.map((x) => usdt(x.credit)).join(", ")} USDT`); S.keep = true; render(); }
     } catch (e) { toast(e.message, true); }
   }));
-  every(15000, async () => {
-    try { const f = await api("wallet"); if (c.alive() && (f.deposits[0] || {}).id !== (w.deposits[0] || {}).id) { S.keep = true; render(); } } catch (e) { /* retry */ }
+  every(10000, async () => {
+    try {
+      const f = await api("wallet");
+      if (c.alive() && (f.deposits[0] || {}).id !== (w.deposits[0] || {}).id) { haptic("success"); toast(`Пришло ${usdt(f.deposits[0].credit)} USDT`); S.keep = true; render(); }
+    } catch (e) { /* retry */ }
   });
+}
+
+const ADDR = /^0x[0-9a-fA-F]{40}$/;
+
+/* a card number in groups of four with a Luhn check; a phone (СБП) as +7 900 123-45-67 */
+function luhn(digits) {
+  let sum = 0;
+  for (let i = 0; i < digits.length; i++) { let x = n(digits[digits.length - 1 - i]); if (i % 2) { x *= 2; if (x > 9) x -= 9; } sum += x; }
+  return digits.length >= 13 && sum % 10 === 0;
+}
+function bindNumber(input, hint, sbp) {
+  const fmt = () => {
+    const raw = input.value;
+    const phone = (sbp && sbp()) || /^\s*(\+|8\s?9|7\s?9)/.test(raw);
+    const d = raw.replace(/\D/g, "");
+    if (phone) {
+      const p = (d.startsWith("8") ? "7" + d.slice(1) : d).slice(0, 11);
+      input.value = p ? "+" + [p.slice(0, 1), p.slice(1, 4), p.slice(4, 7), [p.slice(7, 9), p.slice(9, 11)].filter(Boolean).join("-")].filter(Boolean).join(" ") : "";
+      if (hint) hint.innerHTML = p.length === 11 ? `<span class="plus">Телефон СБП</span>` : "";
+    } else {
+      input.value = d.slice(0, 19).replace(/(\d{4})(?=\d)/g, "$1 ");
+      if (hint) hint.innerHTML = d.length < 16 ? "" : luhn(d) ? `<span class="plus">${ic("check").replace("<svg", '<svg style="width:14px;height:14px;vertical-align:-2px"')} Номер карты корректный</span>`
+        : `<span class="minus">Номер не проходит проверку — сверьте цифры</span>`;
+    }
+  };
+  input.addEventListener("input", fmt);
+  fmt();
+}
+
+async function pasteInto(input, after) {
+  try {
+    const text = (await navigator.clipboard.readText()).trim();
+    if (!text) throw new Error("empty");
+    input.value = text; after(); haptic("select");
+  } catch (e) { input.focus(); toast("Вставьте адрес вручную: долгое нажатие → «Вставить»"); }
 }
 
 async function withdrawScreen(c) {
   const w = await api("wallet");
   const req = uuid();
-  if (!view(c, `${titleBlock("Вывести", `Можно вывести <b class="num">${usdt(w.balance.withdrawable)} USDT</b>${n(w.balance.withdrawable) < n(w.balance.available) ? ` из ${usdt(w.balance.available)}` : ""}`)}
-    ${w.lock_note ? `<div class="box pad" style="display:flex;gap:10px;margin-top:10px"><span style="color:var(--blue);flex:none">${ic("info")}</span><span class="hint" style="margin:0">${esc(w.lock_note)}</span></div>` : ""}
-    <label class="field"><span>Адрес кошелька USDT в сети TON</span><div class="inp"><input id="addr" class="mono" autocomplete="off" spellcheck="false" placeholder="UQ… или EQ…" value="${esc(w.withdraw.last_address || "")}"></div></label>
-    <label class="field"><span>Memo — если выводите на биржу</span><div class="inp"><input id="memo" autocomplete="off" placeholder="Необязательно"></div></label>
-    <label class="field"><span>Сумма списания</span><div class="inp big"><input id="amt" inputmode="decimal" placeholder="0"><button class="max" id="max">Макс</button></div></label>
-    <div id="q" class="hint">Комиссия ${esc(w.withdraw.terms)} · минимум ${esc(w.withdraw.min)} USDT</div>
+  const max = n(w.withdraw.max);
+  if (!view(c, `${titleBlock("Вывести", `USDT в сети BEP-20 · комиссия ${esc(w.withdraw.terms)} · минимум ${esc(w.withdraw.min)} USDT`)}
+    <div class="tiles" style="margin-top:10px"><div class="tile accent"><small>Можно вывести</small><b>${usdt(w.withdraw.max)}</b><em>USDT</em></div>
+      <div class="tile"><small>Баланс</small><b>${usdt(w.balance.available)}</b><em>${n(w.balance.frozen) ? `в сделках ${usdt(w.balance.frozen)}` : "USDT"}</em></div></div>
+    ${w.lock_note ? `<div class="note-box">${ic("info")}<span>${esc(w.lock_note)}</span></div>` : ""}
+    <label class="field"><span>Адрес кошелька USDT · сеть BEP-20 (BSC)</span><div class="inp" id="addrbox"><input id="addr" class="mono" autocomplete="off" spellcheck="false" placeholder="0x… — 42 символа" value="${esc(w.withdraw.last_address || "")}"><button class="max" id="paste" type="button">Вставить</button></div></label>
+    <div id="addrhint" class="hint"></div>
+    <label class="field"><span>Сумма списания</span><div class="inp big"><input id="amt" inputmode="decimal" placeholder="0" autocomplete="off"><span class="unit">USDT</span></div></label>
+    <div class="chips" style="margin-top:8px">${[["25%", 0.25], ["50%", 0.5], ["75%", 0.75], ["Всё", 1]].map(([l, k]) => `<button class="chip" data-part="${k}">${l}</button>`).join("")}</div>
+    <div class="box pad" id="sum" style="margin-top:12px" hidden></div>
+    <p class="err" id="qerr" hidden></p>
     <button class="btn" id="go" disabled>${ic("up")}Вывести</button>
-    <p class="hint">Отправляем автоматически, обычно за 1–2 минуты. Если у сервиса не хватит USDT — вывод подождёт в очереди и уйдёт сам.</p>
+    <p class="hint">Отправляем автоматически, обычно за минуту. Не хватит USDT у сервиса — вывод подождёт в очереди и уйдёт сам.</p>
     ${w.withdrawals.length ? `${sec("В пути")}<div class="list">${w.withdrawals.map((x) => `<div class="row">
-      <span class="ic ${x.status === "queued" ? "amber" : "blue"}">${ic(x.status === "queued" ? "clock" : "up")}</span>
+      <span class="ic ${x.status === "queued" ? "amber" : "accent"}">${ic(x.status === "queued" ? "clock" : "up")}</span>
       <span class="mid"><b class="num">${usdt(x.receive)} USDT</b><small>#${x.id} · ${esc(x.status_text)}</small></span>
       ${x.cancellable ? `<button class="btn line red sm" data-cancel="${x.id}">Отменить</button>` : ""}</div>`).join("")}</div>` : ""}`)) return;
-  const amt = $app.querySelector("#amt"), qbox = $app.querySelector("#q"), goBtn = $app.querySelector("#go"), addr = $app.querySelector("#addr");
+  const amt = $app.querySelector("#amt"), sum = $app.querySelector("#sum"), qerr = $app.querySelector("#qerr"), goBtn = $app.querySelector("#go"), addr = $app.querySelector("#addr");
+  const addrHint = $app.querySelector("#addrhint"), addrBox = $app.querySelector("#addrbox");
   let q = null;
-  const ready = () => { goBtn.disabled = !(q && !q.error && addr.value.trim()); };
+  const addrOk = () => ADDR.test(addr.value.trim());
+  const checkAddr = () => {
+    const v = addr.value.trim();
+    addrBox.classList.toggle("bad", !!v && !addrOk());
+    addrBox.classList.toggle("good", addrOk());
+    addrHint.innerHTML = !v ? "" : addrOk() ? `<span class="plus">${ic("check").replace("<svg", '<svg style="width:14px;height:14px;vertical-align:-2px"')} Адрес BEP-20 · сверьте: <b class="mono">${esc(v.slice(0, 6))}…${esc(v.slice(-4))}</b></span>`
+      : `<span class="minus">Адрес BEP-20 — 0x и 40 символов (сейчас ${v.length})</span>`;
+    ready();
+  };
+  const ready = () => {
+    goBtn.disabled = !(q && !q.error && addrOk());
+    MB.active(!goBtn.disabled, q && !q.error ? `Вывести ${usdt(q.amount)} USDT` : "Вывести");
+  };
   const quote = debounce(async () => {
     const v = amountOf(amt.value);
-    q = null; ready();
-    if (!v) { qbox.textContent = `Комиссия ${w.withdraw.terms} · минимум ${w.withdraw.min} USDT`; return; }
+    q = null; ready(); qerr.hidden = true;
+    if (!v) { sum.hidden = true; return; }
     try {
       const r = await api(`withdraw/quote?amount=${encodeURIComponent(v)}`);
       if (!c.alive() || amountOf(amt.value) !== v) return;
       q = r;
-      if (q.error) { qbox.innerHTML = `<span class="err" style="margin:0">${esc(q.error)}</span>`; return; }
-      qbox.innerHTML = `Комиссия ${esc(q.terms)}: −<span class="num">${usdt(q.fee)}</span> USDT · <b style="color:var(--ink);font-weight:500">придёт <span class="num">${usdt(q.receive)}</span> USDT</b>`;
+      if (q.error) { sum.hidden = true; qerr.textContent = q.error; qerr.hidden = false; return; }
+      sum.innerHTML = `${kv("Спишется", `<span class="num">${usdt(v)} USDT</span>`)}${kv(`Комиссия ${esc(q.terms)}`, `<span class="num">−${usdt(q.fee)}</span>`)}<div class="kv total"><span>Придёт</span><b>${usdt(q.receive)} USDT</b></div>`;
+      sum.hidden = false;
       q.amount = v;
       ready();
-    } catch (e) { qbox.innerHTML = `<span class="err" style="margin:0">${esc(e.message)}</span>`; }
+    } catch (e) { qerr.textContent = e.message; qerr.hidden = false; }
   }, 300);
   amt.oninput = quote;
-  addr.oninput = ready;
-  on("#max", () => { amt.value = w.balance.withdrawable; quote(); });
+  addr.oninput = checkAddr;
+  MB.take(goBtn, { active: false });
+  checkAddr();
+  on("#paste", () => pasteInto(addr, checkAddr));
+  on("[data-part]", (b) => { amt.value = String(Math.floor(max * n(b.dataset.part) * 100) / 100); haptic("select"); quote(); });
   on("[data-cancel]", async (b) => {
     if (!(await confirmBox("Отменить вывод из очереди? USDT вернутся на баланс."))) return;
     busy(b, async () => { try { await api(`withdrawals/${b.dataset.cancel}/cancel`, { method: "POST" }); toast("Вывод отменён, USDT на балансе"); S.keep = true; render(); } catch (e) { toast(e.message, true); } });
@@ -914,12 +1294,12 @@ async function withdrawScreen(c) {
   on("#go", async (b) => {
     if (!q || q.error) return;
     const a = addr.value.trim();
-    if (!(await confirmBox(`Вывести ${usdt(q.amount)} USDT в сети TON на ${a.slice(0, 6)}…${a.slice(-4)}? Придёт ${usdt(q.receive)} USDT. Перевод в блокчейне не отменить.`))) return;
+    if (!(await confirmBox(`Вывести ${usdt(q.amount)} USDT в сети BEP-20 на ${a.slice(0, 6)}…${a.slice(-4)}? Придёт ${usdt(q.receive)} USDT. Перевод в блокчейне не отменить.`))) return;
     busy(b, async () => {
       try {
-        const r = await api("withdraw", { body: { amount: q.amount, fee: q.fee, request_id: req, address: a, memo: $app.querySelector("#memo").value.trim() || null } });
+        const r = await api("withdraw", { body: { amount: q.amount, fee: q.fee, request_id: req, address: a } });
         toast(r.message, !r.ok);
-        if (r.ok) go("", { replace: true });
+        if (r.ok) { haptic("success"); go("", { replace: true }); }
       } catch (e) { toast(e.message, true); }
     });
   });
@@ -958,12 +1338,49 @@ async function workScreen(c) {
   const r = m.roles, w = m.work || {};
   const rows = [
     `<button class="row" data-go="cards"><span class="ic sea">${ic("card")}</span><span class="mid"><b>Карты и смена</b><small>${r.seller ? (m.user.online ? `На смене · в потоке карт: ${w.cards_on || 0}` : "Не на смене") : "Продавайте USDT на свою карту или СБП"}</small></span>${chev()}</button>`,
-    `<button class="row" data-go="orders"><span class="ic amber">${ic("bell")}</span><span class="mid"><b>Ордерные реквизиты</b><small>${r.merchant === "approved" ? `Свободных заявок: ${w.offers || 0}` : r.merchant === "pending" ? "Анкета на рассмотрении" : r.merchant === "suspended" ? "Доступ приостановлен" : "Заявки покупателей под точную сумму"}</small></span>${chev()}</button>`,
+    `<button class="row" data-go="orders"><span class="ic amber">${ic("orders")}</span><span class="mid"><b>Заявки (реквизиты под сумму)</b><small>${r.merchant === "approved" ? `Свободных заявок: ${w.offers || 0}` : r.merchant === "pending" ? "Анкета на рассмотрении" : r.merchant === "suspended" ? "Доступ приостановлен" : "Заявки покупателей под точную сумму"}</small></span>${chev()}</button>`,
     r.operator || n(m.balance.debt) ? `<button class="row" data-go="operator"><span class="ic blue">${ic("shield")}</span><span class="mid"><b>Оператор</b><small>${w.free_orders ? `Ордеров ждут оператора: ${w.free_orders}` : "Bybit-ордера, реквизиты, подтверждение"}</small></span>${chev()}</button>` : "",
-    r.admin ? `<button class="row" data-go="admin"><span class="ic red">${ic("scale")}</span><span class="mid"><b>Администрирование</b><small>${w.disputes ? `Споров: ${w.disputes}` : "Споры, сделки, деньги"}</small></span>${chev()}</button>` : "",
+    r.team ? `<button class="row" data-go="team"><span class="ic accent">${ic("people")}</span><span class="mid"><b>${r.team.leader ? "Моя команда" : "Команда"} · ${esc(r.team.name)}</b><small>${r.team.leader ? "Участники, ссылка, доход тимлида" : "Ваша команда и тимлид"}</small></span>${chev()}</button>` : "",
+    r.admin ? `<button class="row" data-go="admin"><span class="ic red">${ic("scale")}</span><span class="mid"><b>Администрирование</b><small>${w.disputes ? `Споров: ${w.disputes}` : "Споры, пользователи, касса, финансы"}</small></span>${chev()}</button>` : "",
     `<button class="row" data-go="stats"><span class="ic">${ic("chart")}</span><span class="mid"><b>Статистика</b><small>Оборот, доход по дням, успешность</small></span>${chev()}</button>`,
   ].join("");
-  view(c, `${titleBlock("Работа", "Продажа, заявки, операторская и администрирование — всё, что приносит доход")}<div class="list" style="margin-top:12px">${rows}</div>`);
+  view(c, `${titleBlock("Работа", "Продажа, заявки, команда, операторская и администрирование")}<div class="list" style="margin-top:12px">${rows}</div>`);
+}
+
+/* ---------- a team: the leader's cabinet ---------- */
+
+async function teamScreen(c) {
+  const t = await api("team");
+  const st = (k) => t[k] || { n: 0, rub: 0, income: 0 };
+  if (!t.leader) {
+    view(c, `${titleBlock(`Команда «${t.name}»`, "Вы участник команды")}
+      <div class="box pad" style="margin-top:10px">${kv("Тимлид", esc(t.leader_name || "—"))}${kv("Участников", t.members)}${kv("Статус", t.status === "approved" ? "работает" : "приостановлена")}</div>
+      <p class="hint">Тимлид получает ${esc(t.pct)}% от ваших сделок — из дохода площадки, с вашей суммы ничего не удерживается.</p>`);
+    return;
+  }
+  const share = `https://t.me/share/url?url=${encodeURIComponent(t.link)}&text=${encodeURIComponent("Работаю в Strait Pay — заходи в мою команду")}`;
+  if (!view(c, `${titleBlock(`Команда «${t.name}»`, t.status === "approved" ? `Вы тимлид · ${esc(t.pct)}% от сделок участников` : "Команда приостановлена администрацией")}
+    <section class="balance" style="margin-top:12px">${WAVES}
+      <div class="lbl"><span>Командный баланс</span><span>${t.members} в команде</span></div>
+      <div class="sum">${usdt(t.balance)}<small>USDT</small></div>
+      <div class="sub">Сегодня +${usdt(st("today").income)} · 7 дней +${usdt(st("week").income)} USDT</div>
+    </section>
+    ${n(t.balance) ? `<button class="btn" id="out">${ic("wallet")}Перевести ${usdt(t.balance)} USDT на основной баланс</button>` : ""}
+    <div class="grid2"><div class="col">
+      ${sec("Реферальная ссылка")}
+      <div class="box pad"><button class="req" data-copy="${esc(t.link)}" data-what="Ссылка" style="margin-top:0"><span class="v"><small>Кто запустит бота по ссылке — попадёт в команду</small><span class="mono" style="font-size:14px">${esc(t.link)}</span></span>${ic("copy")}</button>
+        <div class="btns"><button class="btn soft" data-copy="${esc(t.link)}" data-what="Ссылка">${ic("copy")}Скопировать</button><button class="btn soft" data-open="${esc(share)}">${ic("send")}Поделиться</button></div>
+        ${t.chat ? "" : `<p class="hint">Чат команды не подключён: добавьте бота админом в группу и отправьте там /team.</p>`}</div>
+      ${sec("Доход тимлида")}
+      <div class="tiles">
+        <div class="tile accent"><small>Сегодня</small><b>+${usdt(st("today").income)}</b><em>${st("today").n} сделок · ${rub(st("today").rub)}</em></div>
+        <div class="tile"><small>7 дней</small><b>+${usdt(st("week").income)}</b><em>${st("week").n} · ${rub(st("week").rub)}</em></div>
+        <div class="tile"><small>Всего</small><b>+${usdt(st("all").income)}</b><em>${st("all").n} сделок</em></div>
+        <div class="tile"><small>Процент</small><b>${esc(t.pct)}%</b><em>от каждой сделки</em></div>
+      </div></div>
+    <div class="col">${sec(`Участники · ${t.members}`)}
+      <div class="list">${t.list.length ? t.list.map((u) => `<div class="row"><span class="ic ${u.online ? "green" : ""}">${ic("user")}</span><span class="mid"><b>${esc(u.name || "—")}${u.username ? ` <small style="display:inline">@${esc(u.username)}</small>` : ""}</b><small>с ${when(u.since).replace(/, \d\d:\d\d$/, "")}${u.online ? " · на смене" : ""}</small></span><span class="end"><b>${u.deals}</b><small>сделок</small></span></div>`).join("") : empty("people", "Пока никого — поделитесь ссылкой")}</div></div></div>`)) return;
+  on("#out", (b) => busy(b, async () => { try { const r = await api("team/out", { method: "POST" }); toast(`${usdt(r.moved)} USDT на основном балансе`); S.keep = true; render(); } catch (e) { toast(e.message, true); } }));
 }
 
 function cardRow(c) {
@@ -1029,7 +1446,8 @@ async function cardScreen(c, id) {
 
 async function cardNew(c) {
   if (!view(c, `${titleBlock("Новая карта", "Карта или СБП — покупатели увидят её сразу после сохранения")}
-    <label class="field"><span>Номер карты или телефон СБП</span><div class="inp"><input id="num" class="mono" inputmode="numeric" autocomplete="off" placeholder="2200 7001 2345 6781 или +7 900…"></div></label>
+    <label class="field"><span>Номер карты или телефон СБП</span><div class="inp"><input id="num" class="mono" inputmode="tel" autocomplete="off" placeholder="2200 7001 2345 6781 или +7 900…"></div></label>
+    <div class="hint" id="numhint"></div>
     <label class="field"><span>Банк</span><div class="inp"><input id="bank" autocomplete="off" placeholder="Сбербанк"></div></label>
     <div class="chips" style="margin-top:6px">${BANKS.map((b) => `<button class="chip" data-bank="${esc(b)}">${esc(b)}</button>`).join("")}</div>
     <label class="field"><span>Получатель — как его видит отправитель</span><div class="inp"><input id="holder" autocomplete="off" placeholder="Иван Иванович И."></div></label>
@@ -1037,7 +1455,8 @@ async function cardNew(c) {
       <label class="field"><span>Максимум, ₽</span><div class="inp"><input id="max" inputmode="decimal" placeholder="50 000"></div></label></div>
     <p class="hint">Ошибка в цифрах — деньги покупателя уйдут чужому человеку. Проверьте номер.</p>
     <button class="btn" id="save">Сохранить и включить</button>`)) return;
-  on("[data-bank]", (b) => { $app.querySelector("#bank").value = b.dataset.bank; haptic("select"); });
+  bindNumber($app.querySelector("#num"), $app.querySelector("#numhint"));
+  on("[data-bank]", (b) => { $app.querySelector("#bank").value = b.dataset.bank; haptic("select"); $app.querySelectorAll("[data-bank]").forEach((x) => x.classList.toggle("on", x === b)); });
   on("#save", (b) => busy(b, async () => {
     const v = (k) => $app.querySelector("#" + k).value.trim();
     try {
@@ -1062,10 +1481,11 @@ async function ordersScreen(c) {
     return;
   }
   const st = data.stats;
-  if (!view(c, `${titleBlock("Ордерные реквизиты")}
-    <div class="box pad" style="margin-top:8px;display:flex;align-items:center;gap:10px">
-      ${data.status !== "approved" ? tag("Приостановлено администрацией", "red") : data.asleep ? tag(`Пауза до ${when(data.sleep_until)}`, "amber") : tag("На линии · заявки приходят все", "sea")}
-    </div>
+  const live = data.status === "approved" && !data.asleep && data.online;
+  if (!view(c, `${titleBlock("Заявки", "Реквизиты под сумму покупателя — берёте те, что подходят")}
+    ${data.status !== "approved" ? `<div class="line"><span class="dot"></span><div class="mid"><b>Приостановлено администрацией</b><small>Заявки не приходят</small></div></div>`
+      : data.asleep ? `<div class="line"><span class="dot"></span><div class="mid"><b>Пауза до ${when(data.sleep_until)}</b><small>${data.terms.strike_limit} раза подряд не было реквизитов</small></div></div>`
+      : `<div class="line"><span class="dot ${live ? "on" : ""}"></span><div class="mid"><b>${live ? "На линии" : "Не на линии"}</b><small>${live ? "Заявки приходят — выключите, когда уходите" : "Заявки не приходят и не берутся"}</small></div><button class="sw green ${live ? "on" : ""}" id="line" aria-label="На линии"></button></div>`}
     <div class="tiles" style="margin-top:8px">
       <div class="tile"><small>Сегодня</small><b>+${usdt(st.today.income)}</b><em>${st.today.n} · ${rub(st.today.rub)}</em></div>
       <div class="tile"><small>Репутация</small><b>${data.reputation.score == null ? "—" : data.reputation.score}</b><em>${esc(data.reputation.line)}</em></div>
@@ -1075,11 +1495,12 @@ async function ordersScreen(c) {
     ${data.strikes && !data.asleep ? `<p class="hint">Пропусков реквизитов подряд: ${data.strikes} из ${data.terms.strike_limit} — потом пауза.</p>` : ""}
     ${sec("В работе")}<div class="list">${data.working.length ? data.working.map(dealRow).join("") : empty("deals", "Взятых заявок нет")}</div>
     ${sec("Свободные заявки", `<button id="refresh">${ic("refresh").replace("<svg", '<svg style="width:15px;height:15px;vertical-align:-3px"')}</button>`)}
-    <div class="list">${data.offers.length ? data.offers.map((d) => dealRow({ ...d, role: "offer" })).join("") : empty("bell", data.status === "approved" && !data.asleep ? "Свободных заявок нет — новые придут уведомлением" : "Заявки не приходят, пока доступ на паузе")}</div>
+    <div class="list">${data.offers.length ? data.offers.map((d) => dealRow({ ...d, role: "offer" })).join("") : empty("bell", live ? "Свободных заявок нет — новые придут уведомлением" : data.status === "approved" && !data.asleep ? "Вы не на линии — включите, чтобы видеть заявки" : "Заявки не приходят, пока доступ на паузе")}</div>
     ${sec("Время на оплату по умолчанию")}
     <div class="opts">${data.pay_choices.map((x) => `<button class="opt ${x === data.pay_minutes ? "on" : ""}" data-pm="${x}">${x} мин</button>`).join("")}</div>
     <div class="foot">7 дней: ${st.week.n} · +${usdt(st.week.income)} USDT · всего ${st.all.n}${st.all.success != null ? ` · успешных ${st.all.success}%` : ""}</div>`)) return;
   on("#refresh", () => { S.keep = true; render(); });
+  on("#line", (sw) => busy(sw, async () => { try { await api("merchant", { body: { online: !data.online } }); haptic("success"); toast(data.online ? "Вы не на линии — заявки не приходят" : "Вы на линии — заявки приходят"); S.me = null; await me(true); S.keep = true; render(); } catch (e) { toast(e.message, true); } }));
   on("[data-pm]", (b) => busy(b, async () => { try { await api("merchant", { body: { pay_minutes: n(b.dataset.pm) } }); toast(`По умолчанию — ${b.dataset.pm} мин на оплату`); S.keep = true; render(); } catch (e) { toast(e.message, true); } }));
   every(8000, async () => { try { const f = await api("merchant"); if (c.alive() && JSON.stringify([f.offers, f.working]) !== JSON.stringify([data.offers, data.working])) { S.keep = true; render(); } } catch (e) { /* retry */ } });
 }
@@ -1101,9 +1522,7 @@ async function operatorScreen(c) {
     <div class="list">${data.free.length ? data.free.map(dealRow).join("") : empty("bell", "Новых ордеров нет — придут уведомлением")}</div>
     ${n(data.debt) ? `${sec("Погасить долг")}
       ${n(data.balance) ? `<button class="btn line" id="repay">${ic("wallet")}С баланса · ${usdt(Math.min(n(data.debt), n(data.balance)))} USDT</button>` : ""}
-      ${data.debt_address ? `<div class="box pad" style="margin-top:8px">${kv("Сеть и монета", "TON · только USDT")}
-        <button class="req" data-copy="${esc(data.debt_address)}" data-what="Адрес"><span class="v"><small>Ваш адрес погашения долга</small><span class="mono">${esc(data.debt_address)}</span></span>${ic("copy")}</button></div>
-        <p class="hint">Всё, что придёт на этот адрес, уменьшит долг автоматически, без комиссии; сверх долга — на баланс.</p>` : ""}` : ""}`)) return;
+      <p class="hint">Не хватает баланса — пополните кошелёк USDT в сети BEP-20 (BSC) и погасите с баланса.</p>` : ""}`)) return;
   on("#refresh", () => { S.keep = true; render(); });
   on("#repay", async (b) => {
     if (!(await confirmBox(`Погасить ${usdt(Math.min(n(data.debt), n(data.balance)))} USDT долга с баланса?`))) return;
@@ -1113,32 +1532,174 @@ async function operatorScreen(c) {
 }
 
 async function adminScreen(c) {
-  const a = await api("admin");
+  const [a, m] = await Promise.all([api("admin"), me()]);
   const k = a.counts, mo = a.money;
   const tile = (go, label, value, alert, sub) => `<button class="tile ${alert ? "alert" : ""}" ${go ? `data-go="${go}"` : ""}><small>${label}</small><b>${value}</b>${sub ? `<em>${sub}</em>` : ""}</button>`;
-  if (!view(c, `${titleBlock("Администрирование")}
-    <div class="tiles" style="margin-top:8px">
+  const hub = (go, icon, tone, title, sub, badge) => `<button class="row" data-go="${go}"><span class="ic ${tone}">${ic(icon)}</span><span class="mid"><b>${title}</b><small>${sub}</small></span>${badge ? `<span class="badge">${badge}</span>` : ""}${chev()}</button>`;
+  if (!view(c, `${titleBlock("Администрирование", `24 часа: ${a.day.deals} сделок · ${rub(a.day.rub)} · +${usdt(a.day.income)} USDT`)}
+    <div class="tiles four" style="margin-top:10px">
       ${tile("admin/deals?dispute", "Споры", k.disputes, k.disputes)}
       ${tile("admin/deals?paid", "Ждут подтверждения", k.slow, k.slow, "дольше срока")}
       ${tile("admin/deals?open", "Открытых сделок", k.open, false, `ищут реквизиты: ${k.searching}`)}
-      ${tile("", "Выводы на проверке", k.unknown_wd, k.unknown_wd, `в очереди ${k.queued_wd}`)}
+      ${tile("admin/desk", "Выводы", k.unknown_wd || k.queued_wd, k.unknown_wd, k.unknown_wd ? "на проверке" : "в очереди")}
     </div>
-    ${sec("Деньги")}<div class="box pad">
-      ${kv("Балансы пользователей", `<span class="num">${usdt(mo.users)} USDT</span>`)}
-      ${mo.hot ? (mo.hot.error ? kv("Горячий кошелёк", "нет ответа сети") : kv("Горячий кошелёк", `<span class="num">${usdt(mo.hot.usdt)} USDT · <span class="${mo.hot.low ? "minus" : ""}">${mo.hot.ton} TON</span></span>`)) : kv("Горячий кошелёк", "выключен")}
-      ${n(mo.unswept) ? kv("Не собрано с адресов", `<span class="num">${usdt(mo.unswept)} USDT</span>`) : ""}
-      ${n(mo.op_debt) ? kv("Долг операторов", `<span class="num">${usdt(mo.op_debt)} USDT</span>`) : ""}
-      ${kv("За 24 часа", `<span class="num">${a.day.deals} · ${rub(a.day.rub)} · +${usdt(a.day.income)} USDT</span>`)}
-    </div>
-    ${mo.hot && mo.hot.address ? `<button class="btn line" data-copy="${esc(mo.hot.address)}" data-what="Адрес">${ic("copy")}Адрес горячего кошелька (газ и выплаты)</button>` : ""}
-    ${a.disputes.length ? `${sec("Споры")}<div class="list">${a.disputes.map(dealRow).join("")}</div>` : ""}
-    ${a.slow.length ? `${sec("Продавец молчит")}<div class="list">${a.slow.map(dealRow).join("")}</div>` : ""}
-    ${a.withdrawals.length ? `${sec("Выводы на проверке")}<div class="list">${a.withdrawals.map((w) => `<div class="row"><span class="ic red">${ic("up")}</span><span class="mid"><b class="num">#${w.id} · ${usdt(w.amount)} USDT</b><small class="mono">${esc((w.address || "").slice(0, 8))}…${esc((w.address || "").slice(-6))} · ID ${w.user_id}</small></span></div>`).join("")}</div><p class="hint">Решение по выводу — в боте: «Админ-панель → TON-кошелёк».</p>` : ""}
-    ${k.signups || k.tickets || k.merchants || k.adjustments ? `${sec("В боте")}<div class="box pad">
-      ${k.signups ? kv("Заявок на вход", k.signups) : ""}${k.merchants ? kv("Анкет мерчантов", k.merchants) : ""}
-      ${k.tickets ? kv("Обращений", k.tickets) : ""}${k.adjustments ? kv("Корректировок ждут второго админа", k.adjustments) : ""}</div>` : ""}
-    <button class="btn line" data-go="admin/deals?all">${ic("search")}Все сделки</button>`)) return;
+    <div class="grid2"><div class="col">
+      ${sec("Разделы")}<div class="list">
+        ${hub("admin/users", "people", "accent", "Пользователи", "Поиск, баланс, бан, рейтинг мерчанта")}
+        ${hub("admin/signups", "user", "amber", "Заявки на вход", k.signups ? "Ждут решения" : "Новых нет", k.signups)}
+        ${hub("admin/desk", "wallet", "accent", "Касса BEP-20", mo.hot && !mo.hot.error ? `${usdt(mo.hot.usdt)} USDT · ${mo.hot.bnb} BNB` : "Балансы, очередь выводов")}
+        ${hub("admin/finance", "chart", "green", "Финансы", "Что есть, что должны, сколько можно забрать")}
+        ${hub("admin/deals?all", "search", "", "Все сделки", "Поиск по номеру или ID")}
+      </div>
+      ${sec("Деньги")}<div class="box pad">
+        ${kv("Балансы пользователей", `<span class="num">${usdt(mo.users)} USDT</span>`)}
+        ${mo.hot ? (mo.hot.error ? kv("Касса BEP-20", "нет ответа сети") : kv("Касса BEP-20", `<span class="num">${usdt(mo.hot.usdt)} USDT · <span class="${mo.hot.low ? "minus" : ""}">${mo.hot.bnb} BNB</span></span>`)) : kv("Касса BEP-20", "выключена")}
+        ${n(mo.unswept) ? kv("Не собрано с адресов", `<span class="num">${usdt(mo.unswept)} USDT</span>`) : ""}
+        ${n(mo.op_debt) ? kv("Долг операторов", `<span class="num">${usdt(mo.op_debt)} USDT</span>`) : ""}
+      </div>
+      ${k.tickets || k.merchants || k.adjustments ? `${sec("Ещё в боте")}<div class="box pad">
+        ${k.merchants ? kv("Анкет мерчантов", k.merchants) : ""}${k.tickets ? kv("Обращений", k.tickets) : ""}${k.adjustments ? kv("Корректировок ждут подтверждения", k.adjustments) : ""}</div>` : ""}
+    </div><div class="col">
+      ${a.disputes.length ? `${sec("Споры")}<div class="list">${a.disputes.map(dealRow).join("")}</div>` : ""}
+      ${a.slow.length ? `${sec("Продавец молчит")}<div class="list">${a.slow.map(dealRow).join("")}</div>` : ""}
+      ${a.withdrawals.length ? `${sec("Выводы на проверке")}<div class="list">${a.withdrawals.map((w) => `<div class="row"><span class="ic red">${ic("up")}</span><span class="mid"><b class="num">#${w.id} · ${usdt(w.amount)} USDT</b><small class="mono">${esc((w.address || "").slice(0, 8))}…${esc((w.address || "").slice(-6))} · ID ${w.user_id}</small></span>
+        <button class="btn sm soft" data-wd="${w.id}" data-act="done">Выполнен</button><button class="btn sm line red" data-wd="${w.id}" data-act="refund" style="margin-left:6px">Вернуть</button></div>`).join("")}</div><p class="hint">Старые сети (TON / xRocket): проверьте перевод в обозревателе. Решают владельцы.</p>` : ""}
+      ${!a.disputes.length && !a.slow.length && !a.withdrawals.length ? `${sec("Очереди")}<div class="list">${empty("check", "Всё обработано — споров и проверок нет")}</div>` : ""}
+    </div></div>`)) return;
+  on("[data-wd]", async (b) => {
+    const refund = b.dataset.act === "refund";
+    if (!(await confirmBox(refund ? `Вернуть средства по выводу #${b.dataset.wd}? Только если перевод точно не ушёл.` : `Подтвердить выполнение вывода #${b.dataset.wd}? Только если нашли перевод в сети.`))) return;
+    busy(b, async () => { try { const r = await api(`admin/withdrawals/${b.dataset.wd}`, { body: { action: b.dataset.act } }); toast(r.message); S.keep = true; render(); } catch (e) { toast(e.message, true); } });
+  });
+  if (m) drawNav(path());
   every(10000, async () => { try { const f = await api("admin"); if (c.alive() && JSON.stringify([f.counts, f.disputes.map((x) => x.id)]) !== JSON.stringify([a.counts, a.disputes.map((x) => x.id)])) { S.keep = true; render(); } } catch (e) { /* retry */ } });
+}
+
+const stars = (v) => { const k = Math.round(n(v) / 2); return `<span class="stars">${"★".repeat(k)}${"☆".repeat(5 - k)}</span>`; };
+
+async function adminUsers(c) {
+  const q = S.userQ || "";
+  const list = await api(`admin/users${q ? "?q=" + encodeURIComponent(q) : ""}`);
+  if (!view(c, `${titleBlock("Пользователи", "ID, @юзернейм или часть имени")}
+    <label class="field"><div class="inp">${ic("search").replace("<svg", '<svg style="width:18px;height:18px;color:var(--muted)"')}<input id="q" placeholder="Поиск" value="${esc(q)}" autocomplete="off"></div></label>
+    <div class="list" style="margin-top:12px">${list.users.length ? list.users.map((u) => `<button class="row" data-go="admin/user/${u.id}"><span class="ic ${u.banned ? "red" : u.online ? "green" : "accent"}">${ic(u.banned ? "ban" : "user")}</span>
+      <span class="mid"><b>${esc(u.name || "—")}${u.username ? ` · @${esc(u.username)}` : ""}</b><small>ID ${u.id} · был ${when(u.seen)}</small></span><span class="end"><b>${usdt(u.balance)}</b><small>USDT</small></span></button>`).join("") : empty("search", "Никого не нашли")}</div>`, { keepScroll: S.keep })) return;
+  const input = $app.querySelector("#q");
+  if (S.keep) { input.focus(); input.setSelectionRange(input.value.length, input.value.length); }
+  input.oninput = debounce(() => { S.userQ = input.value.trim(); S.keep = true; render(); }, 400);
+}
+
+async function adminUser(c, id) {
+  const u = await api(`admin/users/${id}`);
+  const r = u.roles;
+  const tags = ROLE_TAGS(r).map(([tt, tone]) => tag(tt, tone)).join(" ");
+  if (!view(c, `<div style="display:flex;align-items:center;gap:14px;margin-top:4px">
+      <div class="ava xl" style="width:64px;height:64px;font-size:22px">${esc((u.name || "?").trim()[0] || "?")}</div>
+      <div style="min-width:0"><h1 style="margin:0;font-size:20px;font-weight:600">${esc(u.name || "—")}</h1>
+        <div class="hint" style="margin:2px 0 0">${u.username ? "@" + esc(u.username) + " · " : ""}<button data-copy="${u.id}" data-what="ID" class="num" style="color:var(--muted)">ID ${u.id}</button></div>
+        <div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:8px">${u.banned ? tag("Заблокирован", "red", "ban") : ""}${tags}</div></div></div>
+    <div class="tiles" style="margin-top:14px">
+      <div class="tile accent"><small>Доступно</small><b>${usdt(u.balance)}</b><em>USDT</em></div>
+      <div class="tile"><small>В сделках</small><b>${usdt(u.frozen)}</b><em>USDT${n(u.deposit_lock) ? ` · не прокручено ${usdt(u.deposit_lock)}` : ""}</em></div>
+      <div class="tile"><small>Сделок</small><b>${u.deals.done}</b><em>открыто ${u.deals.open}</em></div>
+      <div class="tile ${u.debt ? "alert" : ""}"><small>${u.debt ? "Долг оператора" : "Командный баланс"}</small><b>${usdt(u.debt || u.team_balance)}</b><em>USDT</em></div>
+    </div>
+    ${sec("Баланс")}<div class="box pad">
+      <div class="opts" style="margin-top:0">${["-50", "-10", "+10", "+50"].map((v) => `<button class="opt" data-bal="${v}">${v}</button>`).join("")}</div>
+      <label class="field"><span>Своя сумма: +25 начислить, -5 списать</span><div class="inp"><input id="delta" inputmode="decimal" placeholder="+25"><span class="unit">USDT</span></div></label>
+      <label class="field"><span>Причина (увидит пользователь)</span><div class="inp"><input id="why" maxlength="200" placeholder="Например: компенсация по сделке #15"></div></label>
+      <button class="btn" id="apply">${ic("coin")}Провести</button>
+      <p class="hint">${u.owner ? "Вы владелец: проводится сразу." : "Свой баланс и суммы выше порога ждут второго администратора."}</p></div>
+    ${sec("Рейтинг мерчанта")}<div class="box pad">
+      <div style="font-size:15px">${u.rating != null ? `${stars(u.rating)} <b>${u.rating}</b> из 10 · вручную` : esc(u.rating_lines[0]).replace(/&lt;\/?b&gt;/g, "")}</div>
+      <div class="hint" style="margin-top:2px">${esc(u.rating_lines[1] || "").replace(/&lt;\/?b&gt;/g, "")}</div>
+      <div class="opts">${[3, 5, 6, 7, 8, 9, 10].map((v) => `<button class="opt ${n(u.rating) === v ? "on" : ""}" data-rate="${v}">${v}</button>`).join("")}<button class="opt" data-rate="-">Авто</button></div>
+      <label class="field"><span>Точный рейтинг 1–10 (можно 8.5)</span><div class="inp"><input id="rate" inputmode="decimal" placeholder="8.5"><button class="max" id="rset">Задать</button></div></label></div>
+    ${sec("Доступ")}<div class="list">
+      <button class="row" data-q="${u.id}"><span class="ic">${ic("deals")}</span><span class="mid"><b>Сделки пользователя</b><small>Все его покупки и продажи</small></span>${chev()}</button>
+      ${u.admin ? "" : `<button class="row" id="ban"><span class="ic ${u.banned ? "green" : "red"}">${ic(u.banned ? "check" : "ban")}</span><span class="mid"><b>${u.banned ? "Разблокировать" : "Заблокировать"}</b><small>${u.banned ? "Вернуть доступ к боту и приложению" : "Сделки отменятся или уйдут в спор, баланс сохранится"}</small></span></button>`}
+    </div>`)) return;
+  const act = async (b, body, ask) => {
+    if (ask && !(await confirmBox(ask))) return;
+    busy(b, async () => { try { const res = await api(`admin/users/${id}`, { body }); toast(res.message); S.keep = true; render(); } catch (e) { toast(e.message, true); } });
+  };
+  on("[data-bal]", (b) => act(b, { action: "balance", value: b.dataset.bal, comment: $app.querySelector("#why").value }, `${b.dataset.bal} USDT пользователю ${u.name || u.id}?`));
+  on("#apply", (b) => { const v = amountOf($app.querySelector("#delta").value); if (!v) { toast("Введите сумму: +25 или -5", true); return; } act(b, { action: "balance", value: v, comment: $app.querySelector("#why").value }, `${v} USDT пользователю ${u.name || u.id}?`); });
+  on("[data-rate]", (b) => act(b, { action: "rating", value: b.dataset.rate }));
+  on("#rset", (b) => act(b, { action: "rating", value: amountOf($app.querySelector("#rate").value) }));
+  on("#ban", (b) => act(b, { action: u.banned ? "unban" : "ban" }, u.banned ? "Разблокировать пользователя?" : "Заблокировать? Его открытые сделки отменятся или уйдут в спор."));
+  on("[data-q]", (b) => { S.adminQ = b.dataset.q; go("admin/deals?all"); });
+}
+
+async function adminDesk(c) {
+  const d = await api("admin/desk");
+  if (!d.on) { view(c, `${titleBlock("Касса BEP-20")}<div class="box pad" style="margin-top:10px"><p style="margin:0">Касса выключена: ${esc(d.error)}</p></div>`); return; }
+  if (!view(c, `${titleBlock("Касса USDT · BEP-20", "Горячий кошелёк платит выводы и газ")}
+    <section class="balance" style="margin-top:12px">${WAVES}
+      <div class="lbl"><span>Свободно на горячем</span><span>${d.pending ? `в сети ${d.pending}` : ""}</span></div>
+      <div class="sum">${d.chain_error ? "—" : usdt(d.usdt)}<small>USDT</small></div>
+      <div class="sub">${d.chain_error ? "Сеть не ответила" : `Касса всего ${usdt(d.total)} USDT · газ ${d.bnb} BNB${d.low ? " — мало" : ""}`}</div>
+    </section>
+    <div class="box pad" style="margin-top:10px">
+      <button class="req" data-copy="${esc(d.address)}" data-what="Адрес" style="margin-top:0"><span class="v"><small>Адрес горячего кошелька · BSC</small><span class="mono" style="font-size:14px">${esc(d.address)}</span></span>${ic("copy")}</button>
+      ${d.cold != null ? kv("Холодный кошелёк", `<span class="num">${usdt(d.cold)} USDT</span>`) : ""}
+      ${n(d.unswept) ? kv("На адресах пополнения", `<span class="num">${usdt(d.unswept)} USDT</span>`) : ""}
+      ${kv("Очередь выводов", `<span class="num">${usdt(d.queued)} USDT</span>`)}
+      <div class="btns"><button class="btn soft" data-open="${esc(d.explorer)}">${ic("search")}BscScan</button>${d.owner ? `<button class="btn line red" id="key">${ic("key")}Ключ кассы</button>` : ""}</div>
+      ${d.low ? `<p class="err">Газа мало — пополните BNB (~0,005) на адрес выше, иначе выплаты встанут.</p>` : ""}
+    </div>
+    ${sec(`Выводы в работе · ${d.queue.length}`)}
+    <div class="list">${d.queue.length ? d.queue.map((w) => `<button class="row" data-go="admin/user/${w.user_id}"><span class="ic ${w.status === "queued" ? "amber" : "accent"}">${ic(w.status === "queued" ? "clock" : "up")}</span>
+      <span class="mid"><b class="num">#${w.id} · ${usdt(w.amount)} USDT</b><small class="mono">${esc(w.address.slice(0, 8))}…${esc(w.address.slice(-6))} · ${w.status === "queued" ? "в очереди" : w.status === "sent" ? "в сети" : "готовится"}${w.signed ? " · подписан" : ""}</small></span>${chev()}</button>`).join("") : empty("check", "Очередь пуста")}</div>`)) return;
+  on("#key", async (b) => {
+    if (!(await confirmBox("Прислать seed кассы вам в личку с ботом? 12 слов дают полный доступ к деньгам. Сообщение удалится через 2 минуты."))) return;
+    busy(b, async () => { try { const r = await api("admin/desk/key", { method: "POST" }); toast(`Ключ в чате с ботом — удалится через ${r.minutes} мин`); } catch (e) { toast(e.message, true); } });
+  });
+  every(15000, async () => { try { const f = await api("admin/desk"); if (c.alive() && JSON.stringify(f.queue) !== JSON.stringify(d.queue)) { S.keep = true; render(); } } catch (e) { /* retry */ } });
+}
+
+async function adminFinance(c) {
+  const f = await api("admin/finance");
+  const free = n(f.free);
+  view(c, `${titleBlock("Финансы", "Что есть, что должны пользователям и что можно забрать")}
+    <div class="tiles" style="margin-top:10px">
+      <div class="tile ${free >= 0 ? "accent" : "alert"}"><small>${free >= 0 ? "Можно забрать" : "Не хватает"}</small><b>${usdt(Math.abs(free))}</b><em>USDT</em></div>
+      <div class="tile"><small>Прибыль 24 ч</small><b class="plus">+${usdt(f.profit["24h"])}</b><em>7 д +${usdt(f.profit["7d"])}</em></div>
+    </div>
+    <div class="grid2"><div class="col">
+      ${sec("Что есть")}<div class="box pad">
+        ${kv("Горячий кошелёк", f.hot == null ? "нет ответа" : `<span class="num">${usdt(f.hot)} USDT</span>`)}
+        ${f.cold != null ? kv("Холодный", `<span class="num">${usdt(f.cold)} USDT</span>`) : ""}
+        ${n(f.unswept) ? kv("Не собрано с адресов", `<span class="num">${usdt(f.unswept)} USDT</span>`) : ""}
+        <div class="kv total"><span>Итого</span><b>${usdt(f.assets)} USDT</b></div></div>
+      ${sec("Должны пользователям")}<div class="box pad">
+        ${kv("Балансы", `<span class="num">${usdt(f.users)}</span>`)}${kv("В сделках", `<span class="num">${usdt(f.frozen)}</span>`)}
+        ${n(f.team) ? kv("Командные балансы", `<span class="num">${usdt(f.team)}</span>`) : ""}
+        ${f.unpaid_n ? kv(`Выводы в пути (${f.unpaid_n})`, `<span class="num">${usdt(f.unpaid)}</span>`) : ""}
+        <div class="kv total"><span>Итого</span><b>${usdt(f.liabilities)} USDT</b></div></div>
+    </div><div class="col">
+      ${sec("Прибыль площадки")}<div class="box pad">
+        ${kv("24 часа", `<span class="num plus">+${usdt(f.profit["24h"])}</span>`)}${kv("7 дней", `<span class="num">+${usdt(f.profit["7d"])}</span>`)}
+        ${kv("30 дней", `<span class="num">+${usdt(f.profit["30d"])}</span>`)}${kv("Всего", `<span class="num">+${usdt(f.profit.all)}</span>`)}</div>
+      ${sec("Оборот")}<div class="box pad">
+        ${kv("Сделок за 24 ч", `${f.volume["24h"].n} · ${rub(f.volume["24h"].rub)}`)}${kv("За 7 дней", `${f.volume["7d"].n} · ${rub(f.volume["7d"].rub)}`)}
+        ${kv("Пользователей", `${f.users_n} · на смене ${f.online}`)}
+        ${n(f.op_debt) ? kv("Долг операторов", `<span class="num">${usdt(f.op_debt)} USDT</span>`) : ""}</div>
+    </div></div>
+    <p class="hint">«Можно забрать» = что есть − что должны пользователям; прибыль уже внутри.</p>`);
+}
+
+async function adminSignups(c) {
+  const list = await api("admin/signups");
+  if (!view(c, `${titleBlock("Заявки на вход", "Кто хочет работать в Strait Pay")}
+    <div class="list" style="margin-top:12px">${list.signups.length ? list.signups.map((s) => `<div class="row" style="flex-wrap:wrap"><span class="ic amber">${ic("user")}</span>
+      <span class="mid"><b>${esc(s.name || "—")}${s.username ? ` · @${esc(s.username)}` : ""}</b><small>${esc(s.role)} · оборот ${esc(s.turnover)}${s.proof ? " · скриншот в боте" : ""} · ${when(s.created_at)}</small></span>
+      <div style="display:flex;gap:6px;width:100%;padding-left:50px"><button class="btn sm" data-ok="${s.id}">${ic("check")}Одобрить</button><button class="btn sm line red" data-no="${s.id}">Отклонить</button></div></div>`).join("") : empty("check", "Новых заявок нет")}</div>`)) return;
+  on("[data-ok]", (b) => busy(b, async () => { try { const r = await api(`admin/signups/${b.dataset.ok}`, { body: { approve: true } }); toast(r.message); S.keep = true; render(); } catch (e) { toast(e.message, true); } }));
+  on("[data-no]", (b) => {
+    const sh = sheet(`<h3>Отклонить заявку</h3><label class="field"><span>Причина (увидит пользователь)</span><div class="inp"><textarea id="why" rows="2" maxlength="300" placeholder="Например: нет опыта P2P"></textarea></div></label><button class="btn red" id="no">Отклонить</button>`);
+    on("#no", (x) => busy(x, async () => { try { const r = await api(`admin/signups/${b.dataset.no}`, { body: { approve: false, reason: sh.querySelector("#why").value } }); closeSheet(); toast(r.message); S.keep = true; render(); } catch (e) { toast(e.message, true); } }), sh);
+  });
 }
 
 async function adminDeals(c, filter) {
@@ -1175,7 +1736,9 @@ async function profile(c) {
       <div class="tile"><small>Куплено</small><b>${usdt(st.buyer.usdt)}</b><em>USDT · ${st.buyer.n} сделок</em></div>
       <div class="tile"><small>Продано</small><b>${rub(st.seller[3].rub)}</b><em>${st.seller[3].n} сделок${n(st.seller[3].income) ? " · +" + usdt(st.seller[3].income) + " USDT" : ""}</em></div>
     </div>
+    ${sec("Оформление")}<div class="seg" style="margin-top:0">${[["auto", "Как в Telegram", "auto"], ["light", "Светлая", "sun"], ["dark", "Тёмная", "moon"]].map(([k, label]) => `<button data-theme="${k}" class="${themeMode() === k ? "on" : ""}">${label}</button>`).join("")}</div>
     ${sec("Аккаунт")}<div class="list">
+      ${m.roles.team ? `<button class="row" data-go="team"><span class="ic accent">${ic("people")}</span><span class="mid"><b>${m.roles.team.leader ? "Моя команда" : "Команда"} · ${esc(m.roles.team.name)}</b><small>${m.roles.team.leader ? "Участники, ссылка, доход тимлида" : "Ваша команда"}</small></span>${chev()}</button>` : ""}
       <button class="row" data-go="stats"><span class="ic">${ic("chart")}</span><span class="mid"><b>Статистика</b><small>Оборот, доход по дням, успешность</small></span>${chev()}</button>
       <button class="row" data-go="history"><span class="ic">${ic("clock")}</span><span class="mid"><b>История операций</b><small>Пополнения, выводы, сделки</small></span>${chev()}</button>
       <div class="row"><span class="ic">${ic("bell")}</span><span class="mid"><b>Уведомления без звука</b><small>О сделках — тихо</small></span><button class="sw ${m.user.quiet ? "on" : ""}" id="quiet" aria-label="Без звука"></button></div>
@@ -1193,6 +1756,7 @@ async function profile(c) {
     catch (err) { toast(err.message, true); }
   }));
   on("#chat", (b) => busy(b, async () => { try { const r = await api("chat-invite", { method: "POST" }); openUrl(r.chat); } catch (e) { toast(e.message, true); } }));
+  on("[data-theme]", (b) => { setTheme(b.dataset.theme); haptic("select"); $app.querySelectorAll("[data-theme]").forEach((x) => x.classList.toggle("on", x === b)); drawSide(path()); });
   setBadge(m.counts.action);
 }
 
@@ -1212,10 +1776,11 @@ async function statsScreen(c) {
       <div class="tile"><small>Подтверждаете за</small><b>${p.confirm_min == null ? "—" : p.confirm_min + " мин"}</b>${p.disputes ? `<em style="color:var(--red)">споров: ${p.disputes}</em>` : ""}</div>
     </div>
     ${sec("Доход по дням", `<span class="hint" style="margin:0">14 дней, USDT</span>`)}
-    <div class="box pad"><div class="bars">${st.days.map((d) => `<div title="${esc(d.day)}: ${d.n} сд., +${usdt(d.income)} USDT"><i class="${n(d.income) ? "" : "zero"}" style="height:${Math.round((n(d.income) / max) * 100)}%"></i><span>${new Date(d.day).getDate()}</span></div>`).join("")}</div></div>
+    <div class="box pad"><div class="bars">${st.days.map((d) => `<div data-bar="${esc(d.day)}|${d.n}|${d.income}" title="${esc(d.day)}: ${d.n} сд., +${usdt(d.income)} USDT"><i class="${n(d.income) ? "" : "zero"}" style="height:${Math.round((n(d.income) / max) * 100)}%"></i><span>${new Date(d.day).getDate()}</span></div>`).join("")}</div></div>
     ${sec("Покупки")}
     <div class="box pad">${kv("Сделок", st.buyer.n)}${kv("Переведено", `<span class="num">${rub(st.buyer.rub)}</span>`)}<div class="kv total"><span>Получено</span><b>${usdt(st.buyer.usdt)} USDT</b></div></div>`)) return;
   on("[data-p]", (b) => { S.period = b.dataset.p; haptic("select"); S.keep = true; render(); });
+  on("[data-bar]", (b) => { const [day, k, inc] = b.dataset.bar.split("|"); haptic("select"); toast(`${dayLabel(day + "T12:00:00")}: ${k} сделок · +${usdt(inc)} USDT`); });
 }
 
 async function guidesScreen(c) {
@@ -1246,23 +1811,42 @@ async function guideScreen(c, slug) {
 const ROUTES = [
   [/^$/, home, "home"], [/^buy$/, (c) => exchange(c, "buy"), "page"], [/^sell$/, (c) => exchange(c, "sell"), "page"],
   [/^deals$/, dealsScreen, "page"], [/^deal\/(\d+)$/, (c, id) => dealScreen(c, id), "deal"],
-  [/^deal\/(\d+)\/chat$/, (c, id) => dealScreen(c, id, "chat"), "deal"], [/^request\/(\d+)$/, (c, id) => dealScreen(c, id, "deal", true), "deal"],
+  [/^deal\/(\d+)\/chat$/, chatScreen, "chat"], [/^request\/(\d+)$/, (c, id) => dealScreen(c, id, "deal", true), "deal"],
   [/^deposit$/, depositScreen, "page"], [/^withdraw$/, withdrawScreen, "page"], [/^history$/, historyScreen, "page"],
   [/^work$/, workScreen, "page"], [/^cards$/, cardsScreen, "page"], [/^card\/new$/, cardNew, "page"], [/^card\/(\d+)$/, cardScreen, "page"],
-  [/^orders$/, ordersScreen, "page"], [/^operator$/, operatorScreen, "page"], [/^admin$/, adminScreen, "page"],
-  [/^admin\/deals(?:\?(\w+))?$/, adminDeals, "page"],
+  [/^orders$/, ordersScreen, "page"], [/^operator$/, operatorScreen, "page"], [/^team$/, teamScreen, "page"],
+  [/^admin$/, adminScreen, "page"], [/^admin\/deals(?:\?(\w+))?$/, adminDeals, "page"],
+  [/^admin\/users$/, adminUsers, "page"], [/^admin\/user\/(\d+)$/, adminUser, "page"], [/^admin\/desk$/, adminDesk, "page"],
+  [/^admin\/finance$/, adminFinance, "page"], [/^admin\/signups$/, adminSignups, "page"],
   [/^profile$/, profile, "page"], [/^stats$/, statsScreen, "page"], [/^guides$/, guidesScreen, "page"], [/^guide\/([a-z]+)$/, guideScreen, "page"],
 ];
-const TABS = [["", "Главная", "home"], ["buy", "Обмен", "swap"], ["deals", "Сделки", "deals"], ["work", "Работа", "work"], ["profile", "Профиль", "user"]];
-const TAB_OF = (p) => (/^(buy|sell)$/.test(p) ? "buy" : /^(deals|deal\/|request\/)/.test(p) ? "deals" :
-  /^(work|cards|card\/|orders|operator|admin|stats)/.test(p) ? "work" : /^(profile|guides|guide\/)/.test(p) ? "profile" : "");
+const ROOTS = ["", "buy", "orders", "deals", "work", "profile"];
+const isRoot = (p) => ROOTS.includes(p);
+
+function roles() { return (S.me && S.me.roles) || {}; }
+function tabs() {
+  const r = roles();
+  return [["", "Главная", "home"], r.merchant === "approved" ? ["orders", "Заявки", "orders"] : ["buy", "Обмен", "swap"],
+    ["deals", "Сделки", "deals"], ["work", "Работа", "work"], ["profile", "Профиль", "user"]];
+}
+function TAB_OF(p) {
+  const has = (k) => tabs().some(([t]) => t === k);
+  if (/^(buy|sell)$/.test(p)) return has("buy") ? "buy" : "";
+  if (/^(orders|request\/)/.test(p)) return has("orders") ? "orders" : "work";
+  if (/^(deals|deal\/)/.test(p)) return "deals";
+  if (/^(work|cards|card\/|operator|admin|stats|team)/.test(p)) return "work";
+  if (/^(profile|guides|guide\/)/.test(p)) return "profile";
+  return "";
+}
 
 function parent(p) {
   if (/^deal\/\d+\/chat$/.test(p)) return p.replace(/\/chat$/, "");
-  if (/^(deal|request)\//.test(p)) return "deals";
+  if (/^request\//.test(p)) return "orders";
+  if (/^deal\//.test(p)) return "deals";
   if (/^card\//.test(p)) return "cards";
-  if (/^admin\/deals/.test(p)) return "admin";
-  if (/^(cards|orders|operator|admin|stats)$/.test(p)) return "work";
+  if (/^admin\/user\//.test(p)) return "admin/users";
+  if (/^admin\//.test(p)) return "admin";
+  if (/^(cards|operator|admin|stats|team)$/.test(p)) return "work";
   if (/^guide\//.test(p)) return "guides";
   if (p === "guides") return "profile";
   if (p === "sell") return "buy";
@@ -1270,7 +1854,6 @@ function parent(p) {
 }
 
 const path = () => (location.hash.startsWith("#/") ? decodeURIComponent(location.hash.slice(2)) : "");
-const isRoot = (p) => TABS.some(([t]) => t === p);
 
 function go(p, opts = {}) {
   const cur = path();
@@ -1284,42 +1867,73 @@ function go(p, opts = {}) {
 }
 
 function back() {
+  if (S.viewer) { closeViewer(); return; }
   if (S.sheet) { closeSheet(); return; }
   const p = path();
-  const prev = S.stack.length ? S.stack.pop() : parent(p);
+  let prev = S.stack.length ? S.stack.pop() : parent(p);
+  if (prev === p) prev = parent(p);
   history.replaceState(null, "", location.pathname + location.search + "#/" + prev);
   render();
 }
 
 function syncBack() {
   if (!tg || !tg.BackButton) return;
-  try { if (S.sheet || !isRoot(path())) tg.BackButton.show(); else tg.BackButton.hide(); } catch (e) { /* old client */ }
+  try { if (S.viewer || S.sheet || !isRoot(path())) tg.BackButton.show(); else tg.BackButton.hide(); } catch (e) { /* old client */ }
+}
+
+function counts() {
+  const m = S.me || {};
+  const unread = S.unreadTotal != null ? S.unreadTotal : (m.counts || {}).unread || 0;
+  return { deals: ((m.counts || {}).action || 0) + unread, orders: (m.work || {}).offers || 0, admin: (m.work || {}).disputes || 0 };
 }
 
 function setBadge(count) {
-  const b = $navIn.querySelector("[data-tab='deals'] .badge");
-  if (b) { b.textContent = count; b.hidden = !count; }
+  if (S.me) S.me.counts.action = count;
+  drawBadges();
 }
 
 function drawNav(p) {
   const tab = TAB_OF(p);
-  $navIn.innerHTML = TABS.map(([t, label, icon]) => `<button data-tab="${t}" class="${t === tab ? "on" : ""}">${ic(icon)}${label}${t === "deals" ? `<span class="badge" hidden></span>` : ""}</button>`).join("");
+  const k = counts();
+  $navIn.innerHTML = tabs().map(([t, label, icon]) => `<button data-tab="${t}" class="${t === tab ? "on" : ""}"><span class="pill">${ic(icon)}</span>${label}${k[t] ? `<span class="badge">${k[t]}</span>` : `<span class="badge" hidden></span>`}</button>`).join("");
   $nav.hidden = false;
   $navIn.querySelectorAll("[data-tab]").forEach((b) => { b.onclick = () => { haptic("select"); if (b.dataset.tab === tab && isRoot(p)) { window.scrollTo({ top: 0, behavior: "smooth" }); return; } go(b.dataset.tab); }; });
-  if (S.me) setBadge(S.me.counts.action);
+  drawSide(p);
   syncBack();
+}
+
+function drawSide(p) {
+  const r = roles(), k = counts();
+  const head = p.split("/")[0] || "";
+  const item = (to, label, icon, badge) => `<button data-side="${to}" class="${(to === head || (to === "admin" && head === "admin")) && !(to === "" && p !== "") ? "on" : ""}">${ic(icon)}${label}<span class="badge" ${badge ? "" : "hidden"}>${badge || ""}</span></button>`;
+  const mode = themeMode();
+  $side.innerHTML = `<div class="brand">${LOGO}Strait Pay</div>
+    ${item("", "Главная", "home")}${item("buy", "Обмен", "swap")}${item("deals", "Сделки", "deals", k.deals)}${item("history", "История", "clock")}
+    <div class="sub">Работа</div>
+    ${r.merchant === "approved" ? item("orders", "Заявки", "orders", k.orders) : ""}${item("cards", "Карты и смена", "card")}
+    ${r.operator ? item("operator", "Оператор", "shield") : ""}${r.team ? item("team", r.team.leader ? "Моя команда" : "Команда", "people") : ""}
+    ${r.admin ? item("admin", "Администрирование", "scale", k.admin) : ""}${item("stats", "Статистика", "chart")}
+    <div class="grow"></div>
+    ${item("guides", "Инструкции", "book")}${item("profile", "Профиль", "user")}
+    <button data-theme-cycle>${ic(mode === "dark" ? "moon" : mode === "light" ? "sun" : "auto")}Тема: ${mode === "dark" ? "тёмная" : mode === "light" ? "светлая" : "как в Telegram"}</button>`;
+  $side.querySelectorAll("[data-side]").forEach((b) => { b.onclick = () => go(b.dataset.side); });
+  const cyc = $side.querySelector("[data-theme-cycle]");
+  if (cyc) cyc.onclick = () => { setTheme({ auto: "light", light: "dark", dark: "auto" }[themeMode()]); drawSide(path()); };
 }
 
 async function render() {
   clearTimers();
   closeSheet(false);
+  closeViewer(false);
+  MB.clear();
   const t = ++S.seq;
   const p = path();
-  drawNav(p);
   const route = ROUTES.find(([re]) => re.test(p));
   if (!route) { go("", { replace: true }); return; }
+  document.body.classList.toggle("no-nav", route[2] === "chat");
+  drawNav(p);
   const c = { t, alive: () => t === S.seq && path() === p };
-  if (!S.keep) { $app.innerHTML = `<div class="screen">${SK[route[2]]()}</div>`; window.scrollTo(0, 0); }
+  if (!S.keep && route[2] !== "chat") { $app.innerHTML = `<div class="screen">${SK[route[2]]()}</div>`; window.scrollTo(0, 0); }
   try { await route[1](c, ...p.match(route[0]).slice(1)); }
   catch (e) { if (c.alive()) failView(c, e); }
   finally { if (t === S.seq) S.keep = false; }
@@ -1328,10 +1942,12 @@ async function render() {
 /* ---------- start ---------- */
 
 document.addEventListener("click", (e) => {
-  const t = e.target.closest("[data-go],[data-copy],[data-open]");
+  const t = e.target.closest("[data-go],[data-copy],[data-open],[data-back],[data-fs]");
   if (!t || t.disabled) return;
   if (t.dataset.copy !== undefined) { e.preventDefault(); copy(t.dataset.copy, t.dataset.what); return; }
   if (t.dataset.open) { e.preventDefault(); openUrl(t.dataset.open); return; }
+  if (t.dataset.back !== undefined) { e.preventDefault(); haptic("tap"); back(); return; }
+  if (t.dataset.fs !== undefined) { e.preventDefault(); haptic("tap"); fs.toggle(); return; }
   e.preventDefault();
   haptic("tap");
   closeSheet(false);
@@ -1340,24 +1956,52 @@ document.addEventListener("click", (e) => {
 window.addEventListener("hashchange", () => render());  // a link to #/… inside a page (our own moves do not fire it)
 window.addEventListener("error", (e) => report(e.error || e.message, "window"));
 window.addEventListener("unhandledrejection", (e) => { if (!(e.reason instanceof ApiError)) report(e.reason, "promise"); });
+window.addEventListener("keydown", (e) => { if (e.key === "Escape" && (S.viewer || S.sheet)) back(); });
+document.addEventListener("fullscreenchange", () => fs.sync());
+if (window.visualViewport) window.visualViewport.addEventListener("resize", syncHeight);
+document.addEventListener("visibilitychange", () => {  // back from the background: lists show what happened meanwhile
+  if (document.hidden || S.sheet || S.viewer) return;
+  const p = path();
+  const typing = document.activeElement && /INPUT|TEXTAREA/.test(document.activeElement.tagName);
+  if (!typing && /^(|deals|orders|operator|admin|deal\/\d+|team)$/.test(p)) { S.keep = true; render(); }
+});
+function netBanner() {
+  let b = document.getElementById("offline");
+  if (navigator.onLine) { if (b) b.remove(); return; }
+  if (!b) { b = document.createElement("div"); b.id = "offline"; b.className = "offline"; b.innerHTML = `${ic("alert")}Нет интернета — покажем свежие данные, как только связь вернётся`; document.body.appendChild(b); }
+}
+window.addEventListener("offline", netBanner);
+window.addEventListener("online", () => { netBanner(); toast("Связь восстановлена"); if (!S.sheet && !S.viewer) { S.keep = true; render(); } });
+window.addEventListener("resize", syncHeight);
 
 (function start() {
+  applyTheme();
+  syncHeight();
   if (!tg || !tg.initData) { gate("Откройте Strait Pay в Telegram — кнопкой «Открыть приложение» в боте."); return; }
   try { tg.ready(); tg.expand(); } catch (e) { /* old client */ }
   try {
-    tg.setHeaderColor("#f4f6f7");
-    tg.setBackgroundColor("#f4f6f7");
-    if (tg.isVersionAtLeast("7.10")) tg.setBottomBarColor("#ffffff");
     if (tg.isVersionAtLeast("7.7")) tg.disableVerticalSwipes();
+    tg.onEvent("themeChanged", applyTheme);
+    tg.onEvent("viewportChanged", syncHeight);
+    tg.onEvent("fullscreenChanged", () => fs.sync());
+    tg.onEvent("fullscreenFailed", () => toast("Полный экран недоступен в этой версии Telegram", true));
   } catch (e) { /* older clients */ }
   try { if (tg.BackButton) tg.BackButton.onClick(back); } catch (e) { /* old client */ }
-  // the start page: ?p=deal/5 from the bot's buttons, startapp=deal-5 from t.me links; a hash survives a reload
+  try { if (MB.ok()) tg.MainButton.onClick(() => MB.click()); } catch (e) { /* old client */ }
+  // the start page: ?p=deal/5 from the bot's buttons, startapp=deal-5 from t.me links; a hash survives a reload.
+  // Whatever page it is, the way out is there: «Назад» leads up to its section, «Главная» and the tabs anywhere.
   const fromQuery = new URLSearchParams(location.search).get("p");
   const fromLink = ((tg.initDataUnsafe && tg.initDataUnsafe.start_param) || "").replace(/-/g, "/");
   const fromHash = path();
   const first = [fromHash, fromQuery, fromLink].find((x) => x && ROUTES.some(([re]) => re.test(x))) || "";
-  if (first && !isRoot(first)) S.stack = [parent(first)];
-  history.replaceState(null, "", location.pathname + location.search + "#/" + first);
+  if (first && !isRoot(first)) {
+    const chain = [];
+    for (let q = parent(first); ; q = parent(q)) { chain.unshift(q); if (q === "" || chain.length > 4) break; }
+    S.stack = chain;
+  }
+  history.replaceState(null, "", location.pathname.replace(/\/$/, "") + "/#/" + first);
+  me().then(() => { drawNav(path()); return refreshUnread(); }).catch(() => {});
+  setInterval(refreshUnread, 20000);  // the deals tab shows new chat messages wherever the user is
   render();
   loadAvatar();
 })();

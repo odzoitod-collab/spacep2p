@@ -1,15 +1,17 @@
 """The platform's money at a glance: what it holds, what it owes users, what is profit and can be taken out.
 
-Assets:       USDT on the bot's hot wallet in TON (every withdrawal is paid from it) plus USDT that came to users'
-              personal addresses and are not collected to the hot wallet yet.
+Assets:       the USDT BEP-20 cash desk: the hot wallet (every withdrawal is paid from it, minus what it signed and
+              the chain has not settled), the cold wallet if set, and USDT on users' deposit addresses not collected
+              to the hot wallet yet.
 Liabilities:  users' available balances + team leaders' team balances + USDT frozen in deals + withdrawals debited
               but not paid yet.
 Operators:    USDT of Bybit-order deals arrive on the operators' Bybit accounts while the buyers are credited in the
-              bot: each operator owes them (services/operators.py) and repays to his debt address — a receivable, shown
+              bot: each operator owes them (services/operators.py) and repays from his balance — a receivable, shown
               separately and not counted in the assets until it is repaid.
 Free:         assets − liabilities. This is what the owner can take out without touching users' money; it already
               contains the profit.
 """
+import asyncio
 from dataclasses import dataclass
 from datetime import timedelta
 from decimal import Decimal
@@ -17,8 +19,8 @@ from decimal import Decimal
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from bot.models import Deal, Ledger, TonAddress, User, Withdrawal, now
-from bot.services import operators, ton
+from bot.models import Deal, Ledger, User, Withdrawal, now
+from bot.services import bsc, operators
 
 UNPAID = ("queued", "pending", "sending", "unknown", "sent")  # withdrawals debited from users, not paid out yet
 
@@ -40,12 +42,13 @@ class Snapshot:
     op_debt: Decimal = Decimal(0)  # operators owe for accepted Bybit orders, not repaid yet
     team_paid: Decimal = Decimal(0)  # paid to team leaders, all time
     users_team: Decimal = Decimal(0)  # team leaders' team balances, not moved to the main balance yet
-    unswept: Decimal = Decimal(0)  # USDT on users' personal addresses, not collected to the hot wallet yet
-    hot_ton: Decimal | None = None  # TON for fees on the hot wallet
+    unswept: Decimal = Decimal(0)  # USDT on users' deposit addresses, not collected to the hot wallet yet
+    bnb: Decimal | None = None  # BNB for fees on the hot wallet
+    cold: Decimal | None = None  # USDT on the cold wallet (BSC_COLD_ADDRESS)
 
     @property
     def assets(self) -> Decimal:
-        return (self.hot or Decimal(0)) + self.unswept
+        return (self.hot or Decimal(0)) + (self.cold or Decimal(0)) + self.unswept
 
     @property
     def liabilities(self) -> Decimal:
@@ -61,11 +64,13 @@ async def _sum(s: AsyncSession, expr, *where) -> Decimal:
 
 
 async def snapshot(s: AsyncSession) -> Snapshot:
-    try:
-        hot, hot_ton = await ton.hot_balances(max_age=60, timeout=5)
-        hot -= await ton.in_flight_usdt(s)  # sent, maybe not subtracted by the indexer yet
-    except Exception:  # noqa: BLE001 - shown as "unknown"
-        hot = hot_ton = None
+    hot = bnb = cold = None
+    if bsc.ready():
+        try:
+            d = await asyncio.wait_for(bsc.desk(s), 10)
+            hot, bnb, cold = d.usdt, d.bnb, d.cold
+        except Exception:  # noqa: BLE001 - shown as "unknown"
+            pass
     t = now()
     profit = {}
     for key, since in (("24h", t - timedelta(hours=24)), ("7d", t - timedelta(days=7)),
@@ -86,7 +91,7 @@ async def snapshot(s: AsyncSession) -> Snapshot:
     queued_n, queued = (await s.execute(select(func.count(Withdrawal.id), func.coalesce(
         func.sum(Withdrawal.amount - Withdrawal.fee), 0)).where(Withdrawal.status == "queued"))).one()
     return Snapshot(
-        hot=hot, hot_ton=hot_ton, unswept=await _sum(s, TonAddress.unswept),
+        hot=hot, bnb=bnb, cold=cold, unswept=await bsc.unswept(s),
         users_available=await _sum(s, User.balance), users_frozen=await _sum(s, User.frozen),
         users_team=await _sum(s, User.team_balance),
         unpaid=Decimal(unpaid), unpaid_n=unpaid_n, queued=Decimal(queued), queued_n=queued_n,

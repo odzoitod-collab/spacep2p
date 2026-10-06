@@ -330,8 +330,6 @@ async def list_orders(request: web.Request) -> web.Response:
 def _kind(data: bytes) -> str | None:
     if data[:1024].find(b"%PDF-") >= 0:
         return "pdf"
-    if settings.get("receipt_images") == "1" and (data[:3] == b"\xff\xd8\xff" or data[:8] == b"\x89PNG\r\n\x1a\n"):
-        return "image"
     return None
 
 
@@ -356,8 +354,7 @@ async def upload_receipt(request: web.Request) -> web.Response:
         raise ApiError(413, "file_too_large", f"Receipt must be at most {config.api_receipt_mb} MB")
     kind = _kind(data)
     if kind is None:
-        raise ApiError(422, "not_a_receipt", "Only PDF receipts from the bank app are accepted"
-                       + (" (or JPEG/PNG)" if settings.get("receipt_images") == "1" else ""))
+        raise ApiError(422, "not_a_receipt", "Only PDF receipts from the bank app are accepted")
     caption = f"Чек по API-заказу #{d.id} ({client.project}) — копия для вас"
     try:  # Telegram gives the file an id through a message: the copy goes to the token owner's own chat
         if kind == "pdf":

@@ -1,3 +1,4 @@
+import asyncio
 import re
 from contextlib import suppress
 from datetime import timedelta
@@ -15,13 +16,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from bot.services.admins import IsAdmin
 from bot.emoji import back, btn, kb, pe
 from bot.handlers.admin_deals import deal_view
-from bot.handlers.deal import STATUS, push, send_files, verdict_effects
+from bot.handlers.deal import push, send_files, status_of, verdict_effects
 from bot.handlers.seller import card_icon, card_label
 from bot.handlers.wallet import ledger_line, parse_usdt, withdraw_terms
 from bot.models import (Adjustment, ApiApplication, Card, Deal, Deposit, Event, Ledger, Operator, OrderMerchant, Signup,
-                        Team, Ticket, TonAddress, User, Withdrawal, now)
-from bot.services import admins, audit, deals, events, money, operators, orders, settings, teams, ton
-from bot.ui import alink, at, cf, esc, field, files_to, mention, notify, ok, quote, section, show, title, ulink, warn
+                        Team, Ticket, User, Withdrawal, now)
+from bot.services import admins, audit, bsc, deals, events, money, operators, orders, settings, teams
+from bot.ui import (alink, app_btn, at, cf, esc, field, files_to, mention, notify, ok, quote, section, show, title, ulink,
+                    warn)
 from bot.ui import card as fields
 
 router = Router()
@@ -54,103 +56,118 @@ async def cb_admin(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User, stat
     await admin_screen(bot, s, user, c)
 
 
-async def admin_screen(bot: Bot, s: AsyncSession, user: User, src=None, note: str = ""):
-    day = now() - timedelta(hours=24)
+async def _queues(s: AsyncSession) -> dict[str, int]:
+    """What waits for an admin, by section: the counts in the panel's buttons."""
     count = lambda *where: s.scalar(select(func.count()).where(*where))  # noqa: E731
-    users = await s.scalar(select(func.count(User.id)))
-    new_users = await count(User.created_at > day)
-    online = await count(User.is_online)
-    cards = await count(Card.is_active, ~Card.is_banned, ~Card.is_deleted)
+    return {
+        "disputes": await count(Deal.status == "dispute"),
+        "slow": await count(Deal.status == "paid",
+                            Deal.paid_at < now() - timedelta(minutes=settings.num("confirm_minutes"))),
+        "unknown": await count(Withdrawal.status.in_(("unknown", "pending"))),
+        "queued_wd": await count(Withdrawal.status == "queued", Withdrawal.method == "bsc"),
+        "tickets": await count(Ticket.status == "open"),
+        "approvals": await count(Adjustment.status == "pending"),
+        "api_apps": await count(ApiApplication.status == "pending"),
+        "om_apps": await count(OrderMerchant.status == "pending"),
+        "searching": await count(Deal.status.in_(orders.REQUEST)),
+        "free_orders": await count(Deal.status == "checking", Deal.operator_id.is_(None)),
+        "team_apps": await count(Team.status == "pending"),
+        "signups": await count(Signup.status == "pending"),
+        "backlog": await count(Event.alert, Event.sent_at.is_(None), Event.attempts < events.MAX_ATTEMPTS),
+    }
+
+
+async def _desk_line(s: AsyncSession, held: Decimal) -> tuple[str, str]:
+    """(the cash desk in one line, a warning if it cannot cover users' money or has no gas)."""
+    if not bsc.ready():
+        return "выключена" + (f" — {esc(bsc.error)}" if bsc.error else " (запускается)"), ""
+    try:
+        d = await asyncio.wait_for(bsc.desk(s), 4)
+    except Exception:  # noqa: BLE001 - the panel opens anyway
+        return "сеть не ответила", ""
+    warn_ = ""
+    if d.total < held:
+        warn_ += warn(f"В кассе на {money.usdt(held - d.total)} USDT меньше, чем на балансах пользователей: выводы могут "
+                      "ждать в очереди.")
+    if d.bnb < Decimal("0.003"):
+        warn_ += warn(f"Газа {d.bnb:.5f} BNB — пополните BNB на горячий кошелёк.")
+    return f"<b>{money.usdt(d.total)} USDT</b> · газ {d.bnb:.4f} BNB", warn_
+
+
+async def admin_screen(bot: Bot, s: AsyncSession, user: User, src=None, note: str = ""):
+    """Simple on purpose: what waits on top, today in three lines, five sections below."""
+    day = now() - timedelta(hours=24)
+    q = await _queues(s)
     done24, volume24 = (await s.execute(
         select(func.count(Deal.id), func.coalesce(func.sum(Deal.amount_rub), 0))
         .where(Deal.status == "completed", Deal.closed_at > day))).one()
-    opened = await count(Deal.status.in_(deals.OPEN))
-    disputes = await count(Deal.status == "dispute")
-    slow = await count(Deal.status == "paid",
-                       Deal.paid_at < now() - timedelta(minutes=settings.num("confirm_minutes")))
-    unknown = await count(Withdrawal.status.in_(("unknown", "pending")))
-    queued_wd = await count(Withdrawal.status == "queued", Withdrawal.method == "ton")
-    tickets = await count(Ticket.status == "open")
-    approvals = await count(Adjustment.status == "pending")
-    api_apps = await count(ApiApplication.status == "pending")
-    om_apps = await count(OrderMerchant.status == "pending")
-    om_working = await count(OrderMerchant.status == "approved")
-    searching = await count(Deal.status.in_(orders.REQUEST))
-    free_orders = await count(Deal.status == "checking", Deal.operator_id.is_(None))
-    team_apps = await count(Team.status == "pending")
-    teams_working = await count(Team.status == "approved")
-    signups = await count(Signup.status == "pending")
-    op_debt = await operators.total_debt(s)
-    backlog = await count(Event.alert, Event.sent_at.is_(None), Event.attempts < events.MAX_ATTEMPTS)
     income24 = await s.scalar(select(func.coalesce(func.sum(Ledger.delta), 0))
                               .where(Ledger.user_id.is_(None), Ledger.created_at > day))
-    income = await s.scalar(select(func.coalesce(func.sum(Ledger.delta), 0)).where(Ledger.user_id.is_(None)))
+    new_users = await s.scalar(select(func.count()).where(User.created_at > day))
     held = Decimal(await s.scalar(select(func.coalesce(func.sum(User.balance + User.frozen + User.team_balance), 0))))
-    solvency = ""
-    unswept = Decimal(await s.scalar(select(func.coalesce(func.sum(TonAddress.unswept), 0))))
-    try:
-        available, gas = await ton.hot_balances(max_age=60, timeout=3)
-        wallet = f"<b>{money.usdt(available)} USDT</b> · газ {money.fmt(gas, 4)} TON" + (
-            f" · не собрано {money.usdt(unswept)} USDT" if unswept else "")
-        if available + unswept < held:
-            solvency = warn(f"На кошельках TON на {money.usdt(held - available - unswept)} USDT меньше, чем на балансах "
-                            "пользователей: выводы могут ждать в очереди.")
-        if gas < ton.HOT_LOW:
-            solvency += warn(f"Газа на горячем кошельке {money.fmt(gas, 4)} TON — пополните TON.")
-    except Exception:
-        wallet = "нет ответа" if ton.enabled() else "выключен (TON_SEED не задан)"
-    todo = [(signups, f"<b>Заявок на вход:</b> {signups}"),
-            (disputes, f"<b>Споров:</b> {disputes}"),
-            (slow, f"<b>Продавец молчит дольше {settings.get('confirm_minutes')} мин:</b> {slow}"),
-            (unknown, f"<b>Выводов на проверке:</b> {unknown}"),
-            (free_orders, f"<b>Bybit-ордеров ждут оператора:</b> {free_orders}"),
-            (tickets, f"<b>Открытых обращений:</b> {tickets}"),
-            (approvals, f"<b>Корректировок ждут второго админа:</b> {approvals}"),
-            (api_apps, f"<b>Заявок на API:</b> {api_apps}"),
-            (om_apps, f"<b>Анкет ордерных мерчантов:</b> {om_apps}"),
-            (team_apps, f"<b>Заявок на команды:</b> {team_apps}"),
-            (searching, f"<b>Ордерных заявок ищут реквизиты:</b> {searching}"),
-            (backlog, f"<b>Недоставленных уведомлений:</b> {backlog}")]
+    desk, solvency = await _desk_line(s, held)
+    todo = [(q["disputes"], f"Споры: <b>{q['disputes']}</b>"),
+            (q["unknown"], f"Выводы на проверке: <b>{q['unknown']}</b>"),
+            (q["signups"], f"Заявки на вход: <b>{q['signups']}</b>"),
+            (q["slow"], f"Продавец молчит дольше {settings.get('confirm_minutes')} мин: <b>{q['slow']}</b>"),
+            (q["free_orders"], f"Bybit-ордера ждут оператора: <b>{q['free_orders']}</b>"),
+            (q["tickets"], f"Обращения: <b>{q['tickets']}</b>"),
+            (q["approvals"], f"Корректировки ждут подтверждения: <b>{q['approvals']}</b>"),
+            (q["om_apps"] + q["team_apps"] + q["api_apps"],
+             f"Анкеты (мерчанты, команды, API): <b>{q['om_apps'] + q['team_apps'] + q['api_apps']}</b>"),
+            (q["queued_wd"], f"Выводы ждут денег в кассе: <b>{q['queued_wd']}</b>"),
+            (q["backlog"], f"Недоставленные уведомления: <b>{q['backlog']}</b>")]
     active = [line for n, line in todo if n]
+    people = q["signups"] + q["om_apps"] + q["team_apps"] + q["free_orders"]
     await show(bot, user, "\n".join([
         title(pe("settings"), "Админ-панель") + f" · {admins.role(user.id)}",
         "",
-        section("bell", "Требует внимания"),
-        "\n".join(active) if active else "<i>Очереди пусты — всё обработано.</i>",
+        section("bell", "Ждёт решения"),
+        quote(*active) if active else f"{pe('ok')} <i>Всё обработано</i>",
         "",
         section("stats", "За 24 часа"),
-        f"<b>Сделок:</b> {done24} на {money.fmt(Decimal(volume24))} ₽ · открыто сейчас {opened}",
-        f"<b>Доход площадки:</b> +{money.usdt(Decimal(income24))} USDT · всего {money.usdt(Decimal(income))} USDT",
-        f"<b>Новых пользователей:</b> {new_users} · всего {users}",
-        "",
-        section("people", "Люди"),
-        f"<b>На смене:</b> {online} · карт в работе {cards}",
-        f"<b>Ордерных мерчантов:</b> {om_working} · операторов {len(await operators.ids(s))} · команд {teams_working}",
-        f"<b>Администраторов:</b> {len(admins.ids())}",
-        "",
-        section("wallet", "Деньги"),
-        f"<b>Балансы пользователей:</b> {money.usdt(held)} USDT",
-        f"<b>Горячий кошелёк TON:</b> {wallet}",
-        f"<b>Долг операторов (Bybit):</b> {money.usdt(op_debt)} USDT" if op_debt else "",
-        "",
-        section("support", "Админ-чат"),
-        await _admin_chat_line(bot),
-    ]).replace("\n\n\n", "\n\n") + solvency + note, kb(
-        # what is urgent stands out on top; everything else is one button per section, its queue in the label
-        btn(f"Споры · {disputes}", "adl:dispute", "flag", style="danger") if disputes else None,
-        btn(f"Выводы на проверке · {unknown}", "awl:check", "up", style="danger") if unknown else None,
-        [btn(_n("Заявки на вход", signups), "asu", "pencil"), btn(_n("Сделки", slow + searching), "ad", "list")],
-        [btn("Найти", "au", "search"), btn(_n("Обращения", tickets), "atl", "support")],
-        [btn(_n("Мерчанты", om_apps), "aoml", "key"), btn(_n("Операторы", free_orders), "aopl", "shop")],
-        [btn(_n("Команды", team_apps), "atml", "people"), btn(_n("API", api_apps), "aapi", "key")],
-        [btn("Финансы", "afin", "stats"), btn(_n("TON-кошелёк", queued_wd), "aton", "wallet")],
-        [btn(_n("Корректировки", approvals), "aadjl", "dollar"), btn("Балансы", "bal:p:0", "wallet")],
-        btn("Карты", "ac:0", "card"),
-        [btn("Комиссии", "acm", "percent"), btn("Настройки", "as", "settings")],
-        [btn("Чат и канал", "ach", "people"), btn("Администраторы", "aadm", "lock")],
-        [btn("Журнал", "aa", "list"), btn("Отчёты CSV", "arp", "doc")],
+        f"Сделок <b>{done24}</b> на {money.fmt(Decimal(volume24))} ₽ · доход <b>+{money.usdt(Decimal(income24))}</b> "
+        f"USDT · новых {new_users}",
+        f"Касса BEP-20: {desk}",
+        f"Админ-чат: {await _admin_chat_line(bot)}",
+    ]) + solvency + note, kb(
+        btn(f"Споры · {q['disputes']}", "adl:dispute", "flag", style="danger") if q["disputes"] else None,
+        btn(f"Выводы на проверке · {q['unknown']}", "awl:check", "up", style="danger") if q["unknown"] else None,
+        btn(f"Заявки на вход · {q['signups']}", "asu", "pencil", style="primary") if q["signups"] else None,
+        [btn("Найти", "au", "search"), btn(_n("Сделки", q["slow"] + q["searching"]), "ad", "list")],
+        [btn(_n("Люди", people), "a:people", "people"), btn(_n("Деньги", q["approvals"] + q["queued_wd"]), "a:money",
+                                                              "wallet")],
+        [btn(_n("Обращения", q["tickets"]), "atl", "support"), btn("Настройки", "a:more", "settings")],
+        app_btn("Админка в приложении", "admin", "settings", style="primary", wide=True),
         back("menu", "В меню"),
     ), src)
+
+
+@router.callback_query(F.data.in_({"a:people", "a:money", "a:more"}))
+async def cb_admin_section(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User, state: FSMContext):
+    """The panel's sections: every admin screen two taps from the panel."""
+    await state.set_state(None)
+    q = await _queues(s)
+    part = c.data.split(":")[1]
+    if part == "people":
+        head, about, rows = "Люди", "Пользователи, мерчанты (рейтинг — в карточке мерчанта), операторы, команды.", [
+            [btn(_n("Заявки на вход", q["signups"]), "asu", "pencil"), btn("Найти человека", "au", "search")],
+            [btn(_n("Мерчанты и рейтинг", q["om_apps"]), "aoml", "star"), btn(_n("Операторы", q["free_orders"]),
+                                                                            "aopl", "shop")],
+            [btn(_n("Команды", q["team_apps"]), "atml", "people"), btn("Карты", "ac:0", "card")],
+            btn("Администраторы", "aadm", "lock")]
+    elif part == "money":
+        head, about, rows = "Деньги", "Касса, балансы, корректировки — без подтверждения второго админа для владельцев.", [
+            btn(_n("Касса BEP-20", q["queued_wd"]), "acash", "wallet", style="primary"),
+            [btn("Балансы", "bal:p:0", "dollar"), btn(_n("Корректировки", q["approvals"]), "aadjl", "pencil")],
+            [btn("Пополнения и выводы", "al", "list"), btn("Финансы", "afin", "stats")],
+            [btn("Комиссии", "acm", "percent"), btn("Отчёты CSV", "arp", "doc")]]
+    else:
+        head, about, rows = "Настройки", "Правила, тексты, чат сообщества, API и журнал действий.", [
+            [btn("Все настройки", "as", "settings"), btn("Чат и канал", "ach", "people")],
+            [btn(_n("API", q["api_apps"]), "aapi", "key"), btn("Журнал", "aa", "list")]]
+    await show(bot, user, "\n".join([title(pe("settings"), head), "", about]),
+               kb(*rows, back("a", "Админ-панель")), c)
 
 
 def _n(label: str, n: int) -> str:
@@ -177,11 +194,10 @@ async def _admin_chat_line(bot: Bot) -> str:
 SETTING_ICONS = ["percent", "clock", "wallet", "lock", "info", "key"]  # one per settings.GROUPS section
 # short names for the overview: every setting in one line of its section
 SHORT = {"rate": "курс", "order_rate": "ордер", "seller_pct": "карта", "platform_pct": "площадка",
-         "deposit_fee": "пополнение", "withdraw_pct": "вывод", "chain_withdraw_fee": "вывод +",
+         "bsc_withdraw_fee": "вывод", "bsc_withdraw_min": "вывод от",
          "team_pct": "тимлиду", "deal_minutes": "оплата", "buyer_max_open": "сделок сразу", "confirm_minutes": "спор через",
          "escalate_minutes": "автоспор", "late_hold_minutes": "залог", "late_minutes": "поздний чек",
-         "online_minutes": "смена", "deposit_min": "пополнение от",
-         "chain_withdraw_min": "вывод от", "ton_sweep_min": "сбор от", "adjust_approval_usdt": "второй админ от", "withdraw_turnover": "прокрутка", "receipt_images": "чеки",
+         "online_minutes": "смена", "adjust_approval_usdt": "второй админ от", "withdraw_turnover": "прокрутка",
          "log_all": "лог", "signup_review": "вход", "join_required": "чат и канал", "support": "поддержка", "manager": "менеджер",
          "tutorial": "о сервисе", "manual_url": "памятка", "docs_url": "инструкции", "chat_id": "чат",
          "channel_id": "канал", "channel_autopost_hours": "автопост", "order_min_rub": "от", "order_max_rub": "до", "order_search_minutes": "поиск",
@@ -301,7 +317,7 @@ async def msg_setting(m: Message, bot: Bot, s: AsyncSession, user: User, state: 
     audit.log(s, user.id, "setting", key, f"{old} → {value}"[:2000])
     if key == "chat_id":
         events.add(s, "app:chat", "chat_changed", f"Чат сообщества: {old or '—'} → {value or 'отключён'} "
-                   f"({user.name}, {user.id})", user.id, alert=True)
+                   f"({user.name}, {user.id})", user.id, notice=True)
     if key in ("chat_id", "channel_id") and old != value:  # another chat: who is in it is checked again
         from bot.handlers.community import forget_channel_link
         await s.execute(sql_update(User).values(**{"in_chat" if key == "chat_id" else "in_channel": False}))
@@ -351,8 +367,8 @@ async def commissions_screen(bot: Bot, s: AsyncSession, admin: User, src=None, n
               f"(карта) или {money.usdt(qo.platform_fee)} USDT (ордер: мерчант отдаёт {money.usdt(qo.seller_debit)})"),
         "",
         section("wallet", "Кошелёк"),
-        field("Пополнение", f"{settings.get('deposit_fee')}% (погашение долга оператора — без комиссии)"),
-        field("Вывод", f"{withdraw_terms()} — фикс. часть покрывает газ сети TON (его платит горячий кошелёк)"),
+        field("Пополнение", "без комиссии (USDT BEP-20 на личный адрес)"),
+        field("Вывод", f"{withdraw_terms()} фиксом — покрывает газ в BNB (его платит горячий кошелёк)"),
         "",
         section("people", "Команды"),
         field("Тимлиду", f"<b>{settings.get('team_pct')}%</b> от сделок участников (из дохода площадки, не больше него)"),
@@ -371,8 +387,7 @@ async def commissions_screen(bot: Bot, s: AsyncSession, admin: User, src=None, n
     ]) + note, kb(
         [btn("Покупатель", "acs:platform_pct", "dollar"), btn("Курс", "acs:rate", "swap")],
         [btn("Мерчант: карта", "acs:seller_pct", "card"), btn("Курс ордерного", "acs:order_rate", "key")],
-        [btn("Пополнение", "acs:deposit_fee", "down"), btn("Вывод, %", "acs:withdraw_pct", "up")],
-        btn("Вывод, фикс", "acs:chain_withdraw_fee", "up"),
+        [btn("Вывод, комиссия", "acs:bsc_withdraw_fee", "up"), btn("Вывод, минимум", "acs:bsc_withdraw_min", "up")],
         btn("Процент тимлида", "acs:team_pct", "people"),
         *[btn(f"Личная ставка · {u.id} {(u.name or '')[:16]}", f"aup:{u.id}", "star") for u in personal],
         *[btn(f"Покупатель · {u.id} {(u.name or '')[:16]}", f"aut:{u.id}", "star") for u in buyers],
@@ -441,7 +456,7 @@ async def msg_user_pct(m: Message, bot: Bot, s: AsyncSession, user: User, state:
     old, u.pct_static = u.pct_static, value
     audit.log(s, user.id, "merchant_pct", f"user:{u.id}", f"pct_static: {old} → {value}")
     events.add(s, f"user:{u.id}", "pct", f"Личная ставка по статичной карте: {old if old is not None else 'общая'} → "
-               f"{value if value is not None else 'общая'} ({user.name})", u.id, alert=True)
+               f"{value if value is not None else 'общая'} ({user.name})", u.id, notice=True)
     await notify(bot, u.id, f"{pe('star')} <b>Ваш процент по статичной карте: {money.fmt(settings.merchant_pct(u), 3)}%</b>"
                             " — действует для новых сделок.")
     await show(bot, user, _pct_text(u) + ok("Сохранено"), _pct_kb(u))
@@ -452,7 +467,7 @@ async def cb_user_pct_reset(c: CallbackQuery, bot: Bot, s: AsyncSession, user: U
     u = await s.get(User, int(c.data.split(":")[2]))
     u.pct_static = None
     audit.log(s, user.id, "merchant_pct", f"user:{u.id}", "reset")
-    events.add(s, f"user:{u.id}", "pct", f"Личная ставка сброшена на общую ({user.name})", u.id, alert=True)
+    events.add(s, f"user:{u.id}", "pct", f"Личная ставка сброшена на общую ({user.name})", u.id, notice=True)
     await notify(bot, u.id, f"{pe('star')} Ваш процент по статичной карте вернулся к общему: "
                             f"{money.fmt(settings.merchant_pct(u), 3)}%.")
     await show(bot, user, _pct_text(u) + ok("Сброшено на общую"), _pct_kb(u), c)
@@ -605,6 +620,7 @@ async def user_screen(bot: Bot, s: AsyncSession, admin: User, u: User, src=None,
             cf("Кто", f"{mention(u)}" + (f" · @{esc(u.username)}" if u.username else "") + f" · <code>{u.id}</code>",
                icon="profile"),
             cf("Роли", *roles, icon="lock"),
+            cf("Рейтинг мерчанта", *await orders.rep_text(s, u.id), icon="star") if om or u.rating is not None else "",
             cf("Баланс", f"доступно <b>{money.usdt(u.balance)} USDT</b> · заморожено {money.usdt(u.frozen)}",
                f"командный {money.usdt(u.team_balance)} USDT" if u.team_balance else "",
                f"не прокручено пополнений {money.usdt(u.deposit_lock)} USDT · вывести можно "
@@ -636,6 +652,8 @@ async def user_screen(bot: Bot, s: AsyncSession, admin: User, u: User, src=None,
         [btn("Карты", f"auc:{u.id}", "card"), btn("Ввод и вывод", f"auw:{u.id}", "wallet")],
         [btn("История", f"aev:user:{u.id}", "list"),
          btn("Мерчант", f"aom:{u.id}", "key") if om and om.status != "rejected" else None],
+        btn("Рейтинг" + (f" · {money.fmt(u.rating, 1)} вручную" if u.rating is not None else ""), f"art:{u.id}:u",
+            "star"),
         [btn("Написать", f"dm:0:{u.id}", "support"), btn("Баланс", f"bal:u:{u.id}", "dollar")],
         [btn("Ставка мерчанта" + (" · своя" if u.pct_static is not None else ""), f"aup:{u.id}", "star"),
          btn("Условия покупки" + (" · свои" if settings.has_terms(u) else ""), f"aut:{u.id}", "star")],
@@ -685,13 +703,19 @@ async def cb_ban_ask(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User):
 @router.callback_query(F.data.regexp(r"^(aub2:\d+|aub:\d+:0)$"))
 async def cb_ban(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User):
     parts = c.data.split(":")
-    banning = parts[0] == "aub2"
-    uid = int(parts[1])
+    u, result = await set_ban(bot, s, user, int(parts[1]), parts[0] == "aub2")
+    if u is None:
+        return await c.answer(result, show_alert=True)
+    await user_screen(bot, s, user, u, c, ok(result))
+
+
+async def set_ban(bot: Bot, s: AsyncSession, user: User, uid: int, banning: bool) -> tuple[User | None, str]:
+    """Ban or unban (the bot and the mini app alike): (user, what happened) or (None, why not). Commits, notifies."""
     u = await money.lock(s, uid) if await s.get(User, uid) else None
     if not u or admins.is_admin(u.id):
-        return await c.answer("Нельзя", show_alert=True)
+        return None, "Нельзя"
     if u.is_banned == banning:  # explicit target state: repeated or concurrent clicks are no-ops
-        return await user_screen(bot, s, user, u, c, ok("Уже " + ("заблокирован" if banning else "разблокирован")))
+        return u, "Уже " + ("заблокирован" if banning else "разблокирован")
     u.is_banned = banning
     cancelled, disputed = [], []
     if banning:
@@ -705,7 +729,7 @@ async def cb_ban(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User):
               f"cancelled={[d.id for d in cancelled]} disputed={[d.id for d in disputed]}")
     events.add(s, f"user:{uid}", "ban" if banning else "unban",
                (f"Заблокирован ({user.name}): отменено сделок {len(cancelled)}, в спор {len(disputed)}"
-                if banning else f"Разблокирован ({user.name})"), uid, alert=True)
+                if banning else f"Разблокирован ({user.name})"), uid, notice=True)
     await s.commit()
     sup = settings.get("support")
     await notify(bot, u.id, f"{pe('ban')} <b>Ваш аккаунт заблокирован.</b> Баланс сохранён."
@@ -716,8 +740,8 @@ async def cb_ban(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User):
         await push(bot, s, other, d, f"Сделка #{d.id} отменена: участник заблокирован. Не переводите деньги по ней")
     for d in disputed:
         await push(bot, s, d.buyer_id, d, f"Сделка #{d.id} передана администрации: продавец заблокирован")
-    await user_screen(bot, s, user, u, c, ok(
-        f"Заблокирован. Отменено сделок: {len(cancelled)}, в спор: {len(disputed)}" if banning else "Разблокирован"))
+    return u, (f"Заблокирован. Отменено сделок: {len(cancelled)}, в спор: {len(disputed)}" if banning
+               else "Разблокирован")
 
 
 @router.callback_query(F.data.regexp(r"^aul:(\d+)$"))
@@ -727,7 +751,7 @@ async def cb_unlock(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User):
     was, u.deposit_lock = u.deposit_lock, Decimal(0)
     audit.log(s, user.id, "deposit_unlock", f"user:{u.id}", f"{was} USDT")
     events.add(s, f"user:{u.id}", "unlock", f"Снято ограничение вывода на {money.usdt(was)} USDT ({user.name})",
-               u.id, alert=True)
+               u.id, notice=True)
     await s.commit()
     await user_screen(bot, s, user, u, c, ok(f"Ограничение снято: вывести можно {money.usdt(u.balance)} USDT"))
 
@@ -770,8 +794,8 @@ async def _deal_list(bot, s, user, c, uid: int, heading: str, where):
                             .order_by(Deal.id.desc()).limit(20))).all()
     await show(bot, user, f"{title(pe('fire'), heading)} · <code>{uid}</code>\n↓ — покупка, ↑ — продажа"
                + ("" if rows else "\n\nПусто"), kb(
-        *[btn(f"{'↓' if d.buyer_id == uid else '↑'} #{d.id} · {money.fmt(d.amount_rub)} ₽ · {STATUS[d.status][1]}",
-              f"adv:{d.id}", STATUS[d.status][0]) for d in rows],
+        *[btn(f"{'↓' if d.buyer_id == uid else '↑'} #{d.id} · {money.fmt(d.amount_rub)} ₽ · {status_of(d)[1]}",
+              f"adv:{d.id}", status_of(d)[0]) for d in rows],
         back(f"auv:{uid}", "Профиль"),
     ), c)
 
@@ -818,7 +842,8 @@ async def cb_adjust_menu(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User
         quote(f"{pe('dollar')} Доступно: <b>{money.usdt(u.balance)} USDT</b>",
               f"{pe('lock')} Заморожено: {money.usdt(u.frozen)} USDT — меняется только через сделки"),
         "Списать можно только доступный баланс. Каждая корректировка получает номер и попадает в журнал.",
-        f"От {money.usdt(limit)} USDT нужно подтверждение второго администратора." if limit > 0 else None,
+        f"От {money.usdt(limit)} USDT нужно подтверждение второго администратора."
+        if limit > 0 and not admins.is_owner(user.id) else None,
     ] if line is not None), kb(
         [btn("Начислить", f"aum:{u.id}:+", "plus", style="success"), btn("Списать", f"aum:{u.id}:-", "down", style="danger")],
         *[btn(f"#{a.id} · {'+' if a.delta > 0 else ''}{money.usdt(a.delta)} · {ADJ_STATUS[a.status]}", f"adjv:{a.id}", "doc")
@@ -959,8 +984,8 @@ async def apply_adjustment(s: AsyncSession, adj_id: int, admin: User, quiet: boo
         if a.admin_id != admin.id:
             return "not_owner", a
         limit = settings.dec("adjust_approval_usdt")
-        # own balance: always a second admin, whatever the amount
-        if a.user_id == admin.id or (limit > 0 and abs(a.delta) >= limit):
+        # an owner's word is final; an admin's own balance always needs a second admin, big sums too
+        if not admins.is_owner(admin.id) and (a.user_id == admin.id or (limit > 0 and abs(a.delta) >= limit)):
             a.status = "pending"
             events.add(s, ref, "pending", f"{money.usdt(a.delta)} USDT для {a.user_id} ждёт второго администратора "
                                           f"({_adj_reason(a)})", a.user_id, alert=True)
@@ -1151,9 +1176,9 @@ async def cb_deal_list(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User):
             "slow": "Чек загружен, продавец не ответил. Можно написать продавцу из карточки сделки."}.get(kind, "")
     await show(bot, user, title(pe("list"), names[kind]) + (f"\n{hint}" if rows and hint else "")
                + ("" if rows else f"\n\n{pe('ok')} Пусто — всё обработано"), kb(
-        *[btn(f"#{d.id} · {money.fmt(d.amount_rub)} ₽ · {STATUS[d.status][1]}"
+        *[btn(f"#{d.id} · {money.fmt(d.amount_rub)} ₽ · {status_of(d)[1]}"
               + (f" · {ago(d.paid_at)}" if d.paid_at and d.status in ("paid", "dispute") else ""),
-              f"adv:{d.id}", STATUS[d.status][0]) for d in rows],
+              f"adv:{d.id}", status_of(d)[0]) for d in rows],
         back("ad", "Сделки"),
     ), c)
 

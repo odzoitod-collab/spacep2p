@@ -2,6 +2,7 @@
 request, the Bybit link, disputes with evidence and files, the admin's verdict, the operator's score of the merchant;
 plus the user's avatar and the page's own error log. Every action is the bot's own function (handlers.orders, deal,
 admin), so the bot and the app follow one set of rules and tell the same people the same things."""
+import asyncio
 import base64
 import logging
 import time
@@ -14,9 +15,9 @@ from aiohttp import web
 from sqlalchemy import func, select
 
 from bot.api.webapp import AppError, body, ctx, deal_json, deal_of, deal_response, iso, num
-from bot.models import (Adjustment, Deal, Ledger, MerchantRating, Operator, OrderMerchant, Signup, Ticket, TonAddress,
+from bot.models import (Adjustment, Deal, Ledger, MerchantRating, Operator, OrderMerchant, Signup, Ticket,
                         User, Withdrawal, now)
-from bot.services import admins, deals, money, operators, orders, settings, ton
+from bot.services import admins, bsc, deals, money, operators, orders, settings
 
 log = logging.getLogger(__name__)
 UPLOAD_MB = 10  # one evidence file from the app (bigger videos: through the bot)
@@ -98,12 +99,13 @@ async def merchant(request: web.Request) -> web.Response:
                       "success": st["success"]}
     working = (await s.scalars(select(Deal).where(Deal.seller_id == user.id, Deal.is_order,
                                                   Deal.status.in_(deals.FUNDED)).order_by(Deal.id))).all()
-    active = m.status == "approved" and not orders.asleep(m)
+    active = m.status == "approved" and not orders.asleep(m) and not m.offline
     free = (await s.scalars(select(Deal).where(Deal.status == "searching", Deal.buyer_id != user.id,
                                                Deal.expires_at >= now()).order_by(Deal.id).limit(30))).all() \
         if active else []
     return web.json_response({
         "status": m.status, "asleep": orders.asleep(m), "sleep_until": iso(m.sleep_until), "strikes": m.strikes,
+        "online": not m.offline,
         "pay_minutes": m.pay_minutes, "pay_choices": orders.pay_choices(), "terms": terms,
         "reputation": {"score": num(rep.quantize(Decimal("0.1"))) if rep is not None else None, "rated": rated,
                        "line": orders.rep_line(rep, rated)},
@@ -119,9 +121,15 @@ async def merchant(request: web.Request) -> web.Response:
 async def merchant_settings(request: web.Request) -> web.Response:
     s, user, _ = ctx(request)
     m = await s.get(OrderMerchant, user.id)
-    minutes = (await body(request)).get("pay_minutes")
+    data = await body(request)
     if m is None or m.status != "approved":
         raise AppError(403, "not_merchant", "Только для ордерных мерчантов")
+    if "online" in data:  # leaves the line or comes back: requests stop / start reaching him
+        if not isinstance(data["online"], bool):
+            raise AppError(422, "bad_request", "online: true или false")
+        m.offline = not data["online"]
+        return await merchant(request)
+    minutes = data.get("pay_minutes")
     if not isinstance(minutes, int) or minutes not in orders.pay_choices():
         raise AppError(422, "bad_minutes", "Выберите время из списка")
     m.pay_minutes = minutes
@@ -340,21 +348,27 @@ async def may_see_file(s, d: Deal, uid: int, n: str) -> bool:
 
 
 async def file_get(request: web.Request) -> web.Response:
-    """A photo or a video of a deal, streamed from Telegram for the page (documents go to the chat instead)."""
+    """A photo, a video or a PDF of a deal, streamed from Telegram for the page (other documents go to the chat)."""
     s, user, bot = ctx(request)
     d = await deal_of(request)
     n = request.match_info["n"]
     if not await may_see_file(s, d, user.id, n):
         raise AppError(403, "forbidden", "Файл недоступен")
     kind, fid = _file_item(d, n)
-    if kind not in ("photo", "video"):
+    if kind not in ("photo", "video", "document"):
         raise AppError(415, "send", "Этот файл откроется в чате с ботом")
     try:
         buf = await bot.download(fid)
     except TelegramAPIError:
         raise AppError(502, "too_big", "Файл не загрузить в приложение — отправим его в чат")
-    return web.Response(body=buf.read(), content_type="image/jpeg" if kind == "photo" else "video/mp4",
-                        headers={"Cache-Control": "private, max-age=3600"})
+    data = buf.read()
+    if kind == "document":
+        if b"%PDF-" not in data[:1024]:
+            raise AppError(415, "send", "Этот файл откроется в чате с ботом")
+        ctype = "application/pdf"
+    else:
+        ctype = "image/jpeg" if kind == "photo" else "video/mp4"
+    return web.Response(body=data, content_type=ctype, headers={"Cache-Control": "private, max-age=3600"})
 
 
 async def file_send(request: web.Request) -> web.Response:
@@ -426,17 +440,17 @@ async def admin_home(request: web.Request) -> web.Response:
     income24 = await s.scalar(select(func.coalesce(func.sum(Ledger.delta), 0))
                               .where(Ledger.user_id.is_(None), Ledger.created_at > day))
     held = await s.scalar(select(func.coalesce(func.sum(User.balance + User.frozen + User.team_balance), 0)))
-    hot = None
-    if ton.chain is not None:
+    hot, unswept = None, await bsc.unswept(s) if bsc.ready() else Decimal(0)
+    if bsc.ready():
         try:
-            usdt, gas = await ton.hot_balances(max_age=60, timeout=3)
-            hot = {"usdt": num(usdt), "ton": num(gas.quantize(Decimal("0.0001"))),
-                   "address": ton.friendly(ton.hot_address()), "low": gas < ton.HOT_LOW}
+            d = await asyncio.wait_for(bsc.desk(s), 4)
+            hot = {"usdt": num(d.usdt), "bnb": num(d.bnb.quantize(Decimal("0.0001"))), "address": bsc.hot,
+                   "low": d.bnb < Decimal("0.003")}
         except Exception:  # noqa: BLE001 - shown as "no answer"
             hot = {"error": True}
     return web.json_response({
         "counts": {"disputes": len(disputes), "slow": len(slow), "unknown_wd": len(unknown),
-                   "queued_wd": await count(Withdrawal.status == "queued", Withdrawal.method == "ton"),
+                   "queued_wd": await count(Withdrawal.status == "queued", Withdrawal.method == "bsc"),
                    "free_orders": await count(Deal.status == "checking", Deal.operator_id.is_(None)),
                    "searching": await count(Deal.status == "searching"),
                    "open": await count(Deal.status.in_(deals.OPEN)),
@@ -445,7 +459,7 @@ async def admin_home(request: web.Request) -> web.Response:
                    "adjustments": await count(Adjustment.status == "pending")},
         "day": {"deals": done24, "rub": num(Decimal(volume24)), "income": num(Decimal(income24))},
         "money": {"users": num(Decimal(held)), "op_debt": num(await operators.total_debt(s)), "hot": hot,
-                  "unswept": num(Decimal(await s.scalar(select(func.coalesce(func.sum(TonAddress.unswept), 0)))))},
+                  "unswept": num(unswept)},
         "disputes": [deal_json(d, None, user.id, full=False) | {"paid_at": iso(d.paid_at)} for d in disputes],
         "slow": [deal_json(d, None, user.id, full=False) | {"paid_at": iso(d.paid_at)} for d in slow],
         "withdrawals": [{"id": w.id, "user_id": w.user_id, "amount": num(w.amount - w.fee), "address": w.address,
@@ -554,6 +568,231 @@ async def client_log(request: web.Request) -> web.Response:
     return web.json_response({"ok": True})
 
 
+# ---------- a team: the leader's cabinet, a member's view ----------
+
+async def team_view(request: web.Request) -> web.Response:
+    from bot.ui import deep_link
+    from bot.services import teams
+    s, user, bot = ctx(request)
+    team = await teams.of_user(s, user)
+    if team is None:
+        raise AppError(404, "no_team", "Вы не в команде")
+    leader = team.leader_id == user.id
+    out = {"id": team.id, "name": team.name, "status": team.status, "leader": leader,
+           "pct": num(teams.pct(team)), "members": await teams.members(s, team)}
+    if leader:
+        out["link"] = await deep_link(bot, f"t{team.id}")
+        out["balance"] = num(user.team_balance)
+        out["chat"] = bool(team.chat_id)
+        for key, since in (("today", deals.day_start()), ("week", now() - timedelta(days=7)), ("all", None)):
+            n, rub, fee = await teams.stats(s, team, since)
+            out[key] = {"n": n, "rub": num(rub), "income": num(fee.quantize(money.Q))}
+        rows = (await s.scalars(select(User).where(User.team_id == team.id, User.id != team.leader_id)
+                                .order_by(User.created_at.desc()).limit(50))).all()
+        done = await deals.completed_count(s, [u.id for u in rows])
+        out["list"] = [{"id": u.id, "name": u.name, "username": u.username, "deals": done[u.id],
+                        "online": u.is_online, "since": iso(u.created_at)} for u in rows]
+    else:
+        lead = await s.get(User, team.leader_id)
+        out["leader_name"] = lead.name if lead else None
+    return web.json_response(out)
+
+
+async def team_out(request: web.Request) -> web.Response:
+    """The leader's team balance -> his main balance."""
+    from bot.services import events, teams
+    s, user, _ = ctx(request)
+    team = await teams.led_by(s, user.id)
+    if team is None:
+        raise AppError(403, "not_leader", "Только для тимлида")
+    u = await money.lock(s, user.id)
+    amount = u.team_balance
+    if amount <= 0:
+        raise AppError(409, "empty", "Командный баланс пуст")
+    await money.team_to_balance(s, u.id, amount)
+    events.add(s, f"team:{team.id}", "team_out", f"Тимлид перевёл {money.usdt(amount)} USDT с командного баланса "
+               "на основной (приложение)", u.id, notice=True)
+    return web.json_response({"moved": num(amount), "balance": num(u.balance)})
+
+
+# ---------- admin: the cash desk, finance, people, applications, withdrawals ----------
+
+async def admin_desk(request: web.Request) -> web.Response:
+    await admin_only(request)
+    s, user, _ = ctx(request)
+    if not bsc.ready():
+        return web.json_response({"on": False, "error": bsc.error or "запускается"})
+    queue = (await s.scalars(select(Withdrawal).where(Withdrawal.method == "bsc", Withdrawal.status.in_(
+        ("queued", "sending", "sent"))).order_by(Withdrawal.id).limit(30))).all()
+    out = {"on": True, "address": bsc.hot, "explorer": bsc.address_url(bsc.hot), "owner": admins.is_owner(user.id),
+           "queue": [{"id": w.id, "user_id": w.user_id, "amount": num(w.amount - w.fee), "address": w.address,
+                      "status": w.status, "signed": bool(w.transfer_id), "created_at": iso(w.created_at)}
+                     for w in queue]}
+    try:
+        d = await asyncio.wait_for(bsc.desk(s), 8)
+        out |= {"usdt": num(d.usdt), "bnb": num(d.bnb.quantize(Decimal("0.00001"))), "low": d.bnb < Decimal("0.003"),
+                "cold": num(d.cold) if d.cold is not None else None, "unswept": num(d.unswept),
+                "total": num(d.total), "queued": num(d.queued), "pending": d.pending}
+    except Exception as e:  # noqa: BLE001 - the screen opens anyway
+        out["chain_error"] = str(e)[:200]
+    return web.json_response(out)
+
+
+async def admin_desk_key(request: web.Request) -> web.Response:
+    """The seed: owners only, to their private chat with the bot (never into the page), deleted after 2 minutes."""
+    from bot.handlers.admin_bsc import KEY_TTL, send_key
+    await admin_only(request)
+    s, user, bot = ctx(request)
+    if err := await send_key(bot, s, user.id):
+        raise AppError(403 if "владельц" in err else 409, "key", err)
+    return web.json_response({"sent": True, "minutes": KEY_TTL // 60})
+
+
+async def admin_finance(request: web.Request) -> web.Response:
+    from bot.services import finance
+    await admin_only(request)
+    s, _, _ = ctx(request)
+    sn = await finance.snapshot(s)
+    return web.json_response({
+        "hot": num(sn.hot), "bnb": num(sn.bnb), "cold": num(sn.cold), "unswept": num(sn.unswept),
+        "assets": num(sn.assets), "users": num(sn.users_available), "frozen": num(sn.users_frozen),
+        "team": num(sn.users_team), "unpaid": num(sn.unpaid), "unpaid_n": sn.unpaid_n,
+        "liabilities": num(sn.liabilities), "free": num(sn.free), "op_debt": num(sn.op_debt),
+        "profit": {k: num(v) for k, v in sn.profit.items()},
+        "volume": {k: {"n": v[0], "rub": num(v[1])} for k, v in sn.volume.items()},
+        "users_n": sn.users, "online": sn.online})
+
+
+def _user_json(u: User) -> dict:
+    return {"id": u.id, "name": u.name, "username": u.username, "balance": num(u.balance), "frozen": num(u.frozen),
+            "banned": u.is_banned, "online": u.is_online, "since": iso(u.created_at), "seen": iso(u.last_seen)}
+
+
+async def admin_users(request: web.Request) -> web.Response:
+    """Search by ID, @username or a part of the name; empty — the latest who were active."""
+    await admin_only(request)
+    s, _, _ = ctx(request)
+    q = (request.query.get("q") or "").strip().lstrip("@")
+    stmt = select(User)
+    if q.isdigit():
+        stmt = stmt.where(User.id == int(q))
+    elif q:
+        like = f"%{q.lower()}%"
+        stmt = stmt.where(func.lower(User.username).like(like) | func.lower(User.name).like(like))
+    rows = (await s.scalars(stmt.order_by(User.last_seen.desc()).limit(30))).all()
+    return web.json_response({"users": [_user_json(u) for u in rows]})
+
+
+async def admin_user(request: web.Request) -> web.Response:
+    from bot.api.webapp import roles
+    await admin_only(request)
+    s, admin, _ = ctx(request)
+    u = await s.get(User, int(request.match_info["id"]), populate_existing=True)
+    if u is None:
+        raise AppError(404, "not_found", "Пользователь не найден")
+    op = await s.get(Operator, u.id)
+    done = await s.scalar(select(func.count(Deal.id)).where((Deal.buyer_id == u.id) | (Deal.seller_id == u.id),
+                                                            Deal.status == "completed"))
+    opened = await s.scalar(select(func.count(Deal.id)).where((Deal.buyer_id == u.id) | (Deal.seller_id == u.id),
+                                                              Deal.status.in_(deals.OPEN)))
+    return web.json_response(_user_json(u) | {
+        "roles": await roles(s, u), "admin": admins.is_admin(u.id), "team_balance": num(u.team_balance),
+        "deposit_lock": num(u.deposit_lock), "debt": num(op.debt) if op and op.debt else None,
+        "rating": num(u.rating), "rating_lines": await orders.rep_text(s, u.id),
+        "deals": {"done": done, "open": opened}, "owner": admins.is_owner(admin.id)})
+
+
+async def admin_user_act(request: web.Request) -> web.Response:
+    """{"action": "ban" | "unban" | "rating" | "balance", "value": ...} — the bot's own rules: a granted admin's
+    big or own adjustment waits for a second admin, an owner's goes through."""
+    from bot.handlers.admin import set_ban
+    from bot.handlers.admin_balance import _change, _notice
+    from bot.handlers.admin_orders import set_rating
+    from bot.ui import notify
+    await admin_only(request)
+    s, admin, bot = ctx(request)
+    uid = int(request.match_info["id"])
+    u = await s.get(User, uid)
+    if u is None:
+        raise AppError(404, "not_found", "Пользователь не найден")
+    data = await body(request)
+    action, value = data.get("action"), data.get("value")
+    if action in ("ban", "unban"):
+        target, result = await set_ban(bot, s, admin, uid, action == "ban")
+        if target is None:
+            raise AppError(409, "not_allowed", result)
+        return web.json_response({"message": result})
+    if action == "rating":
+        if value in (None, "", "-"):
+            rating = None
+        else:
+            try:
+                rating = Decimal(str(value).replace(",", ".")).quantize(Decimal("0.1"))
+            except ArithmeticError:
+                rating = Decimal(-1)
+            if not Decimal(1) <= rating <= Decimal(10):
+                raise AppError(422, "bad_rating", "Рейтинг — число от 1 до 10")
+        return web.json_response({"message": "Готово: " + await set_rating(bot, s, admin, u, rating)})
+    if action == "balance":
+        try:
+            delta = Decimal(str(value).replace(",", ".").replace(" ", "").replace("−", "-")).quantize(money.Q)
+        except ArithmeticError:
+            raise AppError(422, "bad_amount", "Сумма: +10 или -5")
+        if not delta or abs(delta) >= Decimal(10_000_000):
+            raise AppError(422, "bad_amount", "Сумма: +10 или -5")
+        comment = str(data.get("comment") or "")[:200]
+        result, a = await _change(s, admin, uid, delta, comment)
+        await s.commit()
+        if result == "done":
+            await notify(bot, uid, _notice(a))
+            return web.json_response({"message": f"Проведено: {money.usdt(a.balance_before)} → "
+                                                 f"{money.usdt(a.balance_after)} USDT"})
+        if result == "pending":
+            return web.json_response({"message": "Ждёт подтверждения второго администратора (в боте)"})
+        raise AppError(409, "failed", "Не хватает доступного баланса — ничего не списано")
+    raise AppError(422, "bad_action", "Неизвестное действие")
+
+
+async def admin_signups(request: web.Request) -> web.Response:
+    from bot.handlers.signup import ROLES
+    await admin_only(request)
+    s, _, _ = ctx(request)
+    rows = (await s.execute(select(Signup, User).join(User, User.id == Signup.user_id).where(
+        Signup.status == "pending").order_by(Signup.id).limit(30))).all()
+    return web.json_response({"signups": [{
+        "id": su.id, "user_id": u.id, "name": u.name, "username": u.username, "role": ROLES.get(su.role, su.role),
+        "turnover": su.turnover, "proof": bool(su.proof), "created_at": iso(su.created_at)} for su, u in rows]})
+
+
+async def admin_signup_act(request: web.Request) -> web.Response:
+    from bot.handlers.signup import decide
+    await admin_only(request)
+    s, admin, bot = ctx(request)
+    data = await body(request)
+    su, message = await decide(bot, s, admin, int(request.match_info["id"]), bool(data.get("approve")),
+                               str(data.get("reason") or "")[:300] or None)
+    if su is None:
+        raise AppError(404, "not_found", message)
+    return web.json_response({"message": message})
+
+
+async def admin_withdrawal_act(request: web.Request) -> web.Response:
+    """An owner settles a withdrawal of a network that is gone: done | refund."""
+    from bot.handlers.admin_ops import decidable, settle
+    await admin_only(request)
+    s, admin, bot = ctx(request)
+    if not admins.is_owner(admin.id):
+        raise AppError(403, "not_owner", "Только владельцы")
+    action = (await body(request)).get("action")
+    if action not in ("done", "refund"):
+        raise AppError(422, "bad_action", "done или refund")
+    wd = await s.get(Withdrawal, int(request.match_info["id"]), with_for_update=True, populate_existing=True)
+    if wd is None or not decidable(wd):
+        raise AppError(409, "already", "Вывод уже обработан")
+    result = await settle(bot, s, admin, wd, action)
+    return web.json_response({"message": "Выполнение подтверждено" if result == "done" else "Средства возвращены"})
+
+
 def setup(r) -> None:
     r.add_get("/app/api/merchant", merchant)
     r.add_post("/app/api/merchant", merchant_settings)
@@ -572,3 +811,14 @@ def setup(r) -> None:
     r.add_post("/app/api/operator/repay", repay)
     r.add_get("/app/api/avatar", avatar)
     r.add_post("/app/api/log", client_log)
+    r.add_get("/app/api/team", team_view)
+    r.add_post("/app/api/team/out", team_out)
+    r.add_get("/app/api/admin/desk", admin_desk)
+    r.add_post("/app/api/admin/desk/key", admin_desk_key)
+    r.add_get("/app/api/admin/finance", admin_finance)
+    r.add_get("/app/api/admin/users", admin_users)
+    r.add_get("/app/api/admin/users/{id:\\d+}", admin_user)
+    r.add_post("/app/api/admin/users/{id:\\d+}", admin_user_act)
+    r.add_get("/app/api/admin/signups", admin_signups)
+    r.add_post("/app/api/admin/signups/{id:\\d+}", admin_signup_act)
+    r.add_post("/app/api/admin/withdrawals/{id:\\d+}", admin_withdrawal_act)

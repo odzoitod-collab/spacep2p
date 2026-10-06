@@ -3,8 +3,8 @@
 Who is an operator: active rows of `operators` (an admin adds them in the panel) plus OPERATOR_IDS from .env; if there
 are none at all, the admins. An operator enters the merchant's Bybit order and confirms the buyer's payment: the
 order's USDT arrive on the operator's own Bybit account while the platform credits the buyer. So every confirmed
-deal adds its seller_debit to the operator's debt; he repays it with USDT to his personal debt address in TON
-(services/ton.py: a Deposit with purpose="debt") or from his balance in the bot. Events of an operator are logged under ref op:<user id>.
+deal adds its seller_debit to the operator's debt; he repays it from his balance in the bot (topped up with USDT
+BEP-20 like anyone's); history: TON debt addresses (a Deposit with purpose="debt"). Events of an operator are logged under ref op:<user id>.
 """
 from decimal import Decimal
 
@@ -63,7 +63,11 @@ async def total_debt(s: AsyncSession) -> Decimal:
     return Decimal(await s.scalar(select(func.coalesce(func.sum(Operator.debt), 0))))
 
 
+PROBLEMS = ("no_requisites", "timeout")  # operator actions the admin chat gets a post about
+
+
 def log(s: AsyncSession, operator_id: int, deal, action: str, details: str = "") -> None:
-    """One operator action on a Bybit order (accepted, gave requisites, returned, no requisites...): a post of its own
-    in the admin chat's «Операторы» topic (handlers.logchat), next to the deal's history. Does not commit."""
-    events.add(s, f"opa:{operator_id}", action[:32], f"{deal.id}\x1f{details}"[:1000], operator_id, alert=True)
+    """One operator action on a Bybit order (accepted, gave requisites, returned, no requisites...), in the deal's
+    history; a problem (PROBLEMS) is also a post in the admin chat's «Операторы» topic. Does not commit."""
+    events.add(s, f"opa:{operator_id}", action[:32], f"{deal.id}\x1f{details}"[:1000], operator_id,
+               alert=action in PROBLEMS)  # the rest is the deal's history only

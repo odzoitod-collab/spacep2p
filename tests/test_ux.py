@@ -46,11 +46,14 @@ def test_only_answers_to_bot_questions_are_deleted(go):
         chat = msg(BUYER, "привет")
         await b.run(chat)
         assert chat.message.message_id not in deleted(b, BUYER)  # free text is not an answer to a question
+        async with models.Session() as s:
+            (await s.get(User, BUYER)).balance = D(50)
+            await s.commit()
         await b.run(cb(BUYER, "w:out"))
-        answer = msg(BUYER, "UQBvW8Z5huBkMJYdnfAEM5JqTNkuWX3diqYENkWsIL0XglxD")
+        answer = msg(BUYER, "10")
         await b.run(answer)
-        assert answer.message.message_id in deleted(b, BUYER)  # the bot asked for the address: tidy up
-        assert "шаг 2 из 3" in plain(b.session.last(BUYER))
+        assert answer.message.message_id in deleted(b, BUYER)  # the bot asked for the amount: tidy up
+        assert "шаг 2 из 2" in plain(b.session.last(BUYER))
     go(fn)
 
 
@@ -62,12 +65,12 @@ def test_dialog_state_survives_restart(go):
             await s.commit()
         await b.run(cb(BUYER, "w:out"))
         b.restart()  # new process
-        await b.run(msg(BUYER, "UQBvW8Z5huBkMJYdnfAEM5JqTNkuWX3diqYENkWsIL0XglxD"))
+        await b.run(msg(BUYER, "10"))
         b.restart()
-        await b.run(cb(BUYER, "w:nomemo"), msg(BUYER, "10"))
+        await b.run(msg(BUYER, "0xdD2FD4581271e230360230F9337D5c0430Bf44C0"))
         assert "Проверьте вывод" in plain(b.session.last(BUYER))
         b.restart()
-        await b.run(cb(BUYER, "w:go"))
+        await b.run(cb(BUYER, "wb:go"))
         assert (await user(BUYER)).balance == D(40)
     go(fn)
 
@@ -98,18 +101,18 @@ def test_renamed_file_is_not_accepted_as_pdf(go):
     go(fn)
 
 
-def test_photo_receipts_when_enabled(go):
+def test_receipts_are_pdf_only(go):
     async def fn(b):
         await ready(b)
-        async with models.Session() as s:
-            await settings.put(s, "receipt_images", "1")
-            await s.commit()
         d = await create_deal(b)
         photo = [PhotoSize(file_id="shot", file_unique_id="shot", width=1, height=1)]
-        await b.run(cb(BUYER, f"dl:rc:{d.id}"), msg(BUYER, photo=photo))
-        assert (await get_deal(d.id)).receipt_file_id == "photo:shot"
-        sent = [m for m in b.session.calls if type(m).__name__ == "SendPhoto" and m.chat_id == SELLER and m.photo == "shot"]
-        assert sent and "проверьте поступление" in plain(sent[0].caption)
+        await b.run(cb(BUYER, f"dl:rc:{d.id}"))
+        assert "фото и скриншоты не принимаются" in plain(b.session.last(BUYER))
+        await b.run(msg(BUYER, photo=photo))
+        assert (await get_deal(d.id)).status == "waiting_payment" and "Это фото" in plain(b.session.last(BUYER))
+        assert not [m for m in b.session.calls if type(m).__name__ == "SendPhoto" and m.chat_id == SELLER]
+        await b.run(msg(BUYER, document=PDF))
+        assert (await get_deal(d.id)).status == "paid"
     go(fn)
 
 
@@ -150,16 +153,21 @@ def test_buyer_dispute_goes_straight_to_evidence(go):
 
 def test_admin_cannot_credit_himself_alone(go):
     async def fn(b):
+        from bot.services import admins
+        staff = 40  # a granted admin, not an owner: an owner's word is final
         await ready(b)
-        await b.run(msg(ADMIN2, "/start"))
-        await b.run(cb(ADMIN, f"aum:{ADMIN}:+"), msg(ADMIN, "1000"), cb(ADMIN, "amr:deposit_fix"))
-        assert "провести сможет только другой администратор" in plain(b.session.last(ADMIN))
-        await b.run(cb(ADMIN, "adj:ok:1"), cb(ADMIN, "adj:ok:1"))
-        assert (await user(ADMIN)).balance == 0
+        await b.run(msg(ADMIN2, "/start"), msg(staff, "/start"))
+        async with models.Session() as s:
+            await admins.grant(s, staff)
+            await s.commit()
+        await b.run(cb(staff, f"aum:{staff}:+"), msg(staff, "1000"), cb(staff, "amr:deposit_fix"))
+        assert "провести сможет только другой администратор" in plain(b.session.last(staff))
+        await b.run(cb(staff, "adj:ok:1"), cb(staff, "adj:ok:1"))
+        assert (await user(staff)).balance == 0
         async with models.Session() as s:
             assert (await s.get(Adjustment, 1)).status == "pending"
         await b.run(cb(ADMIN2, "adj:ok:1"))
-        assert (await user(ADMIN)).balance == D(1000)
+        assert (await user(staff)).balance == D(1000)
     go(fn)
 
 
@@ -184,20 +192,22 @@ def test_log_chat_gets_every_deal_step(go):
 
 def test_withdrawal_refusal_is_alerted(go):
     async def fn(b):
-        from bot import tasks
-        from bot.services import ton
+        from bot.services import bsc
+        from tests.harness import bsc_tick
         await ready(b)
         async with models.Session() as s:
             (await s.get(User, BUYER)).balance = D(5)
             await s.commit()
         b.chain.fund_hot(usdt="100")
-        b.chain.abort = True
-        await b.run(cb(BUYER, "w:out"), msg(BUYER, "UQBvW8Z5huBkMJYdnfAEM5JqTNkuWX3diqYENkWsIL0XglxD"), cb(BUYER, "w:nomemo"), msg(BUYER, "5"), cb(BUYER, "w:go"))
-        for _ in range(ton.PAYOUT_TRIES):
-            await tasks.ton_cycle(b.bot)
+        b.chain.revert = bsc.TRIES
+        await b.run(cb(BUYER, "w:out"), msg(BUYER, "5"), msg(BUYER, "0xdD2FD4581271e230360230F9337D5c0430Bf44C0"), cb(BUYER, "wb:go"))
+        for _ in range(bsc.TRIES):
+            await bsc_tick(b)
+            b.chain.mine()
+            await bsc_tick(b)
         log = await b.deliver()
-        assert any("Сеть отклонила перевод" in t for t in log)
-        assert any("Сеть 3 раза отклонила перевод" in t and "возвращены пользователю" in t for t in log)
+        assert any("сеть откатила транзакцию" in t for t in log)
+        assert any("Сеть 3 раза откатила перевод" in t and "возвращены пользователю" in t for t in log)
         assert (await user(BUYER)).balance == D(5)
     go(fn)
 
@@ -251,7 +261,7 @@ def test_fsm_rows_do_not_clash(go):
 
 
 async def wd(b, uid, amount):
-    await b.run(cb(uid, "w:out"), msg(uid, "UQBvW8Z5huBkMJYdnfAEM5JqTNkuWX3diqYENkWsIL0XglxD"), cb(uid, "w:nomemo"), msg(uid, str(amount)), cb(uid, "w:go"))
+    await b.run(cb(uid, "w:out"), msg(uid, str(amount)), msg(uid, "0xdD2FD4581271e230360230F9337D5c0430Bf44C0"), cb(uid, "wb:go"))
 
 
 def test_withdrawals_wait_for_hot_wallet_funds_and_go_out_in_order(go):
@@ -263,25 +273,31 @@ def test_withdrawals_wait_for_hot_wallet_funds_and_go_out_in_order(go):
             (await s.get(User, BUYER)).balance = D(50)
             (await s.get(User, SELLER)).balance = D(50)
             await s.commit()
+        from tests.harness import bsc_tick
+        dest = "0xdD2FD4581271e230360230F9337D5c0430Bf44C0"
         b.chain.fund_hot(usdt="0.5")
         await wd(b, BUYER, 10)
         assert (await user(BUYER)).balance == D(40)  # debited, waiting — not refused
-        await tasks.ton_cycle(b.bot)
+        await bsc_tick(b)
         await b.run(cb(BUYER, "w"))
         assert "в очереди" in plain(b.session.last(BUYER)) and "w:qc:1" in b.session.buttons(BUYER)
         await wd(b, SELLER, 20)
         await wd(b, BUYER, 5)
-        await tasks.ton_cycle(b.bot)  # still nothing on the hot wallet: all three wait, admins are told
-        assert not b.chain.sent
-        assert len([t for t in await b.deliver() if "Выводы ждут USDT" in t]) == 1  # once an hour, not every 20 s
+        await bsc_tick(b)  # still nothing on the hot wallet: all three wait, admins are told
+        await bsc_tick(b)
+        assert not b.chain.pool
+        assert len([t for t in await b.deliver() if "ждёт денег" in t]) == 1  # once, not every 3 s
 
-        b.chain.fund_hot(usdt="24.5")  # 25: enough for #1 (8.85) but not #1 + #2 (18.7): strictly in order
-        await tasks.ton_cycle(b.bot)
-        assert [x[3] for x in b.chain.sent] == [D("8.85")]  # #3 (3.92) must not overtake #2
+        b.chain.fund_hot(usdt="24.5")  # 25: enough for #1 (9) but not #1 + #2 (19): strictly in order
+        await bsc_tick(b)
+        b.chain.mine()
+        assert b.chain.usdt_of(dest) == D(9)  # #3 (4) must not overtake #2
         b.chain.fund_hot(usdt="100")
-        await tasks.ton_cycle(b.bot)
-        await tasks.ton_cycle(b.bot)
-        assert [x[3] for x in b.chain.sent] == [D("8.85"), D("18.7"), D("3.92")]  # 5 − 1.5% (0.08 up) − 1
+        for _ in range(3):
+            await bsc_tick(b)
+            b.chain.mine()
+        await bsc_tick(b)
+        assert b.chain.usdt_of(dest) == D(9 + 19 + 4)  # each minus the fixed 1 USDT
         assert "Вывод #3 выполнен" in plain(b.session.last(BUYER))
         async with models.Session() as s:
             assert [w.status for w in (await s.scalars(select(Withdrawal).order_by(Withdrawal.id))).all()] == ["done"] * 3
@@ -302,8 +318,8 @@ def test_queued_withdrawal_can_be_cancelled(go):
         assert "отменить нельзя" in b.session.alerts()[-1]  # nothing is refunded twice
         assert (await user(BUYER)).balance == D(50)
         b.chain.fund_hot(usdt="100")
-        await tasks.ton_cycle(b.bot)
-        assert not b.chain.sent
+        await tasks.bsc_tick(b.bot, 0)
+        assert not b.chain.pool and not b.chain.sends
     go(fn)
 
 

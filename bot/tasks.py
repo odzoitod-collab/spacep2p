@@ -1,4 +1,4 @@
-"""Background loops: deal timeouts and reminders, the TON wallet cycle, seller auto-offline."""
+"""Background loops: deal timeouts and reminders, the BEP-20 cash desk, seller auto-offline."""
 import asyncio
 import logging
 from datetime import timedelta
@@ -14,7 +14,7 @@ from bot.handlers import orders as order_handlers
 from bot.handlers import finance as finance_handlers
 from bot.handlers import wallet as wallet_handlers
 from bot.models import Deal, Session, User, now
-from bot.services import api, deals, events, money, operators, orders, settings, ton
+from bot.services import api, bsc, deals, events, money, operators, orders, settings
 from bot.ui import notify
 
 log = logging.getLogger(__name__)
@@ -102,11 +102,18 @@ async def escalate_unanswered_deals(bot: Bot) -> None:
                 await push(bot, s, deals.checker(d), d, f"Сделка #{d.id} передана администрации: вы не ответили вовремя")
 
 
-async def ton_cycle(bot: Bot) -> ton.Report:
-    """USDT on TON: credit new transfers, settle messages in flight, collect addresses, pay the queue — then tell the
-    users what happened to their money."""
+BSC_EVERY = 3
+BSC_START = 25  # seconds after the start before the BEP-20 desk loads its seed
+
+
+async def bsc_tick(bot: Bot, n: int = 0) -> bsc.Report:
+    """USDT BEP-20: one round — incoming, the payout queue, settling what is in flight — then tell the users."""
     async with Session() as s:
-        rep = await ton.cycle(s)
+        if not bsc.ready():
+            if n % 20 == 0:  # the seed could not be loaded (database down...): try again every minute
+                await bsc.ensure_wallet(s)
+            return bsc.Report()
+        rep = await bsc.tick(s, n)
         for dep in rep.credited:
             await wallet_handlers.notify_deposit(bot, s, dep)
         for wd, result in rep.finished:
@@ -114,22 +121,23 @@ async def ton_cycle(bot: Bot) -> ton.Report:
     return rep
 
 
-async def ton_loop(bot: Bot) -> None:
-    """Every TON_EVERY seconds, or at once when a withdrawal is queued."""
+async def bsc_loop(bot: Bot) -> None:
+    """Every BSC_EVERY seconds, or at once when a withdrawal is queued."""
+    await asyncio.sleep(BSC_START)
+    n = 0
     while True:
         try:
             async with Session() as s:
                 await settings.load(s)
-            await ton_cycle(bot)
+            await bsc_tick(bot, n)
         except Exception:
-            log.exception("ton cycle failed")
+            log.exception("bsc tick failed")
+        n += 1
         try:
-            await asyncio.wait_for(ton.wake.wait(), TON_EVERY)
+            await asyncio.wait_for(bsc.wake.wait(), BSC_EVERY)
         except asyncio.TimeoutError:
             pass
-
-
-TON_EVERY = 20
+        bsc.wake.clear()
 
 
 async def deliver_alerts(bot: Bot) -> None:
@@ -348,7 +356,7 @@ def start(bot: Bot) -> list[asyncio.Task]:
             asyncio.create_task(loop(release_holds, bot, 60)),
             asyncio.create_task(loop(remind_disputes, bot, 1800)),
             asyncio.create_task(loop(escalate_unanswered_deals, bot, 60)),
-            asyncio.create_task(ton_loop(bot)),
+            asyncio.create_task(bsc_loop(bot)),
             asyncio.create_task(loop(auto_offline, bot, 60)),
             asyncio.create_task(alert_loop(bot)),
             asyncio.create_task(loop(api_webhooks, bot, 2)),

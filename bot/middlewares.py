@@ -143,10 +143,7 @@ class Context(BaseMiddleware):
                 user = await s.get(User, tg.id)
                 if user is None:
                     user = User(id=tg.id)
-                    s.add(user)
-                    events.add(s, f"user:{tg.id}", "registered",
-                               f"Новый пользователь {tg.full_name or ''} @{tg.username or '—'}"[:200], tg.id,
-                               notice=True)
+                    s.add(user)  # nothing to the admin chat: an application to enter (signup) is what it gets
                 if user.is_banned and not is_admin:
                     if cq:
                         with suppress(TelegramAPIError):
