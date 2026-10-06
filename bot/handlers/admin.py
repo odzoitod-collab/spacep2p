@@ -1182,9 +1182,7 @@ async def cb_resolve_ask(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User
     await state.set_state(None)
     _, did, verdict = c.data.split(":")
     d = await s.get(Deal, int(did), populate_existing=True)
-    allowed = deals.UNPAID if verdict == "c" else ("paid", "dispute")
-    if not d or d.status not in allowed or (verdict == "a" and d.dispute_amount_rub is None) \
-            or (verdict == "n" and not (d.via_bybit and d.bybit_url)):
+    if not verdict_allowed(d, verdict):
         return await c.answer("Сделка уже закрыта или решение недоступно", show_alert=True)
     await show(bot, user, "\n".join([
         f"{pe('warn')} <b>Решение по сделке #{d.id}: {VERDICTS[verdict]}</b>",
@@ -1225,10 +1223,21 @@ async def cb_resolve(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User):
     await resolve(bot, s, user, int(did), verdict, "", c)
 
 
-async def resolve(bot: Bot, s: AsyncSession, user: User, did: int, verdict: str, comment: str, src=None):
-    d = await s.get(Deal, did)
-    if not d:
-        return await admin_screen(bot, s, user, src)
+def verdict_allowed(d: Deal | None, verdict: str) -> bool:
+    """The same rule for the bot and the mini app: which verdicts a deal in its current state can take."""
+    if d is None or verdict not in VERDICTS:
+        return False
+    allowed = deals.UNPAID if verdict == "c" else ("paid", "dispute")
+    return (d.status in allowed and not (verdict == "a" and d.dispute_amount_rub is None)
+            and not (verdict == "n" and not (d.via_bybit and d.bybit_url)))
+
+
+async def apply_verdict(bot: Bot, s: AsyncSession, user: User, did: int, verdict: str,
+                        comment: str) -> tuple[Deal | None, str]:
+    """Carry out an admin's verdict, commit, tell both sides. (deal, "") or (None, why). The bot and the app alike."""
+    d = await s.get(Deal, did, populate_existing=True)
+    if not verdict_allowed(d, verdict):
+        return None, "Сделка уже закрыта или решение недоступно"
     error = ""
     try:
         if verdict == "c" and d.status in orders.REQUEST:
@@ -1245,8 +1254,7 @@ async def resolve(bot: Bot, s: AsyncSession, user: User, did: int, verdict: str,
     if not res:
         await s.rollback()
         await s.refresh(user)  # rollback expires every loaded object
-        d = await s.get(Deal, did, populate_existing=True)
-        return await deal_view(bot, s, user, d, src, warn(error or "Сделка уже закрыта другим администратором"))
+        return None, error or "Сделка уже закрыта другим администратором"
     res.resolution = comment or None
     if verdict == "c" and res.is_order and res.card_id is None:  # a request: its offers in chats and bots close
         from bot.handlers.orders import CLOSED, close_offers
@@ -1255,9 +1263,19 @@ async def resolve(bot: Bot, s: AsyncSession, user: User, did: int, verdict: str,
     events.add(s, f"deal:{res.id}", "resolved", f"Решено {VERDICTS[verdict]} ({user.name})"
                + (f": {comment}" if comment else ""), notice=True)
     await s.commit()
-    await deal_view(bot, s, user, res, src, ok(f"Решено {VERDICTS[verdict]}. Стороны уведомлены."))
     head = (f"Сделка #{res.id} отменена администрацией. Не переводите по ней деньги" if verdict == "c"
             else f"Спор по сделке #{res.id} решён {VERDICTS[verdict]}")
     await push(bot, s, res.buyer_id, res, head)
     for uid in deals.sellers(res):
         await push(bot, s, uid, res, head)
+    return res, ""
+
+
+async def resolve(bot: Bot, s: AsyncSession, user: User, did: int, verdict: str, comment: str, src=None):
+    if not await s.get(Deal, did):
+        return await admin_screen(bot, s, user, src)
+    res, error = await apply_verdict(bot, s, user, did, verdict, comment)
+    if not res:
+        d = await s.get(Deal, did, populate_existing=True)
+        return await deal_view(bot, s, user, d, src, warn(error))
+    await deal_view(bot, s, user, res, src, ok(f"Решено {VERDICTS[verdict]}. Стороны уведомлены."))

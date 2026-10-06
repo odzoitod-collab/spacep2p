@@ -64,7 +64,6 @@ async def main_menu(bot: Bot, s: AsyncSession, user: User, is_admin: bool, src=N
         btn(f"Ещё открытых сделок: {len(open_) - 3}", inline="сделки ") if len(open_) > 3 else None,
         btn(f"Проверить оплату ({len(need_check)})", f"dl:{need_check[0].id}", "bell", style="danger")
         if need_check else None,
-        app_btn("Открыть приложение", "", "wallet", style="success", wide=True),
         btn(f"Кошелёк · {money.usdt(user.balance)} USDT", "w", style="primary"),
         [btn("RUB ⇄ USDT", "buy:0", style="success"), btn("USDT ⇄ RUB", "sl", style="danger")],
         btn("Ордерный кабинет" if om and om.status in ("approved", "suspended", "pending") else "Ордерные реквизиты",
@@ -80,6 +79,7 @@ async def main_menu(bot: Bot, s: AsyncSession, user: User, is_admin: bool, src=N
          else None],
         btn("Вопросы менеджеру", url=manager_url()) if manager_url() else None,
         btn("Админ-панель", "a", wide=True) if is_admin else None,
+        app_btn("Открыть приложение", "", wide=True),  # last: the bot's own buttons first, the app below them
     ), src)
 
 

@@ -31,9 +31,12 @@ BOT = web.AppKey("bot", Bot)
 S = web.RequestKey("app_session", object)
 USER = web.RequestKey("app_user", object)
 limiter = api.RateLimiter()
-CSP = ("default-src 'self'; script-src 'self' https://telegram.org; style-src 'self' 'unsafe-inline' "
-       "https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data: blob: https://t.me "
-       "https://*.telegram.org https://*.t.me; connect-src 'self'")
+# Cloudflare (the proxy in front) injects its analytics beacon into the page: allowed, so the console stays clean —
+# Cloudflare terminates TLS anyway, the script adds no new party
+CSP = ("default-src 'self'; script-src 'self' https://telegram.org https://static.cloudflareinsights.com; "
+       "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; "
+       "img-src 'self' data: blob: https://t.me https://*.telegram.org https://*.t.me; media-src 'self' blob:; "
+       "connect-src 'self' https://cloudflareinsights.com")
 
 
 class AppError(Exception):
@@ -184,10 +187,24 @@ async def me(request: web.Request) -> web.Response:
     active = (await s.scalars(select(Deal).where(mine(user.id), Deal.status.in_(deals.OPEN)))).all()
     op = await s.get(Operator, user.id)
     name = await bot_name(bot)
+    rl = await roles(s, user)
+    work = {}
+    if rl["operator"]:
+        work["free_orders"] = await s.scalar(select(func.count(Deal.id)).where(
+            Deal.status == "checking", Deal.operator_id.is_(None), Deal.via_bybit, Deal.seller_id != user.id))
+    if rl["merchant"] == "approved":
+        work["offers"] = await s.scalar(select(func.count(Deal.id)).where(
+            Deal.status == "searching", Deal.buyer_id != user.id, Deal.expires_at >= now()))
+    if rl["admin"]:
+        work["disputes"] = await s.scalar(select(func.count(Deal.id)).where(Deal.status == "dispute"))
+    if rl["seller"]:
+        work["cards_on"] = await s.scalar(select(func.count(Card.id)).where(
+            Card.user_id == user.id, Card.is_active, ~Card.is_deleted, ~Card.is_banned))
     return web.json_response({
         "user": {"id": user.id, "name": user.name, "username": user.username, "since": iso(user.created_at),
                  "quiet": user.quiet, "online": user.is_online},
-        "roles": await roles(s, user),
+        "roles": rl, "work": work,
+        "terms": {"seller_pct": num(settings.merchant_pct(user)), "order_rate": num(settings.dec("order_rate"))},
         "balance": {"available": num(user.balance), "frozen": num(user.frozen),
                     "withdrawable": num(money.withdrawable(user)), "team": num(user.team_balance),
                     "debt": num(op.debt) if op and op.debt else None},
@@ -265,8 +282,12 @@ def steps(d: Deal) -> list[dict]:
              "hint": hint if i == done and not closed else ""} for i, (t, hint) in enumerate(way)]
 
 
-def actions(d: Deal, uid: int) -> list[str]:
+def actions(d: Deal, uid: int, who: dict | None = None) -> list[str]:
+    """What this user can do with the deal right now — the same rules as the bot's buttons; every endpoint checks
+    them again. who: {"admin", "operator", "merchant"} of the viewer (see viewer())."""
+    from bot.handlers.admin import verdict_allowed
     from bot.handlers.relay import chat_people
+    who = who or {}
     out, buyer = [], uid == d.buyer_id
     if buyer and d.status in ("searching", "assigned", "checking"):
         out.append("cancel_request")
@@ -275,25 +296,34 @@ def actions(d: Deal, uid: int) -> list[str]:
     if buyer and d.status == "expired" and (until := deals.late_deadline(d)) and now() < until:
         out.append("late_receipt")
     if not buyer and d.status == "paid" and deals.checker(d) == uid:
-        out += ["confirm", "dispute_bot"]
+        out += ["confirm", "dispute"]
     if buyer and d.status == "paid" and (at := deals.buyer_dispute_at(d)) and now() >= at:
-        out.append("dispute_bot")
-    if d.status == "assigned" and uid == d.seller_id and not d.via_bybit:
-        out.append("give_bot")
-    if d.status == "assigned" and uid == d.seller_id and d.via_bybit:
-        out.append("link_bot")
-    if d.via_bybit and d.status == "checking" and d.operator_id is None and uid not in (d.buyer_id, d.seller_id):
-        out.append("accept")  # shown only to operators: the endpoint checks it
+        out.append("dispute")
+    if d.status == "dispute" and uid in (d.buyer_id, d.seller_id, d.operator_id):
+        out.append("evidence")
+    if d.receipt_file_id and (deals.checker(d) == uid or who.get("admin")):
+        out.append("receipt_view")
+    if d.status == "searching" and who.get("merchant") and uid != d.buyer_id and deals.aware(d.expires_at) >= now():
+        out.append("take")
+    if d.status == "assigned" and uid == d.seller_id:
+        out += ["link" if d.via_bybit else "give", "drop"]
+    if d.via_bybit and d.status == "checking" and d.operator_id is None and uid not in (d.buyer_id, d.seller_id) \
+            and who.get("operator", True):
+        out.append("accept")
     if d.via_bybit and d.operator_id == uid and d.status == "checking":
         out += ["give"] + (["pass_on", "no_requisites"] if d.bybit_url and d.seller_id else [])
     if deals.held(d) and d.operator_id == uid:
         out += (["recreate"] if d.bybit_url and d.seller_id else []) + ["close"]
-    if uid in chat_people(d) or admins.is_admin(uid):
+    if who.get("admin") and any(verdict_allowed(d, v) for v in "bsacn"):
+        out.append("resolve")
+    if who.get("admin") and (d.dispute_files or d.receipt_file_id):
+        out.append("files")
+    if uid in chat_people(d) or who.get("admin"):
         out.append("chat")
     return out
 
 
-def deal_json(d: Deal, card: Card | None, uid: int, full: bool = True) -> dict:
+def deal_json(d: Deal, card: Card | None, uid: int, full: bool = True, who: dict | None = None) -> dict:
     from bot.handlers.deal import CLOSE_REASONS, status_of
     role = role_of(d, uid)
     buyer = role == "buyer"
@@ -322,9 +352,20 @@ def deal_json(d: Deal, card: Card | None, uid: int, full: bool = True) -> dict:
         "receipt": bool(d.receipt_file_id),
         "bybit_url": d.bybit_url if role in ("operator", "admin") or (d.via_bybit and d.status == "checking"
                                                                       and d.operator_id is None) else None,
-        "steps": steps(d), "actions": actions(d, uid),
+        "steps": steps(d), "actions": actions(d, uid, who),
         "dispute_at": iso(deals.buyer_dispute_at(d)) if buyer and d.status == "paid" else None,
+        "resolution": d.resolution,
+        "merchant_rate": num(d.merchant_rate) if role in ("seller", "operator", "admin") else None,
+        "seller_debit": num(d.seller_debit) if role in ("seller", "operator", "admin") else None,
     })
+    if d.dispute_reason:
+        from bot.handlers.deal import REASONS
+        files = d.dispute_files or []
+        out["dispute"] = {"reason": REASONS.get(d.dispute_reason, d.dispute_reason),
+                          "amount_rub": num(d.dispute_amount_rub), "files": len(files),
+                          "mine": sum(1 for f in files if (f[2] if len(f) > 2 else "seller")
+                                      == ("buyer" if buyer else "seller")),
+                          "max": deals.MAX_EVIDENCE}
     return out
 
 
@@ -364,9 +405,20 @@ async def deal_of(request: web.Request) -> Deal:
     return d
 
 
+async def viewer(s, uid: int) -> dict:
+    """The viewer's roles that change what a deal offers him: admin, operator, approved order merchant."""
+    om = await s.get(OrderMerchant, uid)
+    return {"admin": admins.is_admin(uid), "operator": await operators.is_operator(s, uid),
+            "merchant": om is not None and om.status == "approved"}
+
+
 async def deal_response(s, d: Deal, uid: int) -> web.Response:
+    from bot.api import webapp_roles
     card = await s.get(Card, d.card_id) if d.card_id else None
-    return web.json_response({"deal": deal_json(d, card, uid)})
+    who = await viewer(s, uid)
+    out = deal_json(d, card, uid, who=who)
+    await webapp_roles.enrich(s, d, uid, who, out)
+    return web.json_response({"deal": out})
 
 
 async def deal_get(request: web.Request) -> web.Response:
@@ -508,28 +560,49 @@ async def operator_cabinet(request: web.Request) -> web.Response:
     debt_address = None
     if op and op.debt and ton.chain is not None:  # his personal address: USDT there repay the debt
         debt_address = ton.friendly((await ton.personal(s, user.id, "debt")).address)
+    from bot.api.webapp_roles import ratings_of
     return web.json_response({"debt": num(op.debt if op else 0), "debt_address": debt_address,
+                              "balance": num(user.balance), "ratings": await ratings_of(s, user.id),
                               "working": [deal_json(d, None, user.id, full=False) for d in working],
                               "free": [deal_json(d, None, user.id, full=False) for d in free]})
 
 
-async def operator_act(request: web.Request) -> web.Response:
-    """accept · requisites · recreate · close · pass_on · no_requisites — the bot's operator buttons."""
+async def give_requisites(request: web.Request, did: int) -> Deal:
+    """Requisites to the buyer from the app: the merchant from his balance or the operator of a Bybit order.
+    {"text": "2200 7001 2345 6781 Сбербанк\nПётр П.", "minutes": 15} or the parts {"number", "bank", "holder"}."""
     from bot.handlers import orders as order_handlers
-    from bot.services.orders import pay_choices
-    await operator_only(request)
+    from bot.services import orders
+    s, user, bot = ctx(request)
+    d = await s.get(Deal, did, populate_existing=True)
+    if not orders.giver(d, user.id):
+        raise AppError(409, "not_yours", "Заявка уже не у вас — обновите сделку")
+    data = await body(request)
+    text = data.get("text")
+    if not isinstance(text, str) or not text.strip():
+        text = " ".join(str(data.get(k) or "") for k in ("number", "bank")) + "\n" + str(data.get("holder") or "")
+    got, err = order_handlers.parse_requisites(text)
+    if not got:
+        raise AppError(422, "bad_requisites", err)
+    kind, number, bank, holder = got
+    minutes = data.get("minutes")
+    if not isinstance(minutes, int) or minutes not in orders.pay_choices():
+        minutes = await order_handlers._default_minutes(s, user)
+    return await order_handlers.give_now(bot, s, user, did, kind, bank, number, holder, minutes)
+
+
+async def operator_act(request: web.Request) -> web.Response:
+    """accept · requisites · recreate · close · pass_on · no_requisites — the bot's operator buttons (requisites:
+    also the merchant who took a request from his balance)."""
+    from bot.handlers import orders as order_handlers
+    if request.match_info["act"] != "requisites":
+        await operator_only(request)
     s, user, bot = ctx(request)
     did, act = int(request.match_info["id"]), request.match_info["act"]
     try:
         if act == "accept":
             d = await order_handlers.accept_order(bot, s, user, did)
         elif act == "requisites":
-            text = (await body(request)).get("text")
-            got, err = order_handlers.parse_requisites(text if isinstance(text, str) else "")
-            if not got:
-                raise AppError(422, "bad_requisites", err)
-            kind, number, bank, holder = got
-            d = await order_handlers.give_now(bot, s, user, did, kind, bank, number, holder, pay_choices()[0])
+            d = await give_requisites(request, did)
         elif act == "recreate":
             d = await order_handlers.recreate_order(bot, s, user, did)
         elif act == "close":
@@ -865,3 +938,5 @@ def setup(app: web.Application, bot: Bot) -> None:
     r.add_post("/app/api/shift", shift)
     r.add_get("/app/api/guides", guides)
     r.add_get("/app/api/guides/{slug:[a-z]+}", guide)
+    from bot.api import webapp_roles
+    webapp_roles.setup(r)

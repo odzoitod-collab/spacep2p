@@ -380,22 +380,32 @@ async def cb_take(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User, state
             btn("Нет, ещё ищу карту", f"orq:nocard:{did}", "cross"),
             back("x", "Не брать", "cross")), c)
     try:
-        d = await orders.take(s, did, user, bybit)
+        d = await take_request(bot, s, user, did, bybit)
     except deals.DealError as e:
-        await s.rollback()
-        await s.refresh(user)
         await c.answer(str(e), show_alert=True)
         if e.code == "taken" and c.message:
             with suppress(TelegramAPIError):
                 await c.message.edit_text(f"{pe('info')} Заявка #{did} {CLOSED['taken']}", reply_markup=close_kb())
         return
+    await (link_screen if d.via_bybit else give_screen)(bot, s, user, d, state, c)
+
+
+async def take_request(bot: Bot, s: AsyncSession, user: User, did: int, bybit: bool) -> Deal:
+    """A merchant takes a request: a Bybit order (sends its link next) or from his balance (gives requisites next).
+    DealError after a rollback. The bot and the mini app alike."""
+    try:
+        d = await orders.take(s, did, user, bybit)
+    except deals.DealError:
+        await s.rollback()
+        await s.refresh(user)
+        raise
     deal_log(s, d, "taken", f"Принял мерчант {person(user)}: " + (
         "Bybit-ордер" if d.via_bybit else f"с баланса, заморожено {money.usdt(d.seller_debit)} USDT"), notice=True)
     await s.commit()
     await close_offers(bot, s, d, f"Заявка #{d.id} {CLOSED['taken']}", keep=user.id)
     if not d.via_bybit:  # a Bybit-order take counts only with the link: the buyer hears about it then
         await push(bot, s, d.buyer_id, d, f"Мерчант взял заявку #{d.id} и готовит реквизиты")
-    await (link_screen if d.via_bybit else give_screen)(bot, s, user, d, state, c)
+    return d
 
 
 @router.callback_query(F.data.regexp(r"^orq:nocard:(\d+)$"))
@@ -526,30 +536,40 @@ async def msg_link(m: Message, bot: Bot, s: AsyncSession, user: User, state: FSM
             "Нужна ссылка на ордер Bybit: https://www.bybit.com/… (скопируйте из приложения Bybit)"))
     did = d.id
     try:
-        d = await orders.give_link(s, did, user, url)
+        d = await send_link(bot, s, user, did, url)
     except deals.DealError as e:
-        await s.rollback()
-        await s.refresh(user)
         d = await _assigned(s, user, did)
         if e.code == "link_used" and d:
             return await link_screen(bot, s, user, d, state, note=warn(str(e)))
         await state.clear()
         return await show(bot, user, warn(str(e)), close_kb())
     await state.clear()
+    await deal_screen(bot, s, user, d, note=ok(
+        "Новая ссылка ушла оператору — он выдаст реквизиты." if d.operator_id else
+        "Ссылка ушла операторам. Первый, кто примет ордер, выдаст покупателю реквизиты."))
+
+
+async def send_link(bot: Bot, s: AsyncSession, user: User, did: int, url: str) -> Deal:
+    """The merchant's Bybit order link: to the operator who asked for a new one, or to every operator. DealError after
+    a rollback. The bot and the mini app alike."""
+    try:
+        d = await orders.give_link(s, did, user, url)
+    except deals.DealError:
+        await s.rollback()
+        await s.refresh(user)
+        raise
     deal_log(s, d, "link", f"Мерчант {person(user)} прислал Bybit-ордер: {url}", notice=True)
     await s.commit()
     if d.operator_id:  # a recreated order: the operator who asked for it gets it, nobody else
-        await deal_screen(bot, s, user, d, note=ok("Новая ссылка ушла оператору — он выдаст реквизиты."))
         await notify(bot, d.operator_id, "\n".join([
             f"{pe('shop')} <b>Новый ордер по заявке #{d.id}</b>",
             f"• Ссылка: {link_line(d)}",
             f"• Зайти на <b>{money.usdt(d.seller_debit)} USDT</b> · {money.fmt(d.amount_rub)} ₽"]),
             kb(btn("Выдать реквизиты", f"orq:give:{d.id}", "key", style="success"), back("x", "Скрыть", "cross")))
-        return
-    await deal_screen(bot, s, user, d, note=ok("Ссылка ушла операторам. Первый, кто примет ордер, выдаст "
-                                               "покупателю реквизиты."))
+        return d
     await push(bot, s, d.buyer_id, d, f"Ордер по заявке #{d.id} найден — оператор проверяет его и выдаёт реквизиты")
     await notify_operators(bot, s, d, user)
+    return d
 
 
 # ---------- operators: accept a Bybit order, give its requisites ----------
@@ -892,22 +912,29 @@ async def rate_after_deal(bot: Bot, s: AsyncSession, d: Deal) -> None:
 
 @router.callback_query(F.data.regexp(r"^opr:(\d+):(\d{1,2})$"))
 async def cb_rate(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User):
-    from bot.models import MerchantRating
     _, rid, score = c.data.split(":")
-    row = await s.get(MerchantRating, int(rid), with_for_update=True, populate_existing=True)
-    if row is None or row.operator_id != user.id or not 1 <= int(score) <= 10:
-        return await c.answer("Эта оценка не ваша", show_alert=True)
+    done, text = await rate_merchant(s, user, int(rid), int(score))
+    if not done:
+        return await c.answer(text, show_alert=True)
+    await show(bot, user, f"{pe('ok')} {text}", close_kb(), c)
+
+
+async def rate_merchant(s: AsyncSession, user: User, rid: int, score: int) -> tuple[bool, str]:
+    """The operator scores the merchant once: (True, what it made of his reputation) or (False, why not). Commits."""
+    from bot.models import MerchantRating
+    row = await s.get(MerchantRating, rid, with_for_update=True, populate_existing=True)
+    if row is None or row.operator_id != user.id or not 1 <= score <= 10:
+        return False, "Эта оценка не ваша"
     if row.score is not None:
-        return await c.answer(f"Оценка уже стоит: {row.score} из 10", show_alert=True)
-    row.score = int(score)
+        return False, f"Оценка уже стоит: {row.score} из 10"
+    row.score = score
     rep, total = await orders.reputation(s, row.merchant_id)
     events.add(s, f"om:{row.merchant_id}", "rated", f"Оценка оператора по заявке #{row.deal_id}: {score}/10 · "
                f"репутация: {orders.rep_line(rep, total)}", row.merchant_id, notice=True)
     d = await s.get(Deal, row.deal_id)
     operators.log(s, user.id, d, "rated", f"мерчант {row.merchant_id}: {score}/10")
     await s.commit()
-    await show(bot, user, f"{pe('ok')} Оценка {score}/10 сохранена. Репутация мерчанта: {orders.rep_line(rep, total)}.",
-               close_kb(), c)
+    return True, f"Оценка {score}/10 сохранена. Репутация мерчанта: {orders.rep_line(rep, total)}."
 
 
 def _strike_event(s: AsyncSession, merchant: int, d: Deal, count: int, sleep) -> None:
@@ -1039,18 +1066,25 @@ async def cb_drop(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User, state
     if not d:
         return await c.answer("Заявка уже не у вас", show_alert=True)
     await state.clear()
+    bybit = d.via_bybit
+    d = await drop_request(bot, s, user, d)
+    await merchant_screen(bot, s, user, c, ok(f"Вы отказались от заявки #{d.id}" + ("." if bybit else
+                                                                                  ", заморозка снята.")))
+
+
+async def drop_request(bot: Bot, s: AsyncSession, user: User, d: Deal) -> Deal:
+    """The merchant gives up a request he took (not answered yet): it goes back to the search. Commits."""
     bybit, operator = d.via_bybit, d.operator_id
     d = await orders.release(s, d.id)
     deal_log(s, d, "released", f"Мерчант {person(user)} отказался от заявки" + ("" if bybit else ", заморозка снята"),
              notice=True)
     await s.commit()
-    await merchant_screen(bot, s, user, c, ok(f"Вы отказались от заявки #{d.id}" + ("." if bybit else
-                                                                                  ", заморозка снята.")))
     await push(bot, s, d.buyer_id, d, f"Ищем другого мерчанта для заявки #{d.id}")
     if operator:
         await notify(bot, operator, f"{pe('info')} Мерчант отказался пересоздавать ордер по заявке #{d.id} — "
                                     "она снова ищет мерчанта.")
     await broadcast(bot, s, d)
+    return d
 
 
 # ---------- order merchant: application and console ----------

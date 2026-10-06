@@ -218,9 +218,9 @@ def test_navigation_is_last_single_row(go):
         await b.run(cb(BUYER, "menu"))
         menu = next(m for m in reversed(b.session.calls) if getattr(m, "reply_markup", None) and m.chat_id == BUYER)
         rows = [[x.text for x in r] for r in menu.reply_markup.inline_keyboard]
-        assert rows[0] == ["Открыть приложение"]  # the mini app first
-        assert menu.reply_markup.inline_keyboard[0][0].web_app.url == "https://straitpay.best/app"
-        assert rows[1] == ["Кошелёк · 0 USDT"] and rows[2] == ["RUB ⇄ USDT", "USDT ⇄ RUB"]  # one big, two small
+        assert rows[-1] == ["Открыть приложение"]  # the mini app last, under the bot's own buttons
+        assert menu.reply_markup.inline_keyboard[-1][0].web_app.url == "https://straitpay.best/app"
+        assert rows[0] == ["Кошелёк · 0 USDT"] and rows[1] == ["RUB ⇄ USDT", "USDT ⇄ RUB"]  # one big, two small
     go(fn)
 
 

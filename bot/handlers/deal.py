@@ -913,8 +913,17 @@ async def submit_dispute(bot: Bot, s: AsyncSession, user: User, state: FSMContex
 
 
 async def operator_verdict(bot: Bot, s: AsyncSession, user: User, d: Deal):
+    res, what = await settle_by_operator(bot, s, user, d)
+    if res is None:
+        d = await s.get(Deal, d.id, populate_existing=True)
+        return await deal_screen(bot, s, user, d, note=warn(f"Спор передан администрации: {what}"))
+    await deal_screen(bot, s, user, res, note=ok(f"Спор решён в вашу пользу: {what}."))
+
+
+async def settle_by_operator(bot: Bot, s: AsyncSession, user: User, d: Deal) -> tuple[Deal | None, str]:
     """The operator of a Bybit order acts as an admin: his proof from the bank settles the dispute at once —
-    no payment: cancelled; another amount: completed by the amount actually received."""
+    no payment: cancelled; another amount: completed by the amount actually received. (deal, what) or (None, why
+    it stays with the administration). Commits and tells both sides. The bot and the mini app alike."""
     what = OPERATOR_REASONS[d.dispute_reason]
     try:
         if d.dispute_reason == "wrong_amount":
@@ -928,16 +937,15 @@ async def operator_verdict(bot: Bot, s: AsyncSession, user: User, d: Deal):
         await s.refresh(user)
         res, what = None, str(e)
     if res is None:
-        d = await s.get(Deal, d.id, populate_existing=True)
-        return await deal_screen(bot, s, user, d, note=warn(f"Спор передан администрации: {what}"))
+        return None, what
     res.resolution = f"Оператор подтвердил доказательствами из банка: {what}."
     audit.log(s, user.id, "resolve", f"deal:{res.id}", f"оператор: {what}")
     log(s, res, "resolved", f"Спор решён оператором {user.id} автоматически: {what}", alert=True)
     await s.commit()
-    await deal_screen(bot, s, user, res, note=ok(f"Спор решён в вашу пользу: {what}."))
     head = f"Спор по сделке #{res.id} решён: {what}"
     await push(bot, s, res.buyer_id, res, head)
     await push(bot, s, res.seller_id, res, head)
+    return res, what
 
 
 # ---------- evidence (both sides, while in dispute) ----------
