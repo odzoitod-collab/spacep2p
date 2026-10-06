@@ -37,7 +37,7 @@ async def cb_debt(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User, state
         title(pe("shop"), ("Добавить долг" if sign == "+" else "Уменьшить долг") + f" · {uid}"),
         quote(f"• Долг сейчас: <b>{money.usdt(op.debt if op else Decimal(0))} USDT</b>"),
         "Добавить — оператор получил USDT мимо бота; уменьшить — вернул их мимо бота. Отправьте: "
-        "<code>сумма причина</code>, например <code>50 вернул на xRocket</code>.",
+        "<code>сумма причина</code>, например <code>50 вернул на горячий кошелёк</code>.",
     ]), kb(back(f"aop:{uid}", "Отмена")), c)
 
 
@@ -46,7 +46,7 @@ async def msg_debt(m: Message, bot: Bot, s: AsyncSession, user: User, state: FSM
     data = await state.get_data()
     found = re.match(r"^\s*(\d+(?:[.,]\d{1,6})?)\s+(.{3,200})$", m.text or "")
     if not found or Decimal(found.group(1).replace(",", ".")) <= 0:
-        return await show(bot, user, warn("Сумма и причина: «50 вернул на xRocket»"), kb(back(f"aop:{data['uid']}",
+        return await show(bot, user, warn("Сумма и причина: «50 вернул на горячий кошелёк»"), kb(back(f"aop:{data['uid']}",
                                                                                             "Отмена")))
     await state.clear()
     v, why = Decimal(found.group(1).replace(",", ".")), " ".join(found.group(2).split())

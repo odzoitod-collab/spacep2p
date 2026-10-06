@@ -20,7 +20,7 @@ from sqlalchemy import exists, func, or_, select
 
 from bot.config import config
 from bot.models import Card, Deal, DealMessage, Deposit, Ledger, Operator, OrderMerchant, Session, User, Withdrawal, now
-from bot.services import admins, api, deals, events, money, operators, settings, teams, xrocket
+from bot.services import admins, api, deals, events, money, operators, settings, teams, ton
 
 log = logging.getLogger(__name__)
 ROOT = Path(__file__).resolve().parent.parent / "webapp"
@@ -505,7 +505,10 @@ async def operator_cabinet(request: web.Request) -> web.Response:
     free = (await s.scalars(select(Deal).where(Deal.status == "checking", Deal.operator_id.is_(None), Deal.via_bybit,
                                                Deal.seller_id != user.id, Deal.buyer_id != user.id)
                             .order_by(Deal.id).limit(20))).all()
-    return web.json_response({"debt": num(op.debt if op else 0),
+    debt_address = None
+    if op and op.debt and ton.chain is not None:  # his personal address: USDT there repay the debt
+        debt_address = ton.friendly((await ton.personal(s, user.id, "debt")).address)
+    return web.json_response({"debt": num(op.debt if op else 0), "debt_address": debt_address,
                               "working": [deal_json(d, None, user.id, full=False) for d in working],
                               "free": [deal_json(d, None, user.id, full=False) for d in free]})
 
@@ -587,46 +590,39 @@ async def buy(request: web.Request) -> web.Response:
     return await deal_response(s, d, user.id)
 
 
-# ---------- wallet ----------
+# ---------- wallet: USDT on TON ----------
 
 def deposit_json(dep: Deposit) -> dict:
-    return {"id": dep.id, "status": dep.status, "network": dep.network,
-            "network_name": xrocket.net_name(dep.network) if dep.network else None, "address": dep.address,
-            "link": dep.link, "amount": num(dep.amount) if dep.amount else None,
-            "credit": num(dep.credit) if dep.credit else None, "expires_at": iso(dep.expires_at),
-            "created_at": iso(dep.created_at)}
+    return {"id": dep.id, "status": dep.status, "amount": num(dep.amount), "credit": num(dep.credit),
+            "tx_hash": dep.tx_hash, "link": dep.link if dep.tx_hash else None, "created_at": iso(dep.created_at)}
 
 
 def withdrawal_json(wd: Withdrawal) -> dict:
     from bot.handlers.wallet import WD_STATUS
     return {"id": wd.id, "status": wd.status, "status_text": WD_STATUS.get(wd.status, wd.status),
-            "method": wd.method, "network": xrocket.net_name(wd.network) if wd.network else None,
-            "address": wd.address, "amount": num(wd.amount), "receive": num(wd.amount - wd.fee),
-            "link": wd.link if wd.method == "xrocket" else None, "created_at": iso(wd.created_at)}
+            "address": wd.address, "memo": wd.memo, "amount": num(wd.amount), "receive": num(wd.amount - wd.fee),
+            "cancellable": wd.status == "queued" and not wd.transfer_id, "tx_hash": wd.tx_hash,
+            "link": wd.link if wd.method == "ton" else None, "created_at": iso(wd.created_at)}
 
 
 async def wallet(request: web.Request) -> web.Response:
-    from bot.handlers.wallet import fee_pct, lock_note, withdraw_terms
+    from bot.handlers.wallet import MOVING, fee_pct, lock_note, withdraw_terms
     s, user, _ = ctx(request)
-    nets = await xrocket.networks()
-    pending = (await s.scalars(select(Deposit).where(Deposit.user_id == user.id, Deposit.status == "active",
-                                                     Deposit.purpose == "deposit")
-                               .order_by(Deposit.id.desc()).limit(3))).all()
-    moving = (await s.scalars(select(Withdrawal).where(Withdrawal.user_id == user.id, Withdrawal.status.in_(
-        ("queued", "pending", "unknown", "sent"))).order_by(Withdrawal.id))).all()
-    last = {}
-    for wd in (await s.scalars(select(Withdrawal).where(Withdrawal.user_id == user.id, Withdrawal.method == "chain")
-                               .order_by(Withdrawal.id.desc()).limit(20))).all():
-        last.setdefault(wd.network, wd.address)
+    recent = (await s.scalars(select(Deposit).where(Deposit.user_id == user.id, Deposit.purpose == "deposit",
+                                                    Deposit.tx_hash.is_not(None))
+                              .order_by(Deposit.id.desc()).limit(5))).all()
+    moving = (await s.scalars(select(Withdrawal).where(Withdrawal.user_id == user.id, Withdrawal.status.in_(MOVING))
+                              .order_by(Withdrawal.id))).all()
+    last = await s.scalar(select(Withdrawal.address).where(Withdrawal.user_id == user.id, Withdrawal.method == "ton")
+                          .order_by(Withdrawal.id.desc()).limit(1))
     return web.json_response({
         "balance": {"available": num(user.balance), "frozen": num(user.frozen),
                     "withdrawable": num(money.withdrawable(user)), "team": num(user.team_balance)},
         "lock_note": lock_note(user) or None,
-        "networks": [{"code": n, "name": xrocket.net_name(n), "last_address": last.get(n)} for n in nets],
+        "enabled": ton.chain is not None,
         "deposit": {"min": settings.get("deposit_min"), "fee": fee_pct()},
-        "withdraw": {"min": settings.get("withdraw_min"), "chain_min": settings.get("chain_withdraw_min"),
-                     "cheque_terms": withdraw_terms("xrocket"), "chain_terms": withdraw_terms("chain")},
-        "pending_deposits": [deposit_json(d) for d in pending],
+        "withdraw": {"min": settings.get("chain_withdraw_min"), "terms": withdraw_terms(), "last_address": last},
+        "deposits": [deposit_json(d) for d in recent],
         "withdrawals": [withdrawal_json(w) for w in moving],
     })
 
@@ -644,138 +640,73 @@ async def history(request: web.Request) -> web.Response:
         "ref": r.ref, "note": r.note, "at": iso(r.created_at)} for r in rows]})
 
 
-async def deposit_new(request: web.Request) -> web.Response:
-    from bot.handlers.wallet import new_address_deposit, new_invoice_deposit
+async def deposit_address(request: web.Request) -> web.Response:
+    """The user's personal deposit address (made on first use); ?check=1 also scans it for new transfers now."""
     s, user, _ = ctx(request)
-    data = await body(request)
-    if data.get("network"):
-        dep, err = await new_address_deposit(s, user, str(data["network"])[:5])
-    else:
-        dep, err = await new_invoice_deposit(s, user, parse_amount(data.get("amount"), 6))
-    if dep is None:
-        raise AppError(409, "deposit_failed", err)
-    return web.json_response({"deposit": deposit_json(dep)})
-
-
-async def own_deposit(request: web.Request) -> Deposit:
-    s, user, _ = ctx(request)
-    dep = await s.get(Deposit, int(request.match_info["id"]), populate_existing=True)
-    if dep is None or dep.user_id != user.id:
-        raise AppError(404, "not_found", "Пополнение не найдено")
-    return dep
-
-
-async def deposit_get(request: web.Request) -> web.Response:
-    from bot.handlers.wallet import check_deposit
-    s, user, _ = ctx(request)
-    dep = await own_deposit(request)
-    if dep.status in ("active", "new") and request.query.get("check") == "1":
+    if ton.chain is None:
+        raise AppError(503, "wallet_off", "Кошелёк временно недоступен — попробуйте позже")
+    a = await ton.personal(s, user.id, "deposit")
+    await s.commit()
+    checked = None
+    if request.query.get("check") == "1":
         try:
-            await check_deposit(s, dep)
-        except xrocket.XRocketError as e:
-            raise AppError(502, "check_failed", f"Не удалось проверить: {e.human}. Проверим автоматически")
-        await s.refresh(dep)
+            found = await ton.check_user(s, user.id)
+        except ton.ChainError:
+            raise AppError(502, "check_failed", "Сеть сейчас не отвечает. Поступление зачислим автоматически")
+        checked = None if found is None else [deposit_json(d) for d in found if d.purpose == "deposit"]
         await s.refresh(user)
-    return web.json_response({"deposit": deposit_json(dep), "available": num(user.balance)})
-
-
-async def deposit_cancel(request: web.Request) -> web.Response:
-    s, user, _ = ctx(request)
-    dep = await own_deposit(request)
-    dep = await s.get(Deposit, dep.id, with_for_update=True, populate_existing=True)
-    if dep.status != "active":
-        raise AppError(409, "closed", "Пополнение уже оплачено или закрыто")
-    dep.status = "cancelled"
-    events.add(s, f"dep:{dep.id}", "cancelled", "Пользователь отменил пополнение в приложении", user.id, notice=True)
-    return web.json_response({"deposit": deposit_json(dep)})
-
-
-async def withdraw_terms_of(method: str, network: str | None, amount: Decimal | None):
-    """(fee, network fee, xRocket minimum) of a withdrawal."""
-    from bot.handlers.wallet import chain_quota, withdraw_fee
-    if method == "xrocket":
-        return (withdraw_fee(amount, "xrocket") if amount else Decimal(0)), Decimal(0), Decimal(0)
-    if network not in await xrocket.networks():
-        raise AppError(409, "network_off", "Сеть сейчас недоступна")
-    nf, xmin = await chain_quota(network)
-    return (withdraw_fee(amount, "chain", nf) if amount else Decimal(0)), nf, xmin
+    return web.json_response({"address": ton.friendly(a.address), "network": "TON", "coin": "USDT",
+                              "min": settings.get("deposit_min"), "checked": checked, "available": num(user.balance)})
 
 
 async def withdraw_quote(request: web.Request) -> web.Response:
-    from bot.handlers.wallet import withdraw_problem, withdraw_terms
+    from bot.handlers.wallet import withdraw_fee, withdraw_problem, withdraw_terms
     s, user, _ = ctx(request)
-    method = "chain" if request.query.get("method") == "chain" else "xrocket"
-    network = request.query.get("network")
     amount = parse_amount(request.query.get("amount"), 6) if request.query.get("amount") else None
-    fee, nf, xmin = await withdraw_terms_of(method, network, amount)
+    fee = withdraw_fee(amount) if amount else Decimal(0)
     return web.json_response({
-        "terms": withdraw_terms(method, nf), "fee": num(fee) if amount else None,
+        "terms": withdraw_terms(), "fee": num(fee) if amount else None,
         "receive": num(amount - fee) if amount and amount > fee else None,
         "max": num(money.withdrawable(user)),
-        "error": (withdraw_problem(user, amount, method, fee, xmin) or None) if amount else None,
+        "error": (withdraw_problem(user, amount, fee) or None) if amount else None,
     })
 
 
 async def withdraw(request: web.Request) -> web.Response:
-    from bot.handlers.wallet import _check_address, debit_withdrawal, notify_withdrawal, pay_or_queue, withdraw_problem
-    s, user, bot = ctx(request)
+    from bot.handlers.wallet import accepted, check_address, submit, valid_memo, withdraw_fee, withdraw_problem
+    s, user, _ = ctx(request)
     data = await body(request)
-    method = "chain" if data.get("method") == "chain" else "xrocket"
     amount = parse_amount(data.get("amount"), 6)
     try:
         request_id = str(UUID(str(data.get("request_id"))))
     except ValueError:
         raise AppError(422, "bad_request", "Начните вывод заново")
-    network = str(data.get("network") or "")[:5] if method == "chain" else None
-    fee, nf, xmin = await withdraw_terms_of(method, network, amount)
-    if err := withdraw_problem(user, amount, method, fee, xmin):
+    fee = withdraw_fee(amount)
+    if err := withdraw_problem(user, amount, fee):
         raise AppError(422, "bad_amount", err)
     if data.get("fee") is not None and parse_amount(data.get("fee"), 6) != fee:
         raise AppError(409, "fee_changed", "Комиссия изменилась — проверьте сумму ещё раз")
-    wd = Withdrawal(user_id=user.id, amount=amount, fee=fee, request_id=request_id)
-    if method == "chain":
-        addr, err = await _check_address(s, network, data.get("address"))
-        if not addr:
-            raise AppError(422, "bad_address", err)
-        memo = data.get("memo") or None
-        if memo is not None and (network != "TON" or not isinstance(memo, str) or not 1 <= len(memo.strip()) <= 120
-                                 or not memo.strip().isprintable()):
-            raise AppError(422, "bad_memo", "Memo — до 120 символов и только для TON")
-        wd.method, wd.network, wd.address, wd.net_fee = "chain", network, addr, nf
-        wd.memo = memo.strip() if memo else None
-        what = (f"Запрос вывода в сети {xrocket.net_name(network)} (приложение): списано {money.usdt(amount)} USDT, к "
-                f"отправке {money.usdt(amount - fee)} на {addr}" + (f", memo {wd.memo}" if wd.memo else ""))
-    else:
-        what = (f"Запрос вывода чеком (приложение): списано {money.usdt(amount)} USDT, чек "
-                f"{money.usdt(amount - fee)}")
-    if err := await debit_withdrawal(s, user, wd, what):
+    addr, err = await check_address(s, data.get("address"))
+    if not addr:
+        raise AppError(422, "bad_address", err)
+    memo = None
+    if data.get("memo"):
+        if (memo := valid_memo(data.get("memo"))) is None:
+            raise AppError(422, "bad_memo", "Memo — до 120 обычных символов")
+    wd = Withdrawal(user_id=user.id, amount=amount, fee=fee, request_id=request_id, address=addr, memo=memo)
+    if err := await submit(s, user, wd, "приложение"):
         raise AppError(409, "not_debited", err)
-    result = await pay_or_queue(s, wd)
-    await s.commit()
     await s.refresh(user)
-    if result == "done":
-        await notify_withdrawal(bot, wd, "done")
-    net = money.usdt(wd.amount - wd.fee)
-    message = {
-        "done": f"Чек на {net} USDT — в чате с ботом: активируйте его, и USDT придут в @xRocket" if method == "xrocket"
-        else f"Вывод #{wd.id} выполнен: {net} USDT отправлены",
-        "sent": f"Вывод #{wd.id} принят: {net} USDT уйдут в течение нескольких минут",
-        "queued": f"Вывод #{wd.id} в очереди: {net} USDT отправим автоматически, обычно в течение часа",
-        "unknown": f"Вывод #{wd.id} на проверке: сумма удержана, сверим автоматически",
-    }.get(result) or f"Вывод не выполнен: {result}. Средства возвращены на баланс"
-    return web.json_response({"result": result, "ok": result in ("done", "sent", "queued", "unknown"),
-                              "message": message, "withdrawal": withdrawal_json(wd), "available": num(user.balance)})
+    return web.json_response({"result": "queued", "ok": True, "message": accepted(wd),
+                              "withdrawal": withdrawal_json(wd), "available": num(user.balance)})
 
 
 async def withdraw_cancel(request: web.Request) -> web.Response:
+    from bot.handlers.wallet import cancel_queued
     s, user, _ = ctx(request)
-    wd = await s.get(Withdrawal, int(request.match_info["id"]), with_for_update=True, populate_existing=True)
-    if wd is None or wd.user_id != user.id or wd.status != "queued":
+    wd = await cancel_queued(s, user, int(request.match_info["id"]), "приложение")
+    if wd is None:
         raise AppError(409, "too_late", "Вывод уже отправляется — отменить нельзя")
-    wd.status = "cancelled"
-    await money.add(s, user.id, wd.amount, "withdraw_refund", f"wd:{wd.id}")
-    events.add(s, f"wd:{wd.id}", "cancelled", f"Пользователь отменил вывод из очереди в приложении, "
-               f"{money.usdt(wd.amount)} USDT возвращены", user.id, notice=True)
     return web.json_response({"withdrawal": withdrawal_json(wd)})
 
 
@@ -924,9 +855,7 @@ def setup(app: web.Application, bot: Bot) -> None:
     r.add_post("/app/api/buy", buy)
     r.add_get("/app/api/wallet", wallet)
     r.add_get("/app/api/history", history)
-    r.add_post("/app/api/deposits", deposit_new)
-    r.add_get("/app/api/deposits/{id:\\d+}", deposit_get)
-    r.add_post("/app/api/deposits/{id:\\d+}/cancel", deposit_cancel)
+    r.add_get("/app/api/deposit", deposit_address)
     r.add_get("/app/api/withdraw/quote", withdraw_quote)
     r.add_post("/app/api/withdraw", withdraw)
     r.add_post("/app/api/withdrawals/{id:\\d+}/cancel", withdraw_cancel)

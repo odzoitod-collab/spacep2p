@@ -9,7 +9,7 @@ from sqlalchemy import select
 
 from bot import models, tasks
 from bot.models import Deposit, Ledger, Operator, User
-from bot.services import money, operators
+from bot.services import money, operators, ton
 from tests.harness import cb, ids, msg, plain, tg
 from tests.test_orders import LINK, deal, give, merchant, request
 from tests.test_scenarios import ADMIN, BUYER, OTHER, PDF, create_deal, ready, user
@@ -62,10 +62,10 @@ def test_operators_from_the_panel_first_accept_wins_and_the_debt_is_repaid(go):
         text = plain(b.session.last(OPB))
         assert "не погашено: 500 USDT" in text and "op:pay" in b.session.buttons(OPB)
         await b.run(cb(OPB, "op:pay"))
-        assert b.rocket.invoices[-1][:2] == (D(500), "dep-1")
-        assert "К оплате: 500 USDT" in plain(b.session.last(OPB))
-        b.rocket.payments = [{"id": "p", "status": "paid", "receiveAmount": "520", "receiveCurrency": "USDT"}]
-        await tasks.poll_deposits(b.bot)
+        assert ton.friendly(ton.address(f"debt:{OPB}")) in plain(b.session.last(OPB))
+        assert "Долг: 500 USDT" in plain(b.session.last(OPB))
+        b.chain.pay(OPB, "520", purpose="debt")
+        await tasks.ton_cycle(b.bot)
         async with models.Session() as s:
             assert (await s.get(Operator, OPB)).debt == 0
             assert (await s.get(Deposit, 1)).purpose == "debt"
@@ -193,18 +193,21 @@ def test_personal_buyer_terms_with_a_loss_guard(go):
     go(fn)
 
 
-def test_withdrawal_fee_is_one_and_a_half_percent(go):
+def test_withdrawal_fee_is_one_and_a_half_percent_plus_fixed(go):
     async def fn(b):
         await ready(b)
         async with models.Session() as s:
             await money.add(s, BUYER, D(100), "deposit", "dep:0")
             await s.commit()
+        b.chain.fund_hot(usdt="500")
         await b.run(cb(BUYER, "w"), cb(BUYER, "w:out"))
-        assert "Чек xRocket: мгновенно · 1.5%" in plain(b.session.last(BUYER))
-        await b.run(cb(BUYER, "w:wd"), msg(BUYER, "100"))
-        assert "Сумма чека: 98.5 USDT" in plain(b.session.last(BUYER))
+        assert "Комиссия: 1.5% + 1 USDT" in plain(b.session.last(BUYER))
+        await b.run(msg(BUYER, "UQBvW8Z5huBkMJYdnfAEM5JqTNkuWX3diqYENkWsIL0XglxD"), cb(BUYER, "w:nomemo"),
+                    msg(BUYER, "100"))
+        assert "Придёт: 97.5 USDT" in plain(b.session.last(BUYER))
         await b.run(cb(BUYER, "w:go"))
-        assert b.rocket.cheques[-1][0] == D("98.5")
+        await tasks.ton_cycle(b.bot)
+        assert b.chain.sent[-1][3] == D("97.5")
         async with models.Session() as s:
-            assert await s.scalar(select(Ledger.delta).where(Ledger.kind == "withdraw_fee")) == D("1.5")
+            assert await s.scalar(select(Ledger.delta).where(Ledger.kind == "withdraw_fee")) == D("2.5")
     go(fn)

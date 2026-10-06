@@ -1,10 +1,11 @@
 """The platform's money at a glance: what it holds, what it owes users, what is profit and can be taken out.
 
-Assets:       the xRocket app balance: every deposit lands there and every withdrawal is paid from it.
+Assets:       USDT on the bot's hot wallet in TON (every withdrawal is paid from it) plus USDT that came to users'
+              personal addresses and are not collected to the hot wallet yet.
 Liabilities:  users' available balances + team leaders' team balances + USDT frozen in deals + withdrawals debited
               but not paid yet.
 Operators:    USDT of Bybit-order deals arrive on the operators' Bybit accounts while the buyers are credited in the
-              bot: each operator owes them (services/operators.py) and repays to xRocket — a receivable, shown
+              bot: each operator owes them (services/operators.py) and repays to his debt address — a receivable, shown
               separately and not counted in the assets until it is repaid.
 Free:         assets − liabilities. This is what the owner can take out without touching users' money; it already
               contains the profit.
@@ -16,15 +17,15 @@ from decimal import Decimal
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from bot.models import Deal, Ledger, User, Withdrawal, now
-from bot.services import operators, xrocket
+from bot.models import Deal, Ledger, TonAddress, User, Withdrawal, now
+from bot.services import operators, ton
 
-UNPAID = ("queued", "pending", "unknown", "sent")  # withdrawals debited from users, not paid out yet
+UNPAID = ("queued", "pending", "sending", "unknown", "sent")  # withdrawals debited from users, not paid out yet
 
 
 @dataclass
 class Snapshot:
-    xrocket: Decimal | None  # None: xRocket did not answer
+    hot: Decimal | None  # USDT on the hot wallet; None: the network did not answer
     users_available: Decimal
     users_frozen: Decimal
     unpaid: Decimal
@@ -39,10 +40,12 @@ class Snapshot:
     op_debt: Decimal = Decimal(0)  # operators owe for accepted Bybit orders, not repaid yet
     team_paid: Decimal = Decimal(0)  # paid to team leaders, all time
     users_team: Decimal = Decimal(0)  # team leaders' team balances, not moved to the main balance yet
+    unswept: Decimal = Decimal(0)  # USDT on users' personal addresses, not collected to the hot wallet yet
+    hot_ton: Decimal | None = None  # TON for fees on the hot wallet
 
     @property
     def assets(self) -> Decimal:
-        return self.xrocket or Decimal(0)
+        return (self.hot or Decimal(0)) + self.unswept
 
     @property
     def liabilities(self) -> Decimal:
@@ -59,9 +62,10 @@ async def _sum(s: AsyncSession, expr, *where) -> Decimal:
 
 async def snapshot(s: AsyncSession) -> Snapshot:
     try:
-        rocket = await xrocket.usdt_available(max_age=60, timeout=5)
+        hot, hot_ton = await ton.hot_balances(max_age=60, timeout=5)
+        hot -= await ton.in_flight_usdt(s)  # sent, maybe not subtracted by the indexer yet
     except Exception:  # noqa: BLE001 - shown as "unknown"
-        rocket = None
+        hot = hot_ton = None
     t = now()
     profit = {}
     for key, since in (("24h", t - timedelta(hours=24)), ("7d", t - timedelta(days=7)),
@@ -82,7 +86,7 @@ async def snapshot(s: AsyncSession) -> Snapshot:
     queued_n, queued = (await s.execute(select(func.count(Withdrawal.id), func.coalesce(
         func.sum(Withdrawal.amount - Withdrawal.fee), 0)).where(Withdrawal.status == "queued"))).one()
     return Snapshot(
-        xrocket=rocket,
+        hot=hot, hot_ton=hot_ton, unswept=await _sum(s, TonAddress.unswept),
         users_available=await _sum(s, User.balance), users_frozen=await _sum(s, User.frozen),
         users_team=await _sum(s, User.team_balance),
         unpaid=Decimal(unpaid), unpaid_n=unpaid_n, queued=Decimal(queued), queued_n=queued_n,

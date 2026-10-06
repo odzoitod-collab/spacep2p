@@ -70,7 +70,8 @@ async def operators_screen(bot: Bot, s: AsyncSession, admin: User, src=None, not
                   + ("" if uid in active else " · убран") for uid in shown) if shown else "",
         "",
         quote("Оператор получает ссылку на Bybit-ордер, выдаёт его реквизиты и подтверждает оплату. USDT ордера "
-              "приходят ему на Bybit — это его долг, он гасит его счётом xRocket или с баланса."
+              "приходят ему на Bybit — это его долг, он гасит его переводом USDT (TON) на свой адрес погашения или с "
+              "баланса."
               + (f" Из .env (OPERATOR_IDS): {', '.join(map(str, config.operator_ids))}." if config.operator_ids else "")),
     ]).replace("\n\n\n", "\n\n") + note, kb(
         btn("Добавить оператора", "aop:add", "plus", style="success"),
@@ -109,7 +110,7 @@ async def msg_operator_add(m: Message, bot: Bot, s: AsyncSession, user: User, st
         "• Когда мерчант пришлёт Bybit-ордер, вам придёт сообщение с кнопкой «Принять ордер»",
         "• Кто первым принял — получает ссылку, у остальных ордер пропадает",
         "• Зайдите в ордер, выдайте покупателю реквизиты, проверьте оплату и подтвердите",
-        "• USDT ордера приходят вам на Bybit — это ваш долг, гасите его в «Оператор» счётом xRocket"]),
+        "• USDT ордера приходят вам на Bybit — это ваш долг, гасите его в «Оператор» переводом USDT (TON)"]),
         kb(btn("Кабинет оператора", "op", "shop", style="success"), back("x", "Скрыть", "cross")))
     await operator_card(bot, s, user, u.id, note=ok("Оператор добавлен и уведомлён"))
 
@@ -184,7 +185,7 @@ async def cb_writeoff(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User, s
     await show(bot, user, "\n".join([
         title(pe("dollar"), "Списать долг вручную"),
         quote(f"• Долг сейчас: <b>{money.usdt(op.debt if op else Decimal(0))} USDT</b>"),
-        "Используйте, если оператор вернул USDT в обход бота (например, переводом на xRocket площадки). "
+        "Используйте, если оператор вернул USDT в обход бота (например, переводом прямо на горячий кошелёк). "
         "Отправьте сумму в USDT:"]), kb(back(f"aop:{uid}", "Отмена")), c)
 
 

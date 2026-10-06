@@ -1,20 +1,28 @@
-"""Test bench: real dispatcher + middlewares + handlers, fake Telegram transport, fake xRocket.
+"""Test bench: real dispatcher + middlewares + handlers, fake Telegram transport, fake TON network.
 
 Database: SQLite in memory by default; every test using `db_url` also runs on PostgreSQL when
 P2P_TEST_PG is set (e.g. postgresql+asyncpg://p2p@127.0.0.1:55432/p2p_test). The PG schema is
 dropped and re-created for every test.
 """
+import asyncio
+import base64
+import hashlib
 import html
 import itertools
 import os
 import re
+import time
 from datetime import datetime
+from decimal import Decimal
 from html.parser import HTMLParser
 
 os.environ.setdefault("BOT_TOKEN", "123:abc")
 os.environ["ADMIN_IDS"] = "[1, 2]"  # 2 = second admin for approvals
 os.environ["LOG_CHAT_ID"] = "1"  # never use the log chat from a developer's .env
 os.environ["EMOJI_MODE"] = "premium"
+os.environ["TON_SEED"] = "5e" * 32  # a fixed test key: every wallet address is stable across runs
+os.environ["TON_TESTNET"] = "false"
+os.environ["TON_API_KEY"] = ""
 
 from aiogram import Bot, Dispatcher  # noqa: E402
 from aiogram.client.default import DefaultBotProperties  # noqa: E402
@@ -33,7 +41,7 @@ from bot.app import build_dispatcher  # noqa: E402
 from bot import ui  # noqa: E402
 from bot.api import server as api_server  # noqa: E402
 from bot.handlers import logchat  # noqa: E402
-from bot.services import settings, xrocket  # noqa: E402
+from bot.services import settings, ton  # noqa: E402
 
 ui.MIN_GAP = 0  # no pacing delays in tests
 
@@ -170,74 +178,98 @@ class FakeSession(BaseSession):
         return []
 
 
-class FakeRocket:
+class FakeChain:
+    """The TON network as services/ton.Chain shows it: wallets with seqno and TON, USDT jetton balances, the indexer's
+    jetton transfers. broadcast() executes a message like a v4 wallet: only with the current seqno and before
+    valid_until."""
+
     def __init__(self):
-        self.cheques = []
-        self.invoice_status = "paid"
-        self.payments = [{"id": "p1", "status": "paid", "receiveAmount": "98.5", "receiveCurrency": "USDT"}]
-        self.cheque_error: xrocket.XRocketError | None = None
-        self.lookup: dict | xrocket.XRocketError = xrocket.XRocketError("app_cheque_not_found", status=404)
-        self.withdrawals: dict[str, dict] = {}  # clientWithdrawalId -> xRocket withdrawal
-        self.withdrawal_calls: list[tuple] = []
-        self.withdrawal_status = "CREATED"
-        self.withdrawal_error: xrocket.XRocketError | None = None
-        self.invoices: list[tuple] = []  # (amount or None, client id, min payment)
-        self.addresses: list[tuple] = []  # (invoice id, network)
-        self.networks = ["TON", "TRX", "ETH", "BSC", "SOL"]
+        self.seqno: dict[str, int] = {}  # wallet label -> seqno
+        self.ton: dict[str, Decimal] = {}  # raw address -> TON
+        self.usdt: dict[str, Decimal] = {}  # raw owner -> USDT
+        self.transfers: list[dict] = []  # what Toncenter v3 /jetton/transfers knows
+        self.sent: list[tuple] = []  # executed messages: (label, asset, to raw, amount, memo, query_id)
+        self.messages: dict[str, dict] = {}  # boc -> signed message
+        self.apply = True  # broadcast reaches the network (False: lost on the way)
+        self.abort = False  # jetton transfers are aborted on chain
+        self.index = True  # executed jetton transfers show up in the indexer
+        self.down = False  # Toncenter does not answer
+        self.n = 0
 
-    async def create_invoice(self, amount, client_id, description, min_payment=None, expires_ms=3_600_000):
-        self.invoices.append((amount, client_id, min_payment))
-        return {"id": f"inv{len(self.invoices)}", "links": {"telegramBotLink": "https://t.me/xRocket?start=inv1"}}
+    def _check(self):
+        if self.down:
+            raise ton.ChainError("toncenter: ConnectError down")
 
-    async def payment_address(self, invoice_id, network):
-        self.addresses.append((invoice_id, network))
-        return {"address": f"{network}addr{len(self.addresses)}" + "x" * 30, "payNetwork": network,
-                "expiresAt": "2099-01-01T00:00:00Z"}
+    def _transfer(self, source, destination, amount, query_id=0, aborted=False, master=None) -> str:
+        self.n += 1
+        h = hashlib.sha256(f"tx{self.n}".encode()).digest()
+        self.transfers.append({
+            "source": source, "destination": destination, "amount": str(int(Decimal(amount) * ton.USDT_UNIT)),
+            "jetton_master": master or ton.usdt_master(), "transaction_hash": base64.b64encode(h).decode(),
+            "transaction_now": int(time.time()), "transaction_aborted": aborted, "query_id": str(query_id)})
+        return h.hex()
 
-    async def usdt_networks(self):
-        return self.networks
+    def pay(self, uid, amount, purpose="deposit", master=None, aborted=False) -> str:
+        """Someone sends USDT to the user's personal address. Returns the transaction hash (hex)."""
+        to = ton.address(f"{purpose}:{uid}")
+        if not aborted and master is None:
+            self.usdt[to] = self.usdt.get(to, Decimal(0)) + Decimal(amount)
+        return self._transfer(ton.raw("UQCxE6mUtQJKFnGfaROTKOt1lZbDiiX1kCixRv7Nw2Id_p0p"), to, amount, aborted=aborted,
+                              master=master)
 
-    async def get_invoice(self, invoice_id):
-        return {"id": invoice_id, "status": self.invoice_status}
+    def fund_hot(self, usdt="0", gas="10"):
+        hot = ton.hot_address()
+        self.usdt[hot] = self.usdt.get(hot, Decimal(0)) + Decimal(usdt)
+        self.ton[hot] = self.ton.get(hot, Decimal(0)) + Decimal(gas)
 
-    async def get_invoice_by_client(self, client_id):
-        return {"id": "inv1", "status": self.invoice_status, "links": {"telegramBotLink": "https://t.me/x"}}
+    async def state(self, label):
+        self._check()
+        return self.seqno.get(label, 0), self.ton.get(ton.address(label), Decimal(0))
 
-    async def get_invoice_payments(self, invoice_id):
-        return self.payments
+    async def build(self, tr):
+        boc = f"boc{tr.id}"
+        self.messages[boc] = {"wallet": tr.wallet, "seqno": tr.seqno, "valid_until": tr.valid_until,
+                              "asset": tr.asset, "to": tr.to_address, "amount": Decimal(tr.amount), "memo": tr.memo,
+                              "query_id": tr.id}
+        return boc, hashlib.sha256(boc.encode()).hexdigest()
 
-    async def create_cheque(self, amount, client_id, tg_id, description):
-        if self.cheque_error:
-            raise self.cheque_error
-        self.cheques.append((amount, client_id, tg_id))
-        return {"chequeId": "c1", "links": {"telegramBotLink": "https://t.me/xRocket?start=c1"}}
+    async def broadcast(self, boc):
+        self._check()
+        m = self.messages[boc]
+        label, src = m["wallet"], ton.address(m["wallet"])
+        if not self.apply or self.seqno.get(label, 0) != m["seqno"] or time.time() > m["valid_until"]:
+            return  # a v4 wallet refuses it: nothing happens
+        self.seqno[label] = m["seqno"] + 1
+        fee = ton.JETTON_TON if m["asset"] == "USDT" else m["amount"]
+        self.ton[src] = self.ton.get(src, Decimal(0)) - fee
+        if m["asset"] == "TON":
+            self.ton[m["to"]] = self.ton.get(m["to"], Decimal(0)) + m["amount"]
+        else:
+            aborted = self.abort or self.usdt.get(src, Decimal(0)) < m["amount"]
+            if not aborted:
+                self.usdt[src] -= m["amount"]
+                self.usdt[m["to"]] = self.usdt.get(m["to"], Decimal(0)) + m["amount"]
+            if self.index:
+                self._transfer(src, m["to"], m["amount"], m["query_id"], aborted)
+        self.sent.append((label, m["asset"], m["to"], m["amount"], m["memo"], m["query_id"]))
 
-    async def get_cheque_by_client(self, client_id):
-        if isinstance(self.lookup, Exception):
-            raise self.lookup
-        return self.lookup
+    async def incoming(self, owners, since):
+        self._check()
+        return [t for t in self.transfers if t["destination"] in owners and t["transaction_now"] >= since]
 
-    async def delete_cheque_by_client(self, client_id):
+    async def outgoing(self, owner, since):
+        self._check()
+        return [t for t in self.transfers if t["source"] == owner and t["transaction_now"] >= since]
+
+    async def usdt_balance(self, owner):
+        self._check()
+        return self.usdt.get(owner, Decimal(0))
+
+    async def check(self):
+        self._check()
+
+    async def close(self):
         pass
-
-    async def balances(self):
-        return [{"asset": "USDT", "available": "1000"}]
-
-    async def create_withdrawal(self, client_id, network, address, amount, comment):
-        if self.withdrawal_error:
-            raise self.withdrawal_error
-        w = self.withdrawals.setdefault(client_id, {"status": self.withdrawal_status, "amount": str(amount),
-                                                    "address": address, "comment": comment, "network": network})
-        self.withdrawal_calls.append((client_id, network, address, amount, comment))
-        return dict(w)
-
-    async def get_withdrawal(self, client_id):
-        if client_id not in self.withdrawals:
-            raise xrocket.XRocketError("app_withdrawal_not_found", status=404)
-        return dict(self.withdrawals[client_id])
-
-    async def withdrawal_quota(self, network):
-        return {"withdrawMinSize": "0.5", "withdrawFee": "0.1", "withdrawFeeAsset": "USDT", "precision": 6}
 
 
 def tg(uid):
@@ -278,9 +310,10 @@ async def cb_main(uid, data, session=None):
 async def reset_db(url: str) -> None:
     ui._banner_id = None  # every test starts like a fresh process: banner not uploaded yet
     ui._emoji_off_until = 0.0
-    xrocket._usdt = None
-    xrocket._quotas.clear()
-    xrocket._networks = None
+    ton._hot = None
+    ton.busy = asyncio.Lock()
+    ton.wake = asyncio.Event()
+    ton.POLL, ton.WAIT = 0, 0.01
     api_server.limiter._buckets.clear()
     logchat._forum.clear()
     logchat._topics.clear()
@@ -311,8 +344,8 @@ class Bench:
     def __init__(self):
         self.session = FakeSession()
         self.bot = Bot("123:abc", session=self.session, default=DefaultBotProperties(parse_mode="HTML"))
-        self.rocket = FakeRocket()
-        xrocket.rocket = self.rocket
+        self.chain = FakeChain()
+        ton.chain = self.chain
         self.dp = make_dp()
 
     def restart(self):
@@ -383,3 +416,8 @@ def plain(t: str) -> str:
     p = html.unescape(re.sub(r"<[^>]+>", "", t))
     p = re.sub(r":\n ╰  ", ": ", p)
     return re.sub(r"(?m)^[├╰] {2}", "", p)
+
+
+async def ton_cycle(b) -> "ton.Report":
+    from bot import tasks
+    return await tasks.ton_cycle(b.bot)

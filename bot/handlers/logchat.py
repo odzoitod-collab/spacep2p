@@ -34,7 +34,7 @@ from bot.config import config
 from bot.emoji import back, btn, kb, pe
 from bot.models import (Adjustment, ApiApplication, ApiClient, Card, Deal, Deposit, Event, LogMessage, Operator,
                         OrderMerchant, Session, Setting, Team, Ticket, User, Withdrawal, now)
-from bot.services import events, money, xrocket
+from bot.services import events, money, ton
 from bot.services.admins import IsAdmin
 from bot.ui import MSK, alink, app_link, at, card, cf, clean, esc, mark, paced, section, stamp, ulink
 
@@ -70,15 +70,15 @@ KIND_TOPIC = {"wd": "withdrawals", "dep": "deposits", "apa": "api", "apc": "api"
               "team": "teams"}
 # what each topic is for: (what comes by itself, what the buttons do); the commands are admin_cmds.HELP
 ABOUT = {
-    "attention": ("Всё, что ждёт решения: споры, отказы xRocket, выводы на проверке, новые заявки и анкеты, "
-                  "нехватка средств. Держите эту тему со звуком.",
+    "attention": ("Всё, что ждёт решения: споры, выводы на проверке, отказы сети TON, газ и USDT на горячем кошельке, "
+                  "новые заявки и анкеты. Держите эту тему со звуком.",
                   "«Подробнее» — полная карточка прямо здесь; решения — кнопками на карточке."),
     "control": ("Отсюда удобно работать с админ-панелью: /admin открывает её прямо в чате, все переходы — правкой "
                 "того же сообщения. В личку ничего не уходит.",
                 "Кнопки панели работают на месте. Имена и номера — ссылки: откроют карточку в личке с ботом."),
     "signups": ("Заявки новых пользователей: кто (P2P-продавец или покупатель), оборот в день, скриншот.",
                 "«Одобрить» / «Отклонить» — решение прямо на карточке, под ней появится, кто решил."),
-    "stats": ("Одно живое сообщение: сколько денег на xRocket, сколько должны пользователям, прибыль и сколько "
+    "stats": ("Одно живое сообщение: сколько USDT на кошельках TON, сколько должны пользователям, прибыль и сколько "
               "можно забрать. Обновляется каждые 10 минут.", ""),
     "deals": ("Сделки по статичным картам: одна карточка на сделку, статус и история меняются по ходу.",
               "«Подробнее» — вся сделка и решения (завершить, отменить, изменить сумму) прямо здесь."),
@@ -91,10 +91,10 @@ ABOUT = {
                   "«Подробнее» — карточка оператора: снять, вернуть, списать долг."),
     "teams": ("Команды: заявки тимлидов, участники по реферальным ссылкам, подключение чатов, процент тимлида.",
               "Заявку — «Одобрить» / «Отклонить» на карточке; «Подробнее» — участники, ссылка в чат команды."),
-    "deposits": ("Пополнения через xRocket: счета и адреса в сетях — сумма, комиссия, зачислено.",
-                 "«Подробнее» — проверить счёт в xRocket."),
-    "withdrawals": ("Выводы через xRocket: чеки и переводы на кошельки — от запроса до выполнения.",
-                    "«Подробнее» — сверка с xRocket и возврат, если чек не создан."),
+    "deposits": ("Пополнения USDT в сети TON на личные адреса: сумма, комиссия, зачислено, хеш транзакции.",
+                 "«Подробнее» — карточка поступления со ссылкой на транзакцию."),
+    "withdrawals": ("Выводы USDT в сети TON: запрос, очередь, отправка, хеш транзакции — от запроса до выполнения.",
+                    "«Подробнее» — проверка в сети; для владельцев — ручное решение по выводу на проверке."),
     "api": ("Заявки на Strait Pay API и API-клиенты: одобрение, токены, приостановка.",
             "Заявку — «Одобрить» / «Отклонить» на карточке."),
     "om": ("Анкеты ордерных мерчантов и их статус.", "Анкету — «Одобрить» / «Отклонить» на карточке."),
@@ -109,7 +109,7 @@ ABOUT = {
                "решения споров, настройки, назначение админов.", "Имена — ссылки на карточки в боте."),
     "errors": ("Ошибки бота: что сломалось, где и когда. Одна и та же ошибка в течение 30 минут — один пост со "
                "счётчиком повторов.", ""),
-    "service": ("Сервисные сообщения: xRocket и настройки.", ""),
+    "service": ("Сервисные сообщения: TON-кошелёк (газ, сбор USDT на горячий кошелёк, переводы владельцев, ключ Toncenter) и настройки.", ""),
 }
 IMPORTANT = ("failed", "unknown", "refunded", "dispute", "late_no_funds")
 TIMELINE = 6
@@ -322,27 +322,33 @@ async def describe(s: AsyncSession, ref: str) -> tuple[str, str, str, list[str]]
         topic = "bybit" if obj.via_bybit else "orders" if obj.is_order else "deals"
         return topic, obj.status, DEAL_STATUS[obj.status][1], fields
     if kind == "wd":
-        where = (f"{xrocket.net_name(obj.network)} · <code>{esc(obj.address or '—')}</code>" if obj.method == "chain"
-                 else "чек xRocket")
+        where = (f"USDT · TON · <code>{esc(obj.address or '—')}</code>" + (f" · memo <code>{esc(obj.memo)}</code>"
+                                                                           if obj.memo else "")
+                 if obj.method == "ton" else "чек xRocket" if obj.method == "xrocket" else f"xRocket · {obj.network}")
         return topic, obj.status, WD_LABEL.get(obj.status, obj.status), [
             cf("Пользователь", await who(s, obj.user_id), icon="profile"),
             cf("Способ", where, icon="wallet"),
             cf("Сумма", f"списано <b>{money.usdt(obj.amount)} USDT</b>",
                f"к получению <b>{money.usdt(obj.amount - obj.fee)} USDT</b> · комиссия {money.usdt(obj.fee)}",
                icon="dollar"),
-            cf("Ответ xRocket", f"<code>{esc(obj.error[:200])}</code>", icon="info") if obj.error else ""]
+            cf("Транзакция", f'<a href="{esc(obj.link)}">{esc(obj.tx_hash or "открыть")}</a>' if obj.link
+               else f"<code>{esc(obj.tx_hash)}</code>", icon="search") if obj.tx_hash else "",
+            cf("Ошибка", f"<code>{esc(obj.error[:200])}</code>", icon="info") if obj.error else ""]
     if kind == "dep" and obj.purpose == "debt":
         return "operators", obj.status, DEP_LABEL.get(obj.status, obj.status), [
             cf("Оператор", await who(s, obj.user_id), icon="profile"),
             cf("Назначение", "погашение долга за Bybit-ордера", icon="info"),
-            cf("Счёт", f"<b>{money.usdt(obj.amount)} USDT</b>" + (" · оплачен" if obj.status == "paid" else ""),
-               icon="dollar")]
+            cf("Сумма", f"<b>{money.usdt(obj.amount)} USDT</b>" + (" · погашено" if obj.status == "paid" else ""),
+               icon="dollar"),
+            cf("Транзакция", f'<a href="{esc(obj.link)}">{esc(obj.tx_hash)}</a>', icon="search") if obj.tx_hash else ""]
     if kind == "dep":
-        how = f"адрес {xrocket.net_name(obj.network)}" if obj.address else "счёт xRocket"
+        how = (f"USDT · TON на личный адрес · от <code>{esc(ton.short(ton.friendly(obj.source)))}</code>"
+               if obj.tx_hash and obj.source else "USDT · TON на личный адрес" if obj.tx_hash else "счёт xRocket")
         return topic, obj.status, DEP_LABEL.get(obj.status, obj.status), [
             cf("Пользователь", await who(s, obj.user_id), icon="profile"), cf("Способ", how, icon="wallet"),
             cf("Сумма", f"<b>{money.usdt(obj.amount)} USDT</b>" + (
-                f" · зачислено {money.usdt(obj.credit)}" if obj.status == "paid" else ""), icon="dollar")]
+                f" · зачислено {money.usdt(obj.credit)}" if obj.status == "paid" else ""), icon="dollar"),
+            cf("Транзакция", f'<a href="{esc(obj.link)}">{esc(obj.tx_hash)}</a>', icon="search") if obj.tx_hash else ""]
     if kind == "apa":
         return topic, obj.status, APP_STATUS[obj.status], [
             cf("Заявитель", await who(s, obj.user_id), icon="profile"),
@@ -403,7 +409,7 @@ async def describe(s: AsyncSession, ref: str) -> tuple[str, str, str, list[str]]
     return topic, "", "", []
 
 
-APP_NAMES = {"chat": ("Чат сообщества", "ach"), "broadcast": ("Рассылка", "ach"), "xrocket": ("xRocket", "al")}
+APP_NAMES = {"chat": ("Чат сообщества", "ach"), "broadcast": ("Рассылка", "ach"), "ton": ("TON-кошелёк", "aton")}
 # pending applications are decided right on their card: kind -> (status, approve callback, reject callback)
 DECIDE = {"team": ("pending", "atm:ok", "atm:no"), "om": ("pending", "aom:ok", "aom:no"),
           "apa": ("pending", "aap:ok", "aap:no"), "adj": ("pending", "adj:ok", "adj:no")}
@@ -542,7 +548,9 @@ ACTIONS = {
     "deal_amount": ("pencil", "Изменил сумму сделки"), "deal_extend": ("clock", "Продлил срок сделки"),
     "card_off": ("pause", "Выключил карту"), "card_ban": ("ban", "Заблокировал карту"),
     "card_unban": ("ok", "Разблокировал карту"), "offline": ("pause", "Снял со смены"),
-    "wd_check": ("refresh", "Проверил вывод в xRocket"), "wd_refund": ("cross", "Вернул средства по выводу"),
+    "wd_check": ("refresh", "Проверил вывод в сети"),
+    "wd_confirm": ("ok", "Подтвердил выполнение вывода"), "ton_cycle": ("refresh", "Запустил цикл TON-кошелька"),
+    "ton_out": ("up", "Вывел с горячего кошелька"), "ton_key": ("key", "Сменил ключ Toncenter"), "wd_refund": ("cross", "Вернул средства по выводу"),
     "report": ("doc", "Выгрузил отчёт CSV"), "broadcast": ("bell", "Запустил рассылку"),
     "operator_add": ("plus", "Назначил оператора"), "operator_status": ("shop", "Изменил статус оператора"),
     "operator_writeoff": ("dollar", "Списал долг оператора"), "team_approve": ("ok", "Одобрил команду"),

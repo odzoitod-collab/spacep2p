@@ -3,7 +3,8 @@ from decimal import Decimal as D
 
 from bot import models, tasks
 from bot.config import config
-from bot.services import finance
+from bot.models import TonAddress
+from bot.services import finance, ton
 from tests.harness import cb, msg, plain
 from tests.test_scenarios import ADMIN, BUYER, PDF, SELLER, create_deal, ready
 
@@ -13,9 +14,12 @@ def test_numbers_add_up_and_stats_message_is_edited(go, monkeypatch):
         await ready(b)  # the seller holds 200 USDT
         d = await create_deal(b)
         await b.run(cb(BUYER, f"dl:rc:{d.id}"), msg(BUYER, document=PDF), cb(SELLER, f"dl:ok2:{d.id}"))
-        async with models.Session() as s:
+        b.chain.fund_hot(usdt="990", gas="4")
+        async with models.Session() as s:  # 10 USDT came to a personal address, not collected yet
+            s.add(TonAddress(user_id=BUYER, purpose="deposit", address=ton.address(f"deposit:{BUYER}"), unswept=D(10)))
+            await s.commit()
             sn = await finance.snapshot(s)
-        assert sn.xrocket == D(1000)
+        assert (sn.hot, sn.unswept, sn.hot_ton, sn.assets) == (D(990), D(10), D(4), D(1000))
         assert (sn.users_available, sn.users_frozen) == (D(105) + D(94), D(0))  # seller 105, buyer 94
         assert sn.profit["all"] == D(1) and sn.profit["24h"] == D(1)  # 95 − 94 stays with the platform
         assert sn.liabilities == D(199) and sn.free == D(801)
@@ -23,7 +27,8 @@ def test_numbers_add_up_and_stats_message_is_edited(go, monkeypatch):
 
         await b.run(cb(ADMIN, "a"), cb(ADMIN, "afin"))
         text = plain(b.session.last(ADMIN))
-        assert "Можно забрать: 801 USDT" in text and "всего +1 USDT" in text and "отсюда выводы: 1 000" in text
+        assert "Можно забрать: 801 USDT" in text and "всего +1 USDT" in text and "отсюда выводы: 990 USDT · газ 4 TON" in text
+        assert "ещё не собрано: 10 USDT" in text
 
         forum = -100555
         monkeypatch.setattr(config, "log_chat_id", forum)
@@ -47,9 +52,7 @@ def test_shortfall_is_shown_when_assets_are_below_users_money(go):
     async def fn(b):
         await ready(b)
 
-        async def poor():
-            return [{"asset": "USDT", "available": "50"}]
-        b.rocket.balances = poor
+        b.chain.fund_hot(usdt="50")
         async with models.Session() as s:
             sn = await finance.snapshot(s)
             assert sn.free == D(50) - D(200)

@@ -3,8 +3,8 @@
 Who is an operator: active rows of `operators` (an admin adds them in the panel) plus OPERATOR_IDS from .env; if there
 are none at all, the admins. An operator enters the merchant's Bybit order and confirms the buyer's payment: the
 order's USDT arrive on the operator's own Bybit account while the platform credits the buyer. So every confirmed
-deal adds its seller_debit to the operator's debt; he repays it with an xRocket invoice (a Deposit with
-purpose="debt") or from his balance in the bot. Events of an operator are logged under ref op:<user id>.
+deal adds its seller_debit to the operator's debt; he repays it with USDT to his personal debt address in TON
+(services/ton.py: a Deposit with purpose="debt") or from his balance in the bot. Events of an operator are logged under ref op:<user id>.
 """
 from decimal import Decimal
 

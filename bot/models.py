@@ -136,21 +136,26 @@ class Deal(Base):
 
 
 class Deposit(Base):
+    """Money that came in. USDT on TON: one row per incoming transfer to a user's personal address, credited once by
+    its transaction hash (status paid; small = below deposit_min, not credited). Rows with invoice_id are the history
+    of the former xRocket invoices."""
     __tablename__ = "deposits"
+    __table_args__ = (Index("ux_deposits_tx_hash", "tx_hash", unique=True),)
     id: Mapped[int] = mapped_column(primary_key=True)
     user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"), index=True)
     invoice_id: Mapped[str | None] = mapped_column(String(64))
-    amount: Mapped[Decimal] = mapped_column(USDT)
-    credit: Mapped[Decimal] = mapped_column(USDT)
-    link: Mapped[str | None] = mapped_column(String(256))
-    status: Mapped[str] = mapped_column(String(16), index=True, default="new")  # new|active|paid|expired
+    amount: Mapped[Decimal] = mapped_column(USDT)  # received
+    credit: Mapped[Decimal] = mapped_column(USDT)  # to the balance (deposit: minus deposit_fee; debt: repaid)
+    link: Mapped[str | None] = mapped_column(String(256))  # TON: the transaction in an explorer
+    status: Mapped[str] = mapped_column(String(16), index=True, default="new")  # TON: paid | small
     created_at: Mapped[datetime] = mapped_column(default=now)
-    # by address: an open-amount xRocket invoice and its payment address in `network`; None = invoice link
     network: Mapped[str | None] = mapped_column(String(8))
-    address: Mapped[str | None] = mapped_column(String(128))
+    address: Mapped[str | None] = mapped_column(String(128))  # TON: our address the transfer came to
     expires_at: Mapped[datetime | None]
     # deposit: credited to the balance minus deposit_fee; debt: an operator repays his debt (no fee)
     purpose: Mapped[str] = mapped_column(String(8), default="deposit", server_default="deposit")
+    tx_hash: Mapped[str | None] = mapped_column(String(64))  # TON: hex hash of the incoming transfer's transaction
+    source: Mapped[str | None] = mapped_column(String(70))  # TON: the sender's wallet (raw)
 
 
 class Withdrawal(Base):
@@ -161,20 +166,22 @@ class Withdrawal(Base):
     user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"), index=True)
     amount: Mapped[Decimal] = mapped_column(USDT)  # debited from balance
     fee: Mapped[Decimal] = mapped_column(USDT)
-    cheque_id: Mapped[str | None] = mapped_column(String(64))
-    link: Mapped[str | None] = mapped_column(String(256))
-    # cheque (xrocket): pending|unknown|done|failed. chain: pending -> sent -> done | failed; unknown = no answer
-    status: Mapped[str] = mapped_column(String(16), default="pending")
+    cheque_id: Mapped[str | None] = mapped_column(String(64))  # history of xRocket cheques
+    link: Mapped[str | None] = mapped_column(String(256))  # TON: the transaction in an explorer
+    # ton: queued -> sending -> sent -> done; queued <- sending (the message expired unexecuted: sent again);
+    # failed = refunded; unknown = executed but not found on chain in time (an owner decides); cancelled = by the user
+    status: Mapped[str] = mapped_column(String(16), default="queued")
     error: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(default=now)
-    # xrocket: personal cheque; chain: xRocket pays USDT to an external address in `network`
-    method: Mapped[str] = mapped_column(String(8), default="xrocket", server_default="xrocket")
-    address: Mapped[str | None] = mapped_column(String(128))  # chain: recipient
-    memo: Mapped[str | None] = mapped_column(String(120))  # chain: comment an exchange may require (TON)
+    # ton: USDT from the hot wallet to `address`; xrocket / chain: history of the former xRocket payouts
+    method: Mapped[str] = mapped_column(String(8), default="ton", server_default="ton")
+    address: Mapped[str | None] = mapped_column(String(128))  # recipient
+    memo: Mapped[str | None] = mapped_column(String(120))  # comment an exchange may require
     tx_hash: Mapped[str | None] = mapped_column(String(128))
     sent_at: Mapped[datetime | None]
-    network: Mapped[str | None] = mapped_column(String(8))  # chain: TON | TRX | ETH | BSC | SOL ...
-    net_fee: Mapped[Decimal] = mapped_column(USDT, default=Decimal(0), server_default=text("0"))  # xRocket's part of fee
+    network: Mapped[str | None] = mapped_column(String(8))
+    net_fee: Mapped[Decimal] = mapped_column(USDT, default=Decimal(0), server_default=text("0"))
+    transfer_id: Mapped[int | None]  # ton: the last message signed for it (ton_transfers.id = query_id on chain)
 
 
 class Ledger(Base):
@@ -257,6 +264,49 @@ class FsmState(Base):
     updated_at: Mapped[datetime] = mapped_column(default=now, onupdate=now)
 
 
+class TonAddress(Base):
+    """A personal USDT-on-TON address the bot made for a user: purpose deposit (his balance) or debt (an operator repays
+    his debt). Its key is derived from TON_SEED and the label, never stored; incoming USDT are collected (swept) to the
+    hot wallet."""
+    __tablename__ = "ton_addresses"
+    __table_args__ = (Index("ux_ton_addresses_user_purpose", "user_id", "purpose", unique=True),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"), index=True)
+    purpose: Mapped[str] = mapped_column(String(8))  # deposit | debt
+    address: Mapped[str] = mapped_column(String(70), unique=True)  # raw 0:HEX upper case, as Toncenter returns it
+    unswept: Mapped[Decimal] = mapped_column(USDT, default=Decimal(0))  # USDT came here, not yet on the hot wallet
+    created_at: Mapped[datetime] = mapped_column(default=now)
+
+    @property
+    def label(self) -> str:
+        return f"{self.purpose}:{self.user_id}"
+
+
+class TonTransfer(Base):
+    """One message the bot signed for one of its wallets (services/ton.py). It is recorded before it is broadcast:
+    sending -> sent (the wallet executed it: its seqno moved) -> done (USDT seen on chain) | failed (the jetton transfer
+    was aborted, nothing moved) | unknown (not found on chain in time); sending -> expired (valid_until passed with the
+    seqno unmoved: never executed, and never will be)."""
+    __tablename__ = "ton_transfers"
+    __table_args__ = (Index("ix_ton_transfers_wallet_id", "wallet", "id"),)
+    id: Mapped[int] = mapped_column(primary_key=True)  # also the query_id of a jetton transfer
+    wallet: Mapped[str] = mapped_column(String(40))  # label: gas (the hot wallet) | deposit:<user> | debt:<user>
+    kind: Mapped[str] = mapped_column(String(8))  # payout | sweep | gas | admin
+    ref: Mapped[str] = mapped_column(String(32), index=True, default="")  # wd:<id> | addr:<ton_addresses.id> | ""
+    asset: Mapped[str] = mapped_column(String(4))  # USDT | TON
+    amount: Mapped[Decimal] = mapped_column(Numeric(20, 9))
+    to_address: Mapped[str] = mapped_column(String(70))  # raw
+    memo: Mapped[str | None] = mapped_column(String(120))
+    seqno: Mapped[int] = mapped_column(BigInteger)
+    valid_until: Mapped[int] = mapped_column(BigInteger)  # unix time
+    msg_hash: Mapped[str | None] = mapped_column(String(64))  # normalized external message hash (hex)
+    status: Mapped[str] = mapped_column(String(10), index=True, default="sending")
+    tx_hash: Mapped[str | None] = mapped_column(String(64))
+    error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(default=now)
+    done_at: Mapped[datetime | None]
+
+
 class OrderMerchant(Base):
     """Merchant who gives requisites on request (order requisites). The row is also the application:
     pending -> approved | rejected; approved -> suspended by an admin. An approved merchant gets every request
@@ -325,7 +375,8 @@ class OrderOffer(Base):
 class Operator(Base):
     """Operator of Bybit-order deals, added by an admin (OPERATOR_IDS in .env still work). He enters the merchant's
     Bybit order, gives its requisites and confirms the payment: the order's USDT arrive on his Bybit account, so each
-    confirmed deal adds its seller_debit to his debt; he repays it with an xRocket invoice or from his balance."""
+    confirmed deal adds its seller_debit to his debt; he repays it with USDT to his personal debt address (TON) or
+    from his balance."""
     __tablename__ = "operators"
     __table_args__ = (CheckConstraint("debt >= 0", name="ck_operators_debt_nonneg"),)
     user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"), primary_key=True)
@@ -656,6 +707,15 @@ MIGRATIONS: list[tuple[int, list[str]]] = [
         # the API client's own payer: abandoned orders and blocks per payer (api_payer_blocks from create_all)
         "ALTER TABLE deals ADD COLUMN IF NOT EXISTS payer_id VARCHAR(64)",
         "CREATE INDEX IF NOT EXISTS ix_deals_payer_id ON deals (payer_id)",
+    ]),
+    (19, [
+        # USDT on TON instead of xRocket: incoming transfers are deposits credited by tx hash; withdrawals are paid by
+        # the bot's hot wallet (ton_addresses / ton_transfers come from create_all; xRocket rows stay as history)
+        "ALTER TABLE deposits ADD COLUMN IF NOT EXISTS tx_hash VARCHAR(64)",
+        "ALTER TABLE deposits ADD COLUMN IF NOT EXISTS source VARCHAR(70)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS ux_deposits_tx_hash ON deposits (tx_hash)",
+        "ALTER TABLE withdrawals ADD COLUMN IF NOT EXISTS transfer_id INTEGER",
+        "ALTER TABLE withdrawals ALTER COLUMN method SET DEFAULT 'ton'",
     ]),
 ]
 

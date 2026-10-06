@@ -8,7 +8,7 @@ from sqlalchemy import func, select
 
 from bot import models, tasks
 from bot.models import Audit, Card, Deal, Ledger, Ticket, User, Withdrawal, now
-from bot.services import money, settings, xrocket
+from bot.services import money, settings
 from tests.harness import cb, msg, plain
 
 SELLER, BUYER, ADMIN, OTHER = 10, 20, 1, 30
@@ -215,7 +215,7 @@ def test_seller_cannot_withdraw_held_funds_after_expiry(go):
         await ready(b)
         d = await create_deal(b)
         await expire_now(b, d)
-        await b.run(cb(SELLER, "w:wd"), msg(SELLER, "200"))
+        await b.run(cb(SELLER, "w:out"), msg(SELLER, DEST), cb(SELLER, "w:nomemo"), msg(SELLER, "200"))
         assert "Доступно только 105 USDT" in plain(b.session.last(SELLER))
         await end_hold(b, d)
         assert (await user(SELLER)).frozen == 0 and not (await get_deal(d.id)).funds_held
@@ -449,69 +449,37 @@ def test_two_admins_same_card_ban_is_idempotent(go):
     go(fn)
 
 
-# ---------- wallet & xRocket failures ----------
+# ---------- wallet ----------
 
-def test_withdraw_http_500_keeps_funds_reserved_then_reconciles(go):
+DEST = "UQBvW8Z5huBkMJYdnfAEM5JqTNkuWX3diqYENkWsIL0XglxD"
+
+
+def test_withdraw_double_click_debits_once(go):
     async def fn(b):
         await ready(b)
         async with models.Session() as s:
             (await s.get(User, BUYER)).balance = D(50)
             await s.commit()
-        b.rocket.cheque_error = xrocket.XRocketError("internal_error", "boom", 500)
-        await b.run(cb(BUYER, "w:wd"), msg(BUYER, "20"), cb(BUYER, "w:go"), cb(BUYER, "w:go"))
+        await b.run(cb(BUYER, "w:out"), msg(BUYER, DEST), cb(BUYER, "w:nomemo"), msg(BUYER, "20"),
+                    cb(BUYER, "w:go"), cb(BUYER, "w:go"))
         async with models.Session() as s:
             wd = await s.scalar(select(Withdrawal))
-            assert wd.status == "unknown"
-            assert (await s.get(User, BUYER)).balance == D(30)  # NOT refunded: the cheque may exist
+            assert wd.status == "queued" and await s.scalar(select(func.count(Withdrawal.id))) == 1
+            assert (await s.get(User, BUYER)).balance == D(30)
             assert await s.scalar(select(Ledger.ref).where(Ledger.kind == "withdraw")) == f"wd:{wd.id}"
-        assert "на проверке" in plain(b.session.last(BUYER))
-        b.rocket.lookup = {"chequeId": "c9", "state": "active", "deleted": False,
-                           "links": {"telegramBotLink": "https://t.me/xRocket?start=c9"}}
-        await tasks.reconcile_withdrawals(b.bot)
-        async with models.Session() as s:
-            assert (await s.scalar(select(Withdrawal))).status == "done"
-        assert "Чек на 19.7 USDT" in plain(b.session.last(BUYER))  # 20 − 1.5%
+        assert "уже обработана" in b.session.alerts()[-1]
     go(fn)
 
 
-def test_withdraw_definite_error_refunds(go):
+def test_wallet_off_without_seed(go):
     async def fn(b):
+        from bot.services import ton
         await ready(b)
-        async with models.Session() as s:
-            (await s.get(User, BUYER)).balance = D(50)
-            await s.commit()
-        b.rocket.cheque_error = xrocket.XRocketError("target_user_not_found", "", 400)
-        await b.run(cb(BUYER, "w:wd"), msg(BUYER, "20"), cb(BUYER, "w:go"))
-        assert (await user(BUYER)).balance == D(50)
-        assert "Средства возвращены" in plain(b.session.last(BUYER))
-    go(fn)
-
-
-def test_stale_pending_withdrawal_becomes_unknown(go):
-    async def fn(b):
-        await ready(b)
-        async with models.Session() as s:
-            s.add(Withdrawal(user_id=BUYER, amount=D(5), fee=D(0), status="pending",
-                             created_at=now() - timedelta(minutes=10)))
-            await s.commit()
-        await tasks.reconcile_withdrawals(b.bot)
-        async with models.Session() as s:
-            assert (await s.scalar(select(Withdrawal))).status == "unknown"  # cheque not found: admin decides
-    go(fn)
-
-
-def test_deposit_waits_for_pending_payment(go):
-    async def fn(b):
-        await ready(b)
-        b.rocket.invoice_status = "expired"
-        b.rocket.payments = [{"status": "paid", "receiveAmount": "10", "receiveCurrency": "USDT"},
-                             {"status": "pending", "receiveAmount": None, "receiveCurrency": None}]
-        await b.run(cb(BUYER, "w:dep"), msg(BUYER, "30"))
-        await tasks.poll_deposits(b.bot)
-        assert (await user(BUYER)).balance == 0
-        b.rocket.payments[1] = {"status": "paid", "receiveAmount": "19.5", "receiveCurrency": "USDT"}
-        await tasks.poll_deposits(b.bot)
-        assert (await user(BUYER)).balance == D("29.0575")  # 29.5 − 1.5% deposit fee
+        ton.chain = None
+        await b.run(cb(BUYER, "w:out"))
+        assert "временно недоступен" in b.session.alerts()[-1]
+        await b.run(cb(BUYER, "w:in"))
+        assert "временно недоступен" in plain(b.session.last(BUYER))
     go(fn)
 
 

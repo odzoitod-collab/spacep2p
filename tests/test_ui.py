@@ -12,7 +12,7 @@ async def tour(b):
     await ready(b)
     d = await create_deal(b)
     await b.run(cb(BUYER, f"dl:rc:{d.id}"), msg(BUYER, document=PDF))
-    for data in ("menu", "buy:0", "tm", "op", "om", "deals", "w", "w:h", "w:dep", "w:wd", "info", "sup",
+    for data in ("menu", "buy:0", "tm", "op", "om", "deals", "w", "w:h", "w:in", "w:out", "info", "sup",
                  f"dl:{d.id}"):
         await b.run(cb(BUYER, data))
     for data in ("menu", "sl", "cd:1", "ce:min:1", "ce:daily:1", "ce:bank:1", "cd:del:1", f"dl:{d.id}", f"dl:ok:{d.id}", f"dl:ds:{d.id}",

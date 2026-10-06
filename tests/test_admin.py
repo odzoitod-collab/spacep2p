@@ -1,6 +1,5 @@
 """Admin workspace: profile by Telegram ID, safe balance adjustments, operation cards, alert outbox."""
 import asyncio
-from datetime import timedelta
 from decimal import Decimal as D
 
 from aiogram.exceptions import TelegramRetryAfter
@@ -9,7 +8,7 @@ from sqlalchemy import func, select
 
 from bot import models, tasks, ui
 from bot.models import Adjustment, Event, Ledger, User, Withdrawal
-from bot.services import settings, xrocket
+from bot.services import settings
 from tests.harness import cb, msg, plain
 from tests.test_scenarios import ADMIN, BUYER, PDF, SELLER, create_deal, ready, user
 
@@ -43,11 +42,15 @@ def test_profile_splits_buys_and_sells_with_outcomes(go):
     go(fn)
 
 
+DEST = "UQBvW8Z5huBkMJYdnfAEM5JqTNkuWX3diqYENkWsIL0XglxD"
+
+
 def test_search_by_withdrawal_opens_owner_profile(go):
     async def fn(b):
         await ready(b)
         async with models.Session() as s:
-            s.add(Withdrawal(user_id=BUYER, amount=D(25), fee=D(1), status="unknown", error="network: timeout"))
+            s.add(Withdrawal(user_id=BUYER, amount=D(25), fee=D(1), status="unknown", method="ton", address=DEST,
+                             error="не найден в сети"))
             await s.commit()
         await b.run(cb(ADMIN, "au"), msg(ADMIN, "в1"))
         screen = plain(b.session.last(ADMIN))
@@ -55,10 +58,11 @@ def test_search_by_withdrawal_opens_owner_profile(go):
         assert "awv:1" in b.session.buttons(ADMIN)
         await b.run(cb(ADMIN, "awv:1"))
         card = plain(b.session.last(ADMIN))
-        for part in ("Вывод #1 · требует проверки", "Списано: 25 USDT", "Чек: 24 USDT · комиссия: 1 USDT",
-                     "clientChequeId: wd-1", "Ответ xRocket: network: timeout", "Деньги пользователя удержаны"):
+        for part in ("Вывод #1 · требует проверки", "Списано: 25 USDT", "к отправке 24 · комиссия 1", DEST,
+                     "ошибка: не найден в сети", "Деньги пользователя удержаны"):
             assert part in card, part
-        assert "wr:rf:1" not in b.session.buttons(ADMIN)  # no blind refund before an xRocket check
+        buttons = b.session.buttons(ADMIN)
+        assert "wt:1" in buttons and "wk:rf:1" in buttons and "wk:done:1" in buttons  # an owner decides
     go(fn)
 
 
@@ -68,19 +72,17 @@ def test_withdrawal_card_keeps_whole_chain(go):
         async with models.Session() as s:
             (await s.get(User, BUYER)).balance = D(50)
             await s.commit()
-        b.rocket.cheque_error = xrocket.XRocketError("network", "timeout")
-        await b.run(cb(BUYER, "w:wd"), msg(BUYER, "20"), cb(BUYER, "w:go"))
-        alerts = await b.deliver()
-        assert any("Вывод #1" in t and "нужна сверка" in t for t in alerts)
-        b.rocket.lookup = {"chequeId": "c7", "state": "active", "deleted": False,
-                           "links": {"telegramBotLink": "https://t.me/xRocket?start=c7"}}
-        await b.run(cb(ADMIN, "wr:1"))
-        assert "Чек найден в xRocket и отправлен пользователю" in plain(b.session.last(ADMIN))
+        b.chain.fund_hot(usdt="100")
+        await b.run(cb(BUYER, "w:out"), msg(BUYER, DEST), cb(BUYER, "w:nomemo"), msg(BUYER, "20"), cb(BUYER, "w:go"))
+        await b.run(cb(ADMIN, "wt:1"))
+        card = plain(b.session.last(ADMIN))
+        assert "Вывод #1 · выполнен" in card and "#1 · seqno 0 · выполнено" in card and "Проверено: выполнен" in card
         await b.run(cb(ADMIN, "aev:wd:1"))
         history = plain(b.session.last(ADMIN))
-        assert history.index("Запрос вывода") < history.index("Ответ xRocket неизвестен") < history.index("Чек c7 выдан")
-        await b.run(cb(ADMIN, "wr:1"))  # repeated check is harmless
-        assert (await user(BUYER)).balance == D(30)
+        assert (history.index("Запрос вывода") < history.index("Отправка 18.7 USDT") < history.index("Перевод принят")
+                < history.index("Вывод выполнен"))
+        await b.run(cb(ADMIN, "wt:1"))  # repeated check is harmless
+        assert (await user(BUYER)).balance == D(30) and len(b.chain.sent) == 1
     go(fn)
 
 
@@ -191,16 +193,12 @@ def test_pacing_retries_after_flood_limit():
     asyncio.run(scenario())
 
 
-def test_stale_unknown_check_error_alerts_once(go):
+def test_network_errors_alert_once(go):
     async def fn(b):
         await ready(b)
-        async with models.Session() as s:
-            s.add(Withdrawal(user_id=BUYER, amount=D(5), fee=D(0), status="unknown",
-                             created_at=models.now() - timedelta(minutes=10)))
-            await s.commit()
-        b.rocket.lookup = xrocket.XRocketError("internal_error", "boom", 500)
-        await tasks.reconcile_withdrawals(b.bot)
-        await tasks.reconcile_withdrawals(b.bot)
-        alerts = [t for t in await b.deliver() if "Ошибка сверки" in t]
+        b.chain.down = True
+        await tasks.ton_cycle(b.bot)
+        await tasks.ton_cycle(b.bot)
+        alerts = [t for t in await b.deliver() if "toncenter" in t]
         assert len(alerts) == 1  # repeated background failures do not flood the admin chat
     go(fn)

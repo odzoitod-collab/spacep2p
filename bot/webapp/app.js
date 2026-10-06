@@ -436,7 +436,10 @@ async function operatorScreen() {
       <div class="list">${list.map(dealRow).join("")}</div>`).join("") : `<div class="list" style="margin-top:14px">${empty("shield", "Принятых ордеров нет")}</div>`}
     <div class="sec"><h2>Свободные ордера</h2><button id="refresh">${ic("refresh").replace("<svg", '<svg style="width:18px;height:18px;vertical-align:-4px"')}</button></div>
     <div class="list">${data.free.length ? data.free.map(dealRow).join("") : empty("bell", "Новых ордеров нет — придут уведомлением")}</div>
-    <p class="hint">Долг погашается в боте: «Оператор» → «Погасить».</p>`);
+    ${data.debt_address ? `<div class="sec"><h2>Погасить долг</h2></div><div class="card pad">
+      <div class="kv" style="padding-top:0"><span>Сеть и монета</span><b>TON · только USDT</b></div>
+      <button class="req" data-copy="${esc(data.debt_address)}" data-what="Адрес"><span class="v"><small>Ваш адрес погашения долга — нажмите, чтобы скопировать</small><span class="mono">${esc(data.debt_address)}</span></span>${ic("copy")}</button></div>
+      <p class="hint">Всё, что придёт на этот адрес, уменьшит долг автоматически (без комиссии), сверх долга — на баланс. Погасить с баланса — в боте: «Оператор».</p>` : ""}`);
   $app.querySelector("#refresh").onclick = () => operatorScreen();
   every(10000, async () => { if (path() === "operator") { try { const f = await api("operator"); if (JSON.stringify(f) !== JSON.stringify(data)) operatorScreen(); } catch (e) { /* retry */ } } });
 }
@@ -484,141 +487,82 @@ async function buyScreen() {
   input.focus();
 }
 
-async function depositScreen(tab) {
-  tab = tab || "net";
-  const w = await api("wallet");
-  view(`${head("Пополнить", `Только USDT · комиссия ${esc(w.deposit.fee)} · от ${esc(w.deposit.min)} USDT`)}
-    <div class="seg"><button data-tab="net" class="${tab === "net" ? "on" : ""}">Адрес в сети</button><button data-tab="inv" class="${tab === "inv" ? "on" : ""}">Счёт xRocket</button></div>
-    ${tab === "net" ? `<div class="card pad"><b>Выберите сеть</b><p class="hint" style="margin-top:2px">Бот выдаст адрес, зачислим автоматически после подтверждения сети.</p>
-      <div class="nets">${w.networks.map((x) => `<button class="net" data-net="${esc(x.code)}">${esc(x.name)}</button>`).join("") || `<p class="hint">Сети сейчас недоступны</p>`}</div></div>
-      <p class="hint">${ic("info").replace("<svg", '<svg style="width:14px;height:14px;vertical-align:-2px"')} Отправляйте только USDT и только в выбранной сети — иначе деньги не зачислятся.</p>`
-    : `<label class="field"><span>Сумма пополнения</span><div class="inp big"><input id="amt" inputmode="decimal" placeholder="100"><span class="unit">USDT</span></div></label>
-      <p class="hint">Оплата в @xRocket в два нажатия. Минимум ${esc(w.deposit.min)} USDT.</p>
-      <button class="btn" id="inv">${ic("wallet")}Создать счёт</button>`}
-    ${w.pending_deposits.length ? `<div class="sec"><h2>Ожидают оплаты</h2></div><div class="list">${w.pending_deposits.map((d) => `<button class="row" data-go="deposit/${d.id}">
-      <span class="ic amber">${ic("clock")}</span><span class="mid"><b>${d.network ? "Адрес · " + esc(d.network_name) : "Счёт xRocket"}</b><small>#${d.id} · ${when(d.created_at)}</small></span>
-      <span class="end"><b>${d.amount ? usdt(d.amount) + " USDT" : "любая сумма"}</b></span></button>`).join("")}</div>` : ""}`);
-  $app.querySelectorAll("[data-tab]").forEach((b) => (b.onclick = () => depositScreen(b.dataset.tab)));
-  $app.querySelectorAll("[data-net]").forEach((b) => (b.onclick = async () => {
-    b.classList.add("on");
-    try { const r = await api("deposits", { body: { network: b.dataset.net } }); go(`deposit/${r.deposit.id}`); }
-    catch (e) { toast(e.message, true); b.classList.remove("on"); }
-  }));
-  const inv = $app.querySelector("#inv");
-  if (inv) inv.onclick = async () => {
-    inv.disabled = true;
+async function depositScreen(check) {
+  const [w, d] = await Promise.all([api("wallet"), api(`deposit${check ? "?check=1" : ""}`)]);
+  view(`${head("Пополнить", `USDT в сети TON · комиссия ${esc(w.deposit.fee)} · от ${esc(w.deposit.min)} USDT`)}
+    <div class="card pad">
+      <div class="kv" style="padding-top:0"><span>Сеть и монета</span><b>TON · только USDT</b></div>
+      <button class="req" data-copy="${esc(d.address)}" data-what="Адрес"><span class="v"><small>Ваш личный адрес — нажмите, чтобы скопировать</small><span class="mono">${esc(d.address)}</span></span>${ic("copy")}</button>
+    </div>
+    <button class="btn" data-copy="${esc(d.address)}" data-what="Адрес">${ic("copy")}Скопировать адрес</button>
+    <p class="hint">Адрес постоянный и только ваш, memo не нужен. Зачислим автоматически через 1–2 минуты после подтверждения в сети. Меньше ${esc(w.deposit.min)} USDT, другая монета или сеть — не зачислятся.</p>
+    <button class="btn ghost" id="check">${ic("refresh")}Проверить поступление</button>
+    ${w.deposits.length ? `<div class="sec"><h2>Последние поступления</h2></div><div class="list">${w.deposits.map((x) => `<button class="row" ${x.link ? `data-open="${esc(x.link)}"` : ""}>
+      <span class="ic ${x.status === "paid" ? "green" : "amber"}">${ic(x.status === "paid" ? "down" : "info")}</span><span class="mid"><b>${usdt(x.amount)} USDT</b><small>#${x.id} · ${when(x.created_at)}</small></span>
+      <span class="end"><b>${x.status === "paid" ? "+" + usdt(x.credit) : "не зачислено"}</b></span></button>`).join("")}</div>` : ""}`);
+  $app.querySelector("#check").onclick = async () => {
     try {
-      const r = await api("deposits", { body: { amount: $app.querySelector("#amt").value.replace(/\s/g, "").replace(",", ".") } });
-      go(`deposit/${r.deposit.id}`);
-    } catch (e) { toast(e.message, true); inv.disabled = false; }
+      const r = await api("deposit?check=1");
+      if (r.checked === null) toast("Проверка уже идёт — зачислим автоматически");
+      else if (!r.checked.length) toast("Новых поступлений пока нет — зачислим автоматически");
+      else { haptic("success"); toast(`Зачислено: ${r.checked.map((x) => usdt(x.credit)).join(", ")} USDT`); }
+      depositScreen();
+    } catch (e) { toast(e.message, true); }
   };
+  every(15000, async () => {
+    try { const f = await api("wallet"); if (path() === "deposit" && (f.deposits[0] || {}).id !== (w.deposits[0] || {}).id) depositScreen(); } catch (e) { /* retry */ }
+  });
 }
 
-async function depositView(id, check) {
-  const r = await api(`deposits/${id}${check ? "?check=1" : ""}`);
-  const d = r.deposit;
-  const paid = d.status === "paid";
-  view(`${head(d.network ? `Пополнение · ${d.network_name}` : `Счёт #${d.id}`)}
-    ${paid ? `<div class="card pad" style="text-align:center"><div class="ic green" style="width:64px;height:64px;margin:6px auto 10px;border-radius:50%;display:grid;place-items:center;background:#e3f8ef;color:#0a9c6a">${ic("check")}</div>
-      <b style="font:700 20px Unbounded,sans-serif">+${usdt(d.credit)} USDT</b><p class="hint">Зачислено на баланс</p></div>
-      <button class="btn" data-go="">${ic("wallet")}В кошелёк</button>` :
-    d.status === "active" && d.address ? `<div class="card pad">
-      <div class="kv" style="padding-top:0"><span>Сеть</span><b>${esc(d.network_name)} · только USDT</b></div>
-      <button class="req" data-copy="${esc(d.address)}" data-what="Адрес"><span class="v"><small>Адрес — нажмите, чтобы скопировать</small><span class="mono">${esc(d.address)}</span></span>${ic("copy")}</button>
-      ${d.expires_at ? `<div class="kv" style="margin-top:6px"><span>Действует до</span><b>${when(d.expires_at)}</b></div>` : ""}</div>
-      <button class="btn" data-copy="${esc(d.address)}" data-what="Адрес">${ic("copy")}Скопировать адрес</button>
-      <p class="hint">Зачислим автоматически после подтверждения сети — придёт уведомление. Другая монета или сеть — деньги не вернуть.</p>` :
-    d.status === "active" ? `<div class="card pad">
-      <div class="kv" style="padding-top:0"><span>К оплате</span><b>${usdt(d.amount)} USDT</b></div>
-      <div class="kv total"><span>Зачислим</span><b>${usdt(d.credit)} USDT</b></div></div>
-      ${d.link ? `<button class="btn" data-open="${esc(d.link)}">${ic("wallet")}Оплатить в xRocket</button>` : ""}` :
-    `<div class="card pad"><b>${d.status === "cancelled" ? "Пополнение отменено" : d.status === "expired" ? "Время оплаты вышло" : "Пополнение не создано"}</b>
-      <p class="hint">${d.status === "cancelled" ? "Если вы всё же оплатили — зачислим автоматически." : "Создайте новое пополнение."}</p></div>
-      <button class="btn" data-go="deposit">${ic("plus")}Новое пополнение</button>`}
-    ${d.status === "active" ? `<div class="btns"><button class="btn ghost" id="check">${ic("refresh")}Проверить</button><button class="btn danger" id="cancel">${ic("x")}Отменить</button></div>` : ""}`);
-  if (d.status === "active") {
-    every(10000, async () => {
-      try { const f = await api(`deposits/${id}`); if (f.deposit.status !== "active" && path() === `deposit/${id}`) depositView(id); } catch (e) { /* retry */ }
-    });
-    $app.querySelector("#check").onclick = async () => {
-      try { await depositView(id, true); if (S.lastDeposit === "active") toast("Оплата ещё не поступила — проверим автоматически"); } catch (e) { toast(e.message, true); }
-    };
-    $app.querySelector("#cancel").onclick = async () => {
-      if (!(await confirmBox("Отменить пополнение? Если уже отправили USDT — не отменяйте, зачислим сами."))) return;
-      try { await api(`deposits/${id}/cancel`, { method: "POST" }); toast("Пополнение отменено"); depositView(id); } catch (e) { toast(e.message, true); }
-    };
-  }
-  S.lastDeposit = d.status;
-  if (paid && check) haptic("success");
-}
-
-async function withdrawScreen(tab) {
-  tab = tab || S.wdTab || "xrocket";
-  S.wdTab = tab;
+async function withdrawScreen() {
   const w = await api("wallet");
   const req = uuid();
-  let net = tab === "chain" ? (S.wdNet && w.networks.find((x) => x.code === S.wdNet) ? S.wdNet : (w.networks[0] || {}).code) : null;
   view(`${head("Вывести", `Можно вывести <b>${usdt(w.balance.withdrawable)} USDT</b>${n(w.balance.withdrawable) < n(w.balance.available) ? ` из ${usdt(w.balance.available)}` : ""}`)}
     ${w.lock_note ? `<div class="card pad" style="display:flex;gap:10px"><span style="color:var(--deep);flex:none">${ic("info")}</span><span class="hint" style="margin:0">${esc(w.lock_note)}</span></div>` : ""}
-    <div class="seg"><button data-tab="xrocket" class="${tab === "xrocket" ? "on" : ""}">Чек xRocket</button><button data-tab="chain" class="${tab === "chain" ? "on" : ""}">На кошелёк</button></div>
-    ${tab === "chain" ? `<div class="nets" id="nets">${w.networks.map((x) => `<button class="net ${x.code === net ? "on" : ""}" data-net="${esc(x.code)}">${esc(x.name)}</button>`).join("")}</div>
-      <label class="field"><span>Адрес кошелька USDT</span><div class="inp"><input id="addr" class="mono" autocomplete="off" spellcheck="false" placeholder="Вставьте адрес"></div></label>
-      <label class="field" id="memoBox" hidden><span>Memo (если выводите на биржу)</span><div class="inp"><input id="memo" autocomplete="off" placeholder="Необязательно"></div></label>` :
-      `<p class="hint">Чек придёт в чат с ботом — активирует его только ваш аккаунт, USDT придут в @xRocket. Мгновенно.</p>`}
+    <label class="field"><span>Адрес кошелька USDT в сети TON</span><div class="inp"><input id="addr" class="mono" autocomplete="off" spellcheck="false" placeholder="UQ… или EQ…" value="${esc(w.withdraw.last_address || "")}"></div></label>
+    <label class="field"><span>Memo (если выводите на биржу)</span><div class="inp"><input id="memo" autocomplete="off" placeholder="Необязательно"></div></label>
     <label class="field"><span>Сумма списания</span><div class="inp big"><input id="amt" inputmode="decimal" placeholder="0"><button class="max" id="max">Макс</button></div></label>
-    <div id="q" class="hint">${esc(tab === "chain" ? w.withdraw.chain_terms : w.withdraw.cheque_terms)} · минимум ${esc(tab === "chain" ? w.withdraw.chain_min : w.withdraw.min)} USDT</div>
+    <div id="q" class="hint">${esc(w.withdraw.terms)} · минимум ${esc(w.withdraw.min)} USDT</div>
     <button class="btn" id="go" disabled>${ic("up")}Вывести</button>
+    <p class="hint">Отправляем автоматически, обычно за 1–2 минуты. Если у сервиса не хватит USDT — вывод подождёт в очереди и уйдёт сам.</p>
     ${w.withdrawals.length ? `<div class="sec"><h2>В пути</h2></div><div class="list">${w.withdrawals.map((x) => `<div class="row">
       <span class="ic ${x.status === "queued" ? "amber" : ""}">${ic(x.status === "queued" ? "clock" : "up")}</span>
-      <span class="mid"><b>${usdt(x.receive)} USDT · ${x.method === "chain" ? esc(x.network) : "чек"}</b><small>#${x.id} · ${esc(x.status_text)}</small></span>
-      ${x.status === "queued" ? `<button class="chip red" data-cancel="${x.id}">Отменить</button>` : ""}</div>`).join("")}</div>` : ""}`);
+      <span class="mid"><b>${usdt(x.receive)} USDT · TON</b><small>#${x.id} · ${esc(x.status_text)}</small></span>
+      ${x.cancellable ? `<button class="chip red" data-cancel="${x.id}">Отменить</button>` : ""}</div>`).join("")}</div>` : ""}`);
   const amt = $app.querySelector("#amt");
   const qbox = $app.querySelector("#q");
   const goBtn = $app.querySelector("#go");
   const addr = $app.querySelector("#addr");
-  const memoBox = $app.querySelector("#memoBox");
   let q = null;
-  const setNet = (code) => {
-    net = code; S.wdNet = code;
-    $app.querySelectorAll("[data-net]").forEach((b) => b.classList.toggle("on", b.dataset.net === code));
-    const last = (w.networks.find((x) => x.code === code) || {}).last_address;
-    if (addr && !addr.value && last) addr.value = last;
-    if (memoBox) memoBox.hidden = code !== "TON";
-    quote();
-  };
+  const ready = () => { goBtn.disabled = !(q && !q.error && addr.value.trim()); };
   const quote = debounce(async () => {
     const v = amt.value.replace(/\s/g, "").replace(",", ".");
-    q = null; goBtn.disabled = true;
+    q = null; ready();
     if (!v) return;
     try {
-      q = await api(`withdraw/quote?method=${tab}${tab === "chain" ? "&network=" + net : ""}&amount=${encodeURIComponent(v)}`);
+      q = await api(`withdraw/quote?amount=${encodeURIComponent(v)}`);
       if (q.error) { qbox.innerHTML = `<span class="err" style="margin:0">${esc(q.error)}</span>`; return; }
       qbox.innerHTML = `Комиссия ${esc(q.terms)}: −${usdt(q.fee)} USDT · <b style="color:var(--ink)">придёт ${usdt(q.receive)} USDT</b>`;
       q.amount = v;
-      goBtn.disabled = tab === "chain" && !(addr.value.trim());
+      ready();
     } catch (e) { qbox.innerHTML = `<span class="err" style="margin:0">${esc(e.message)}</span>`; }
   }, 350);
   amt.oninput = quote;
-  if (addr) addr.oninput = () => { goBtn.disabled = !(q && !q.error && addr.value.trim()); };
+  addr.oninput = ready;
   $app.querySelector("#max").onclick = () => { amt.value = w.balance.withdrawable; quote(); };
-  $app.querySelectorAll("[data-tab]").forEach((b) => (b.onclick = () => withdrawScreen(b.dataset.tab)));
-  $app.querySelectorAll("[data-net]").forEach((b) => (b.onclick = () => setNet(b.dataset.net)));
-  if (net) setNet(net);
   $app.querySelectorAll("[data-cancel]").forEach((b) => (b.onclick = async () => {
     if (!(await confirmBox("Отменить вывод из очереди? USDT вернутся на баланс."))) return;
-    try { await api(`withdrawals/${b.dataset.cancel}/cancel`, { method: "POST" }); toast("Вывод отменён, USDT на балансе"); withdrawScreen(tab); } catch (e) { toast(e.message, true); }
+    try { await api(`withdrawals/${b.dataset.cancel}/cancel`, { method: "POST" }); toast("Вывод отменён, USDT на балансе"); withdrawScreen(); } catch (e) { toast(e.message, true); }
   }));
   goBtn.onclick = async () => {
     if (!q || q.error) return;
-    const where = tab === "chain" ? `в сети ${(w.networks.find((x) => x.code === net) || {}).name} на ${addr.value.trim().slice(0, 6)}…${addr.value.trim().slice(-4)}` : "чеком xRocket";
-    if (!(await confirmBox(`Вывести ${usdt(q.amount)} USDT ${where}? Придёт ${usdt(q.receive)} USDT.${tab === "chain" ? " Перевод в блокчейне не отменить." : ""}`))) return;
+    const a = addr.value.trim();
+    if (!(await confirmBox(`Вывести ${usdt(q.amount)} USDT в сети TON на ${a.slice(0, 6)}…${a.slice(-4)}? Придёт ${usdt(q.receive)} USDT. Перевод в блокчейне не отменить.`))) return;
     goBtn.disabled = true;
     try {
-      const body = { method: tab, amount: q.amount, fee: q.fee, request_id: req };
-      if (tab === "chain") Object.assign(body, { network: net, address: addr.value.trim(), memo: ($app.querySelector("#memo") || {}).value || null });
-      const r = await api("withdraw", { body });
+      const r = await api("withdraw", { body: { amount: q.amount, fee: q.fee, request_id: req, address: a, memo: $app.querySelector("#memo").value.trim() || null } });
       toast(r.message, !r.ok);
-      if (r.ok) go("", true); else withdrawScreen(tab);
+      if (r.ok) go("", true); else withdrawScreen();
     } catch (e) { toast(e.message, true); goBtn.disabled = false; }
   };
 }
@@ -843,7 +787,7 @@ async function guideScreen(slug) {
 
 const ROUTES = [
   [/^$/, home], [/^deals$/, () => dealsScreen()], [/^deal\/(\d+)$/, dealScreen], [/^deal\/(\d+)\/chat$/, chatScreen],
-  [/^buy$/, buyScreen], [/^deposit$/, () => depositScreen()], [/^deposit\/(\d+)$/, (id) => depositView(id)],
+  [/^buy$/, buyScreen], [/^deposit$/, () => depositScreen()],
   [/^withdraw$/, () => withdrawScreen()], [/^history$/, historyScreen], [/^cards$/, cardsScreen], [/^card\/new$/, cardNew],
   [/^card\/(\d+)$/, cardScreen], [/^profile$/, profile], [/^stats$/, () => statsScreen()], [/^guides$/, guidesScreen],
   [/^guide\/([a-z]+)$/, guideScreen], [/^operator$/, operatorScreen],

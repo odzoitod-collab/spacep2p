@@ -101,11 +101,18 @@ def test_withdraw_cards_and_history_in_the_app(go):
         async with http(b) as c:
             w = await (await c.get("/app/api/wallet", headers=as_(SELLER))).json()
             assert D(w["balance"]["available"]) == D(200)
-            q = await (await c.get("/app/api/withdraw/quote?method=xrocket&amount=50", headers=as_(SELLER))).json()
-            assert q["receive"] and not q["error"]
-            body = {"method": "xrocket", "amount": "50", "fee": q["fee"], "request_id": "8a6e0804-2bd0-4672-b79d-d97b2fd3c1b4"}
+            q = await (await c.get("/app/api/withdraw/quote?amount=50", headers=as_(SELLER))).json()
+            assert D(q["receive"]) == D("48.25") and not q["error"]
+            dep = await (await c.get("/app/api/deposit", headers=as_(SELLER))).json()
+            assert dep["address"].startswith("UQ") and dep["network"] == "TON"
+            own = {"amount": "50", "fee": q["fee"], "request_id": "7a6e0804-2bd0-4672-b79d-d97b2fd3c1b4",
+                   "address": dep["address"]}
+            assert (await c.post("/app/api/withdraw", headers=as_(SELLER), json=own)).status == 422  # our own address
+            body = {"amount": "50", "fee": q["fee"], "request_id": "8a6e0804-2bd0-4672-b79d-d97b2fd3c1b4",
+                    "address": "UQBvW8Z5huBkMJYdnfAEM5JqTNkuWX3diqYENkWsIL0XglxD", "memo": "123"}
             r = await (await c.post("/app/api/withdraw", headers=as_(SELLER), json=body)).json()
-            assert r["ok"] and D(r["available"]) == D(150)
+            assert r["ok"] and D(r["available"]) == D(150) and r["withdrawal"]["cancellable"]
+            assert r["withdrawal"]["memo"] == "123"
             again = await c.post("/app/api/withdraw", headers=as_(SELLER), json=body)  # the same request: once
             assert again.status == 409
             too_much = dict(body, amount="1000", request_id="9a6e0804-2bd0-4672-b79d-d97b2fd3c1b4")

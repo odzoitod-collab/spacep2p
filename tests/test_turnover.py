@@ -3,9 +3,13 @@ withdrawable = balance − deposit_lock; a deposit adds to the lock, USDT sold t
 from decimal import Decimal as D
 
 from bot import models
-from bot.models import User
+from sqlalchemy import select
+
+from bot.models import User, Withdrawal
 from bot.services import money, settings
 from tests.harness import cb, msg, plain
+
+DEST = "UQBvW8Z5huBkMJYdnfAEM5JqTNkuWX3diqYENkWsIL0XglxD"
 from tests.test_scenarios import ADMIN, BUYER, PDF, SELLER, create_deal, ready
 
 
@@ -34,11 +38,11 @@ def test_a_deposit_is_not_withdrawn_until_it_is_turned_over(go):
         assert (u.balance, u.deposit_lock, money.withdrawable(u)) == (D(200), D(200), 0)
         await b.run(cb(SELLER, "w"))
         assert "Можно вывести: 0 USDT · ещё прокрутить 200 USDT в сделках" in plain(b.session.last(SELLER))
-        await b.run(cb(SELLER, "w:wd"), msg(SELLER, "50"))
+        await b.run(cb(SELLER, "w:out"), msg(SELLER, DEST), cb(SELLER, "w:nomemo"), msg(SELLER, "50"))
         assert "Вывести можно только 0 USDT" in plain(b.session.last(SELLER))
-        await b.run(cb(SELLER, "w:wn:TRX"), msg(SELLER, "T" + "A" * 33), msg(SELLER, "50"))
-        assert "Вывести можно только 0 USDT" in plain(b.session.last(SELLER))
-        assert not b.rocket.cheques and not b.rocket.withdrawal_calls
+        assert "w:all" not in b.session.buttons(SELLER)
+        async with models.Session() as s:
+            assert not await s.scalar(select(Withdrawal.id))
 
         d = await create_deal(b)  # he sells 95 USDT to a buyer: that much of his deposit worked
         await b.run(cb(BUYER, f"dl:rc:{d.id}"), msg(BUYER, document=PDF), cb(SELLER, f"dl:ok2:{d.id}"))
@@ -46,8 +50,8 @@ def test_a_deposit_is_not_withdrawn_until_it_is_turned_over(go):
         assert (u.balance, u.deposit_lock, money.withdrawable(u)) == (D(105), D(105), 0)
         b_ = await user(BUYER)
         assert money.withdrawable(b_) == b_.balance == D(94)  # bought USDT go out at once
-        await b.run(cb(BUYER, "w:wd"), msg(BUYER, "94"), cb(BUYER, "w:go"))
-        assert b.rocket.cheques and (await user(BUYER)).balance == 0
+        await b.run(cb(BUYER, "w:out"), msg(BUYER, DEST), cb(BUYER, "w:nomemo"), msg(BUYER, "94"), cb(BUYER, "w:go"))
+        assert (await user(BUYER)).balance == 0
     go(fn)
 
 
@@ -61,14 +65,16 @@ def test_earned_money_is_free_the_deposit_is_not_and_the_last_check_holds(go):
             await money.add(s, 30, D(30), "admin", "adj:1")
             await s.commit()
         assert money.withdrawable(await user(30)) == D(30)
-        await b.run(cb(30, "w:wd"), msg(30, "30"))
+        await b.run(cb(30, "w:out"), msg(30, DEST), cb(30, "w:nomemo"), msg(30, "30"))
         assert "w:go" in b.session.buttons(30)
         await deposit(30, 0.000001)  # meanwhile: the balance moves, the free part does not grow
         async with models.Session() as s:  # and something takes the free part away before he confirms
             await money.add(s, 30, D(-20), "admin", "adj:2")
             await s.commit()
         await b.run(cb(30, "w:go"))
-        assert "Вывести можно только 10 USDT" in b.session.alerts()[-1] and not b.rocket.cheques  # checked again
+        assert "Вывести можно только 10 USDT" in b.session.alerts()[-1]  # checked again
+        async with models.Session() as s:
+            assert not await s.scalar(select(Withdrawal.id))
         await b.run(cb(ADMIN, "auv:30"))
         assert "не прокручено пополнений 100" in plain(b.session.last(ADMIN))
         await b.run(cb(ADMIN, "aul:30"))
@@ -101,33 +107,22 @@ def test_bought_usdt_go_out_at_once_even_next_to_a_locked_deposit(go):
         await b.run(cb(BUYER, f"dl:rc:{d.id}"), msg(BUYER, document=PDF), cb(SELLER, f"dl:ok2:{d.id}"))
         u = await user(BUYER)
         assert (u.balance, u.deposit_lock, money.withdrawable(u)) == (D(194), D(100), D(94))
-        await b.run(cb(BUYER, "w:wd"), msg(BUYER, "94"), cb(BUYER, "w:go"))
-        assert b.rocket.cheques and (await user(BUYER)).balance == D(100)  # all the bought USDT left at once
+        await b.run(cb(BUYER, "w:out"), msg(BUYER, DEST), cb(BUYER, "w:nomemo"), msg(BUYER, "94"), cb(BUYER, "w:go"))
+        assert (await user(BUYER)).balance == D(100)  # all the bought USDT left at once
     go(fn)
 
 
-def test_a_deposit_can_be_cancelled_and_a_late_payment_is_still_credited(go):
+def test_a_ton_deposit_is_locked_until_turned_over(go):
     from bot import tasks
-    from bot.models import Deposit
 
     async def fn(b):
+        await on()
         await ready(b)
-        b.rocket.invoice_status = "active"  # not paid yet
-        await b.run(cb(BUYER, "w:dep"), msg(BUYER, "50"))
-        assert "w:dc:1" in b.session.buttons(BUYER)
-        await b.run(cb(BUYER, "w:dc:1"), cb(BUYER, "w:dc:1"))
-        assert "Пополнение #1 отменено" in plain(b.session.last(BUYER))
-        assert "уже оплачено или закрыто" in b.session.alerts()[-1]  # the second tap changes nothing
-        await b.run(cb(BUYER, "w"))
-        assert "w:dp:1" not in b.session.buttons(BUYER)  # no longer «ждёт оплаты»
-        await tasks.poll_deposits(b.bot)
-        async with models.Session() as s:
-            assert (await s.get(Deposit, 1)).status == "cancelled"
-        b.rocket.invoice_status = "paid"  # he paid after all
-        await tasks.poll_deposits(b.bot)
-        async with models.Session() as s:
-            assert (await s.get(Deposit, 1)).status == "paid"
-        assert (await user(BUYER)).balance == D("97.0225")  # what came (98.5) minus the fee: nothing lost
+        await b.run(cb(BUYER, "w:in"))
+        b.chain.pay(BUYER, "100")
+        await tasks.ton_cycle(b.bot)
+        u = await user(BUYER)
+        assert (u.balance, u.deposit_lock, money.withdrawable(u)) == (D("98.5"), D("98.5"), 0)
     go(fn)
 
 

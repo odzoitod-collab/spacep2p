@@ -28,8 +28,10 @@ def render(sn: finance.Snapshot) -> str:
         title(pe("stats"), "Финансы Strait Pay") + f" · {now().astimezone(MSK):%d.%m %H:%M} МСК",
         "",
         section("wallet", "Что есть"),
-        field("xRocket — сюда пополнения, отсюда выводы", f"<b>{_u(sn.xrocket)}</b>"),
-        field("Долг операторов за Bybit-ордера", f"<b>{money.usdt(sn.op_debt)} USDT</b> — вернут на xRocket "
+        field("Горячий кошелёк TON — отсюда выводы", f"<b>{_u(sn.hot)}</b>"
+              + (f" · газ {money.fmt(sn.hot_ton, 4)} TON" if sn.hot_ton is not None else "")),
+        field("На адресах пополнения, ещё не собрано", f"<b>{money.usdt(sn.unswept)} USDT</b>") if sn.unswept else None,
+        field("Долг операторов за Bybit-ордера", f"<b>{money.usdt(sn.op_debt)} USDT</b> — вернут на адреса долга "
               "(в «есть» не входит, пока не погашен)") if sn.op_debt else None,
         field("Пришло через Bybit-ордера", f"24 ч {money.usdt(sn.bybit['24h'])} · 7 д {money.usdt(sn.bybit['7d'])} · "
               f"всего {money.usdt(sn.bybit['all'])} USDT") if sn.bybit["all"] else None,
@@ -56,9 +58,9 @@ def render(sn: finance.Snapshot) -> str:
         field("Пользователей", f"{sn.users} · мерчантов на смене: {sn.online}"),
     ]
     if sn.queued_n:
-        short = sn.queued - (sn.xrocket or 0)
+        short = sn.queued - (sn.hot or 0)
         lines += ["", f"{pe('warn')} <b>В очереди на вывод {sn.queued_n} на {money.usdt(sn.queued)} USDT</b>"
-                      + (f" — пополните xRocket минимум на {money.usdt(short)} USDT" if short > 0 else "")]
+                      + (f" — пополните горячий кошелёк минимум на {money.usdt(short)} USDT" if short > 0 else "")]
     lines += ["", quote("«Можно забрать» = что есть − что должны пользователям; прибыль уже внутри.")]
     return re.sub(r"\n{3,}", "\n\n", "\n".join(line for line in lines if line is not None))
 

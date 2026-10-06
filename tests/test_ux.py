@@ -46,11 +46,11 @@ def test_only_answers_to_bot_questions_are_deleted(go):
         chat = msg(BUYER, "привет")
         await b.run(chat)
         assert chat.message.message_id not in deleted(b, BUYER)  # free text is not an answer to a question
-        await b.run(cb(BUYER, "w:dep"))
-        amount = msg(BUYER, "50")
-        await b.run(amount)
-        assert amount.message.message_id in deleted(b, BUYER)  # the bot asked for the amount: tidy up
-        assert "Счёт #1 · xRocket" in plain(b.session.last(BUYER))
+        await b.run(cb(BUYER, "w:out"))
+        answer = msg(BUYER, "UQBvW8Z5huBkMJYdnfAEM5JqTNkuWX3diqYENkWsIL0XglxD")
+        await b.run(answer)
+        assert answer.message.message_id in deleted(b, BUYER)  # the bot asked for the address: tidy up
+        assert "шаг 2 из 3" in plain(b.session.last(BUYER))
     go(fn)
 
 
@@ -60,10 +60,12 @@ def test_dialog_state_survives_restart(go):
         async with models.Session() as s:
             (await s.get(User, BUYER)).balance = D(50)
             await s.commit()
-        await b.run(cb(BUYER, "w:wd"))
+        await b.run(cb(BUYER, "w:out"))
         b.restart()  # new process
-        await b.run(msg(BUYER, "10"))
-        assert "Подтвердите вывод" in plain(b.session.last(BUYER))
+        await b.run(msg(BUYER, "UQBvW8Z5huBkMJYdnfAEM5JqTNkuWX3diqYENkWsIL0XglxD"))
+        b.restart()
+        await b.run(cb(BUYER, "w:nomemo"), msg(BUYER, "10"))
+        assert "Проверьте вывод" in plain(b.session.last(BUYER))
         b.restart()
         await b.run(cb(BUYER, "w:go"))
         assert (await user(BUYER)).balance == D(40)
@@ -182,15 +184,21 @@ def test_log_chat_gets_every_deal_step(go):
 
 def test_withdrawal_refusal_is_alerted(go):
     async def fn(b):
-        from bot.services import xrocket
+        from bot import tasks
+        from bot.services import ton
         await ready(b)
         async with models.Session() as s:
             (await s.get(User, BUYER)).balance = D(5)
             await s.commit()
-        b.rocket.cheque_error = xrocket.XRocketError("target_user_not_found", "", 400)
-        await b.run(cb(BUYER, "w:wd"), msg(BUYER, "1"), cb(BUYER, "w:go"))
+        b.chain.fund_hot(usdt="100")
+        b.chain.abort = True
+        await b.run(cb(BUYER, "w:out"), msg(BUYER, "UQBvW8Z5huBkMJYdnfAEM5JqTNkuWX3diqYENkWsIL0XglxD"), cb(BUYER, "w:nomemo"), msg(BUYER, "5"), cb(BUYER, "w:go"))
+        for _ in range(ton.PAYOUT_TRIES):
+            await tasks.ton_cycle(b.bot)
         log = await b.deliver()
-        assert any("нужно внимание" in t and "аккаунт не найден в xRocket" in t for t in log)
+        assert any("Сеть отклонила перевод" in t for t in log)
+        assert any("Сеть 3 раза отклонила перевод" in t and "возвращены пользователю" in t for t in log)
+        assert (await user(BUYER)).balance == D(5)
     go(fn)
 
 
@@ -242,38 +250,39 @@ def test_fsm_rows_do_not_clash(go):
     go(fn)
 
 
-def test_withdrawals_wait_for_xrocket_funds_and_go_out_in_order(go):
+async def wd(b, uid, amount):
+    await b.run(cb(uid, "w:out"), msg(uid, "UQBvW8Z5huBkMJYdnfAEM5JqTNkuWX3diqYENkWsIL0XglxD"), cb(uid, "w:nomemo"), msg(uid, str(amount)), cb(uid, "w:go"))
+
+
+def test_withdrawals_wait_for_hot_wallet_funds_and_go_out_in_order(go):
     async def fn(b):
         from bot import tasks
         from bot.models import Withdrawal
-        from bot.services import xrocket
         await ready(b)
         async with models.Session() as s:
             (await s.get(User, BUYER)).balance = D(50)
             (await s.get(User, SELLER)).balance = D(50)
             await s.commit()
-        funds = {"v": "0.5"}
-
-        async def balances():
-            return [{"asset": "USDT", "available": funds["v"]}]
-        b.rocket.balances = balances
-        await b.run(cb(BUYER, "w:wd"), msg(BUYER, "10"), cb(BUYER, "w:go"))
-        assert (await user(BUYER)).balance == D(40) and not b.rocket.cheques  # debited, waiting — not refused
+        b.chain.fund_hot(usdt="0.5")
+        await wd(b, BUYER, 10)
+        assert (await user(BUYER)).balance == D(40)  # debited, waiting — not refused
+        await tasks.ton_cycle(b.bot)
+        await b.run(cb(BUYER, "w"))
         assert "в очереди" in plain(b.session.last(BUYER)) and "w:qc:1" in b.session.buttons(BUYER)
-        await b.run(cb(SELLER, "w:wd"), msg(SELLER, "20"), cb(SELLER, "w:go"))
-        await b.run(cb(BUYER, "w:wd"), msg(BUYER, "5"), cb(BUYER, "w:go"))
-        await tasks.payout_queue(b.bot)  # still nothing on xRocket: all three wait, admins are told
-        assert not b.rocket.cheques
-        assert any("Выводы ждут пополнения xRocket: 3" in t for t in await b.deliver())
+        await wd(b, SELLER, 20)
+        await wd(b, BUYER, 5)
+        await tasks.ton_cycle(b.bot)  # still nothing on the hot wallet: all three wait, admins are told
+        assert not b.chain.sent
+        assert len([t for t in await b.deliver() if "Выводы ждут USDT" in t]) == 1  # once an hour, not every 20 s
 
-        funds["v"] = "25"  # enough for the first two only (10 + 20 > 25): strictly in order
-        xrocket._usdt = None
-        await tasks.payout_queue(b.bot)
-        assert [c[1] for c in b.rocket.cheques] == ["wd-1"]  # #2 (20) does not fit: #3 (5) must not overtake it
-        funds["v"] = "100"
-        await tasks.payout_queue(b.bot)
-        assert [c[1] for c in b.rocket.cheques] == ["wd-1", "wd-2", "wd-3"]
-        assert "Чек на 4.92 USDT" in plain(b.session.last(BUYER))  # 5 − 1.5% (0.075, up to whole cents)
+        b.chain.fund_hot(usdt="24.5")  # 25: enough for #1 (8.85) but not #1 + #2 (18.7): strictly in order
+        await tasks.ton_cycle(b.bot)
+        assert [x[3] for x in b.chain.sent] == [D("8.85")]  # #3 (3.92) must not overtake #2
+        b.chain.fund_hot(usdt="100")
+        await tasks.ton_cycle(b.bot)
+        await tasks.ton_cycle(b.bot)
+        assert [x[3] for x in b.chain.sent] == [D("8.85"), D("18.7"), D("3.92")]  # 5 − 1.5% (0.08 up) − 1
+        assert "Вывод #3 выполнен" in plain(b.session.last(BUYER))
         async with models.Session() as s:
             assert [w.status for w in (await s.scalars(select(Withdrawal).order_by(Withdrawal.id))).all()] == ["done"] * 3
     go(fn)
@@ -286,17 +295,15 @@ def test_queued_withdrawal_can_be_cancelled(go):
         async with models.Session() as s:
             (await s.get(User, BUYER)).balance = D(50)
             await s.commit()
-
-        async def empty():
-            return [{"asset": "USDT", "available": "0"}]
-        b.rocket.balances = empty
-        await b.run(cb(BUYER, "w:wd"), msg(BUYER, "10"), cb(BUYER, "w:go"), cb(BUYER, "w:qc:1"))
+        await wd(b, BUYER, 10)
+        await b.run(cb(BUYER, "w:qc:1"))
         assert (await user(BUYER)).balance == D(50) and "отменён" in plain(b.session.last(BUYER))
         await b.run(cb(BUYER, "w:qc:1"))
         assert "отменить нельзя" in b.session.alerts()[-1]  # nothing is refunded twice
         assert (await user(BUYER)).balance == D(50)
-        await tasks.payout_queue(b.bot)
-        assert not b.rocket.cheques
+        b.chain.fund_hot(usdt="100")
+        await tasks.ton_cycle(b.bot)
+        assert not b.chain.sent
     go(fn)
 
 

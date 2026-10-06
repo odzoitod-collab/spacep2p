@@ -19,8 +19,8 @@ from bot.handlers.deal import STATUS, push, send_files, verdict_effects
 from bot.handlers.seller import card_icon, card_label
 from bot.handlers.wallet import ledger_line, parse_usdt, withdraw_terms
 from bot.models import (Adjustment, ApiApplication, Card, Deal, Deposit, Event, Ledger, Operator, OrderMerchant, Signup,
-                        Team, Ticket, User, Withdrawal, now)
-from bot.services import admins, audit, deals, events, money, operators, orders, settings, teams, xrocket
+                        Team, Ticket, TonAddress, User, Withdrawal, now)
+from bot.services import admins, audit, deals, events, money, operators, orders, settings, teams, ton
 from bot.ui import alink, at, cf, esc, field, files_to, mention, notify, ok, quote, section, show, title, ulink, warn
 from bot.ui import card as fields
 
@@ -69,7 +69,7 @@ async def admin_screen(bot: Bot, s: AsyncSession, user: User, src=None, note: st
     slow = await count(Deal.status == "paid",
                        Deal.paid_at < now() - timedelta(minutes=settings.num("confirm_minutes")))
     unknown = await count(Withdrawal.status.in_(("unknown", "pending")))
-    queued_wd = await count(Withdrawal.status == "queued")
+    queued_wd = await count(Withdrawal.status == "queued", Withdrawal.method == "ton")
     tickets = await count(Ticket.status == "open")
     approvals = await count(Adjustment.status == "pending")
     api_apps = await count(ApiApplication.status == "pending")
@@ -87,14 +87,18 @@ async def admin_screen(bot: Bot, s: AsyncSession, user: User, src=None, note: st
     income = await s.scalar(select(func.coalesce(func.sum(Ledger.delta), 0)).where(Ledger.user_id.is_(None)))
     held = Decimal(await s.scalar(select(func.coalesce(func.sum(User.balance + User.frozen + User.team_balance), 0))))
     solvency = ""
+    unswept = Decimal(await s.scalar(select(func.coalesce(func.sum(TonAddress.unswept), 0))))
     try:
-        available = await xrocket.usdt_available(max_age=60, timeout=3)
-        rocket = f"<b>{money.usdt(available)} USDT</b>"
-        if available < held:
-            solvency = warn(f"В xRocket на {money.usdt(held - available)} USDT меньше, чем на балансах пользователей: "
-                            "выводы могут не пройти.")
+        available, gas = await ton.hot_balances(max_age=60, timeout=3)
+        wallet = f"<b>{money.usdt(available)} USDT</b> · газ {money.fmt(gas, 4)} TON" + (
+            f" · не собрано {money.usdt(unswept)} USDT" if unswept else "")
+        if available + unswept < held:
+            solvency = warn(f"На кошельках TON на {money.usdt(held - available - unswept)} USDT меньше, чем на балансах "
+                            "пользователей: выводы могут ждать в очереди.")
+        if gas < ton.HOT_LOW:
+            solvency += warn(f"Газа на горячем кошельке {money.fmt(gas, 4)} TON — пополните TON.")
     except Exception:
-        rocket = "нет ответа"
+        wallet = "нет ответа" if ton.enabled() else "выключен (TON_SEED не задан)"
     todo = [(signups, f"<b>Заявок на вход:</b> {signups}"),
             (disputes, f"<b>Споров:</b> {disputes}"),
             (slow, f"<b>Продавец молчит дольше {settings.get('confirm_minutes')} мин:</b> {slow}"),
@@ -126,7 +130,7 @@ async def admin_screen(bot: Bot, s: AsyncSession, user: User, src=None, note: st
         "",
         section("wallet", "Деньги"),
         f"<b>Балансы пользователей:</b> {money.usdt(held)} USDT",
-        f"<b>xRocket:</b> {rocket}",
+        f"<b>Горячий кошелёк TON:</b> {wallet}",
         f"<b>Долг операторов (Bybit):</b> {money.usdt(op_debt)} USDT" if op_debt else "",
         "",
         section("support", "Админ-чат"),
@@ -139,7 +143,7 @@ async def admin_screen(bot: Bot, s: AsyncSession, user: User, src=None, note: st
         [btn("Найти", "au", "search"), btn(_n("Обращения", tickets), "atl", "support")],
         [btn(_n("Мерчанты", om_apps), "aoml", "key"), btn(_n("Операторы", free_orders), "aopl", "shop")],
         [btn(_n("Команды", team_apps), "atml", "people"), btn(_n("API", api_apps), "aapi", "key")],
-        [btn("Финансы", "afin", "stats"), btn(_n("xRocket", queued_wd), "axr", "wallet")],
+        [btn("Финансы", "afin", "stats"), btn(_n("TON-кошелёк", queued_wd), "aton", "wallet")],
         [btn(_n("Корректировки", approvals), "aadjl", "dollar"), btn("Балансы", "bal:p:0", "wallet")],
         btn("Карты", "ac:0", "card"),
         [btn("Комиссии", "acm", "percent"), btn("Настройки", "as", "settings")],
@@ -173,11 +177,11 @@ async def _admin_chat_line(bot: Bot) -> str:
 SETTING_ICONS = ["percent", "clock", "wallet", "lock", "info", "key"]  # one per settings.GROUPS section
 # short names for the overview: every setting in one line of its section
 SHORT = {"rate": "курс", "order_rate": "ордер", "seller_pct": "карта", "platform_pct": "площадка",
-         "deposit_fee": "пополнение", "withdraw_pct": "вывод", "withdraw_fee": "чек +", "chain_withdraw_fee": "кошелёк +",
+         "deposit_fee": "пополнение", "withdraw_pct": "вывод", "chain_withdraw_fee": "вывод +",
          "team_pct": "тимлиду", "deal_minutes": "оплата", "buyer_max_open": "сделок сразу", "confirm_minutes": "спор через",
          "escalate_minutes": "автоспор", "late_hold_minutes": "залог", "late_minutes": "поздний чек",
-         "online_minutes": "смена", "deposit_min": "пополнение от", "withdraw_min": "вывод от",
-         "chain_withdraw_min": "на кошелёк от", "adjust_approval_usdt": "второй админ от", "withdraw_turnover": "прокрутка", "receipt_images": "чеки",
+         "online_minutes": "смена", "deposit_min": "пополнение от",
+         "chain_withdraw_min": "вывод от", "ton_sweep_min": "сбор от", "adjust_approval_usdt": "второй админ от", "withdraw_turnover": "прокрутка", "receipt_images": "чеки",
          "log_all": "лог", "signup_review": "вход", "join_required": "чат и канал", "support": "поддержка", "manager": "менеджер",
          "tutorial": "о сервисе", "manual_url": "памятка", "docs_url": "инструкции", "chat_id": "чат",
          "channel_id": "канал", "channel_autopost_hours": "автопост", "order_min_rub": "от", "order_max_rub": "до", "order_search_minutes": "поиск",
@@ -347,9 +351,8 @@ async def commissions_screen(bot: Bot, s: AsyncSession, admin: User, src=None, n
               f"(карта) или {money.usdt(qo.platform_fee)} USDT (ордер: мерчант отдаёт {money.usdt(qo.seller_debit)})"),
         "",
         section("wallet", "Кошелёк"),
-        field("Пополнение (счёт и адрес)", f"{settings.get('deposit_fee')}%"),
-        field("Вывод чеком", withdraw_terms("xrocket")),
-        field("Вывод на кошелёк", f"{withdraw_terms('chain')} — комиссия сети xRocket внутри фикс. части"),
+        field("Пополнение", f"{settings.get('deposit_fee')}% (погашение долга оператора — без комиссии)"),
+        field("Вывод", f"{withdraw_terms()} — фикс. часть покрывает газ сети TON (его платит горячий кошелёк)"),
         "",
         section("people", "Команды"),
         field("Тимлиду", f"<b>{settings.get('team_pct')}%</b> от сделок участников (из дохода площадки, не больше него)"),
@@ -369,7 +372,7 @@ async def commissions_screen(bot: Bot, s: AsyncSession, admin: User, src=None, n
         [btn("Покупатель", "acs:platform_pct", "dollar"), btn("Курс", "acs:rate", "swap")],
         [btn("Мерчант: карта", "acs:seller_pct", "card"), btn("Курс ордерного", "acs:order_rate", "key")],
         [btn("Пополнение", "acs:deposit_fee", "down"), btn("Вывод, %", "acs:withdraw_pct", "up")],
-        [btn("Вывод чеком, фикс", "acs:withdraw_fee", "up"), btn("На кошелёк, фикс", "acs:chain_withdraw_fee", "up")],
+        btn("Вывод, фикс", "acs:chain_withdraw_fee", "up"),
         btn("Процент тимлида", "acs:team_pct", "people"),
         *[btn(f"Личная ставка · {u.id} {(u.name or '')[:16]}", f"aup:{u.id}", "star") for u in personal],
         *[btn(f"Покупатель · {u.id} {(u.name or '')[:16]}", f"aut:{u.id}", "star") for u in buyers],
@@ -565,11 +568,11 @@ def _role_line(label: str, data: tuple) -> str:
             + (f" · {extra}" if extra else ""))
 
 
-WD_LABEL = {"queued": "ждёт средств xRocket", "cancelled": "отменён пользователем", "pending": "отправляется",
+WD_LABEL = {"queued": "в очереди", "cancelled": "отменён пользователем", "pending": "отправляется",
             "sending": "отправляется", "sent": "в сети", "unknown": "требует проверки",
-            "done": "выполнен", "failed": "не выполнен"}
+            "done": "выполнен", "failed": "не выполнен, возвращён"}
 DEP_LABEL = {"new": "создаётся", "active": "ждёт оплаты", "paid": "зачислен", "expired": "истёк", "failed": "не создан",
-             "cancelled": "отменён пользователем"}
+             "cancelled": "отменён пользователем", "small": "меньше минимума"}
 
 
 async def user_screen(bot: Bot, s: AsyncSession, admin: User, u: User, src=None, note: str = "", found=None):

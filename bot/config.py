@@ -1,5 +1,6 @@
 from typing import Literal
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -12,8 +13,13 @@ class Config(BaseSettings):
     # confirm the payment (acting as an admin in that deal). Empty = the admins.
     operator_ids: list[int] = []
     database_url: str = "postgresql+asyncpg://p2p:p2p@localhost:5432/p2p"
-    xrocket_token: str = ""
-    xrocket_base_url: str = "https://pay.api.xrocket.exchange"
+    # USDT on TON: every wallet of the bot (the hot wallet that pays fees and withdrawals, users' deposit addresses,
+    # operators' debt addresses) is derived from ton_seed — 64 hex chars (32 random bytes). Empty = the wallet is off.
+    # Losing it = losing the funds on those wallets; anyone who has it can move them. Never share it, keep a copy.
+    ton_seed: str = ""
+    ton_api_key: str = ""  # toncenter.com key (@tonapibot); a key set in the admin panel wins over this one
+    ton_testnet: bool = False
+    ton_usdt_master: str = "EQCxE6mUtQJKFnGfaROTKOt1lZbDiiX1kCixRv7Nw2Id_sDs"  # Tether USD (USD₮) jetton, mainnet
     log_chat_id: int | None = None
     log_thread_id: int | None = None  # topic id when the log chat is a forum supergroup
     # premium: custom emoji (bot owner needs Telegram Premium or a Fragment username);
@@ -31,6 +37,14 @@ class Config(BaseSettings):
     @property
     def api_url(self) -> str:
         return (self.api_public_url or f"http://{self.api_host}:{self.api_port}").rstrip("/")
+
+    @field_validator("ton_seed")
+    @classmethod
+    def _seed(cls, v: str) -> str:
+        v = v.strip()
+        if v and (len(v) != 64 or any(c not in "0123456789abcdefABCDEF" for c in v)):
+            raise ValueError("TON_SEED must be 64 hex characters: python -m bot.services.ton seed")
+        return v
 
     @property
     def operators(self) -> list[int]:

@@ -1,10 +1,9 @@
-"""End-to-end run of the bot handlers against a fake Telegram API and fake xRocket."""
+"""End-to-end run of the bot handlers against a fake Telegram API and a fake TON network."""
 import asyncio
 import itertools
 import os
 from datetime import datetime, timedelta
 from decimal import Decimal as D
-from sqlalchemy import select
 
 os.environ.setdefault("BOT_TOKEN", "123:abc")
 os.environ["LOG_CHAT_ID"] = "1"
@@ -16,11 +15,10 @@ from aiogram.types import CallbackQuery, Chat, Document, Message, Update, Video 
 from aiogram.types import User as TgUser  # noqa: E402
 
 from bot import models, tasks  # noqa: E402
-from bot.handlers import wallet  # noqa: E402
 from tests import harness  # noqa: E402
 from tests.harness import make_dp  # noqa: E402
-from bot.models import Deal, Deposit, Ledger, User, Withdrawal  # noqa: E402
-from bot.services import settings, xrocket  # noqa: E402
+from bot.models import Deal, User, Withdrawal  # noqa: E402
+from bot.services import settings, ton  # noqa: E402
 
 ids = itertools.count(100)
 
@@ -45,27 +43,6 @@ class FakeSession(BaseSession):
         pass
 
 
-class FakeRocket:
-    def __init__(self):
-        self.cheques = []
-
-    async def create_invoice(self, amount, client_id, description):
-        return {"id": "inv1", "links": {"telegramBotLink": "https://t.me/xRocket?start=inv1"}}
-
-    async def get_invoice(self, invoice_id):
-        return {"id": invoice_id, "status": "paid"}
-
-    async def get_invoice_payments(self, invoice_id):
-        return [{"id": "payment1", "status": "paid", "receiveAmount": "98.5", "receiveCurrency": "USDT"}]
-
-    async def create_cheque(self, amount, client_id, tg_id, description):
-        self.cheques.append((amount, client_id, tg_id))
-        return {"chequeId": "c1", "links": {"telegramBotLink": "https://t.me/xRocket?start=c1"}}
-
-    async def balances(self):
-        return [{"asset": "USDT", "available": "1000"}]
-
-
 def tg(uid):
     return TgUser(id=uid, is_bot=False, first_name=f"U{uid}", username=f"u{uid}")
 
@@ -88,8 +65,10 @@ async def scenario():
         await settings.put(s, "signup_review", "0")  # entry by application is covered by test_signup
         await s.commit()
         await settings.load(s)
-    rocket = FakeRocket()
-    xrocket.rocket = rocket
+    chain = harness.FakeChain()
+    ton.chain = chain
+    ton.POLL, ton.WAIT = 0, 0.01
+    chain.fund_hot(usdt="100")
     session = FakeSession()
     bot = Bot("123:abc", session=session, default=DefaultBotProperties(parse_mode="HTML"))
     dp = make_dp()
@@ -149,13 +128,16 @@ async def scenario():
     async with models.Session() as s:
         assert (await s.get(User, SELLER)).frozen == 0
 
-    # wallet: withdraw by cheque, deposit via polling
-    await run(cb(BUYER, "w"), cb(BUYER, "w:wd"), msg(BUYER, "10"), cb(BUYER, "w:go"), cb(BUYER, "w:go"),
-              cb(BUYER, "w:dep"), msg(BUYER, "100"), cb(BUYER, "w:h"))
-    assert rocket.cheques and rocket.cheques[0][2] == BUYER
-    await tasks.poll_deposits(bot)
+    # wallet: withdraw to a TON address (double click: one withdrawal), deposit to the personal address
+    await run(cb(BUYER, "w"), cb(BUYER, "w:out"), msg(BUYER, "UQBvW8Z5huBkMJYdnfAEM5JqTNkuWX3diqYENkWsIL0XglxD"),
+              cb(BUYER, "w:nomemo"), msg(BUYER, "10"), cb(BUYER, "w:go"), cb(BUYER, "w:go"), cb(BUYER, "w:in"))
+    chain.pay(BUYER, "100")
+    await tasks.ton_cycle(bot)
+    await run(cb(BUYER, "w:h"))
+    assert [x[3] for x in chain.sent if x[:2] == ("gas", "USDT")] == [D("8.85")]  # 10 − 1.5% − 1 USDT
     async with models.Session() as s:
-        assert (await s.get(User, BUYER)).balance == D("131.6") - 10 + D("97.0225")  # 98.5 − 1.5% fee
+        assert (await s.get(Withdrawal, 1)).status == "done"
+        assert (await s.get(User, BUYER)).balance == D("131.6") - 10 + D("98.5")  # 100 − 1.5% fee
 
     # admin panel
     await run(cb(ADMIN, "as"), cb(ADMIN, "as:rate"), msg(ADMIN, "95"))
@@ -181,81 +163,20 @@ def test_full_flow():
     assert len(session.calls) > 50
 
 
-def test_deposit_credits_actual_net_payment_once():
-    async def scenario():
-        await models.init_db("sqlite+aiosqlite:///:memory:")
-        async with models.Session() as s:
-            s.add(User(id=777))
-            s.add(Deposit(user_id=777, invoice_id="inv-partial", amount=D(100),
-                          credit=D("98.5"), status="active"))
-            await s.commit()
-
-        class PartialRocket(FakeRocket):
-            async def get_invoice(self, invoice_id):
-                return {"id": invoice_id, "status": "expired"}
-
-            async def get_invoice_payments(self, invoice_id):
-                return [{"status": "paid", "receiveAmount": "47.3", "receiveCurrency": "USDT"}]
-
-        xrocket.rocket = PartialRocket()
-        async with models.Session() as s:
-            dep = await s.get(Deposit, 1)
-            assert await wallet.check_deposit(s, dep) == "credited"
-            assert await wallet.check_deposit(s, dep) == "paid"
-            assert (await s.get(User, 777)).balance == D("46.5905")  # 47.3 received − 1.5% deposit fee
-            assert dep.credit == D("46.5905") and dep.amount == D("47.3")
-    asyncio.run(scenario())
-
-
-def test_cancelled_cheque_refunds_once_and_reverses_fee():
-    async def scenario():
-        await harness.reset_db("sqlite+aiosqlite:///:memory:")
-        async with models.Session() as s:
-            s.add_all([User(id=1), User(id=20, balance=D(90)),
-                       Withdrawal(user_id=20, amount=D(10), fee=D(2), status="done",
-                                  cheque_id="ch1", link="https://t.me/x"),
-                       Ledger(user_id=None, delta=D(2), kind="withdraw_fee", ref="wd:1")])
-            await s.commit()
-        b = harness.Bench()
-        b.rocket.lookup = {"chequeId": "ch1", "deleted": True}
-        await b.run(cb(1, "wr:1"), cb(1, "wr:1"))  # second click: already processed
-        async with models.Session() as s:
-            assert (await s.get(User, 20)).balance == D(100)
-            assert (await s.get(Withdrawal, 1)).status == "failed"
-            rows = (await s.scalars(select(Ledger).where(Ledger.user_id.is_(None)))).all()
-            assert sum((row.delta for row in rows), D(0)) == 0
-        assert "возвращена на баланс" in harness.plain(b.session.texts(1)[-2])
-    asyncio.run(scenario())
-
-
 def test_unknown_withdrawal_manual_refund_once():
     async def scenario():
         await harness.reset_db("sqlite+aiosqlite:///:memory:")
         async with models.Session() as s:
             s.add_all([User(id=1), User(id=20, balance=D(90)),
-                       Withdrawal(user_id=20, amount=D(10), fee=D(0), status="unknown")])
+                       Withdrawal(user_id=20, amount=D(10), fee=D(0), status="unknown", method="ton",
+                                  address="UQBvW8Z5huBkMJYdnfAEM5JqTNkuWX3diqYENkWsIL0XglxD")])
             await s.commit()
-
-        class MissingRocket(harness.FakeRocket):
-            deleted = False
-
-            async def get_cheque_by_client(self, client_id):
-                if self.deleted:
-                    return {"chequeId": "check", "deleted": True}
-                raise xrocket.XRocketError("app_cheque_not_found", status=404)
-
-            async def create_cheque(self, amount, client_id, tg_id, description):
-                return {"chequeId": "check", "deleted": False}
-
-            async def delete_cheque_by_client(self, client_id):
-                self.deleted = True
-
         b = harness.Bench()
-        xrocket.rocket = MissingRocket()
-        await b.run(cb(1, "wr:1"))
-        assert "wr:rf:1" in b.session.buttons(1)  # refund offered only after xRocket says "not found"
-        await b.run(cb(1, "wr:rf:1"), cb(1, "wr:rf:1"))
+        await b.run(cb(1, "awv:1"))
+        assert "wk:rf:1" in b.session.buttons(1)
+        await b.run(cb(1, "wk:rf2:1"), cb(1, "wk:rf2:1"))  # second click: already processed
         async with models.Session() as s:
             assert (await s.get(User, 20)).balance == D(100)
             assert (await s.get(Withdrawal, 1)).status == "failed"
+        await harness.models.engine.dispose()
     asyncio.run(scenario())

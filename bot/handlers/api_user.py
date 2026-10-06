@@ -58,7 +58,7 @@ async def api_screen(bot: Bot, s: AsyncSession, user: User, src=None, note: str 
         quote("Реквизиты статичных карт и ордерных мерчантов — в одном API",
               "Одни условия (курс и процент) на все заказы",
               "Статусы по запросу и вебхуки с подписью HMAC",
-              "Вывод — в Кошельке: чек xRocket или кошелёк в любой сети"),
+              "Вывод — в Кошельке: USDT на любой TON-кошелёк"),
     ]
     if app and app.status == "pending":
         lines = intro + [f"{pe('clock')} <b>Заявка «{esc(app.project)}» на рассмотрении</b> с {at(app.created_at, 'dt')}. "

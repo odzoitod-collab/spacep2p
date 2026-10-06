@@ -12,7 +12,7 @@
 | Профиль бота в Telegram | описание и короткое описание (ставятся при запуске, `commands.DESCRIPTION`/`SHORT`) |
 | Меню команд | `/start` — «Strait Pay: главное меню», `/api` — «API для сервисов» |
 | Помощь | «Помощь · Strait Pay» |
-| Счета и чеки xRocket | «Пополнение баланса Strait Pay…», «Вывод с баланса Strait Pay» |
+| Кошелёк TON | «Пополнение USDT · TON», «Вывод USDT · TON» |
 | API | раздел «Strait Pay API», `GET /` → `{"name": "Strait Pay API"}`, вебхуки с `User-Agent: StraitPay-Webhooks/1.0` и заголовками `X-Strait-*`, токены `sp_live_…` |
 | Документация | `docs/API.md`, отдаётся по `GET /docs` |
 
