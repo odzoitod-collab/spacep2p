@@ -14,7 +14,7 @@ from aiogram.types import BufferedInputFile
 from aiohttp import web
 from sqlalchemy import func, select
 
-from bot.api.webapp import AppError, body, ctx, deal_json, deal_of, deal_response, iso, num
+from bot.api.webapp import AppError, body, ctx, deal_json, deal_of, deal_response, iso, num, own_purchase
 from bot.models import (Adjustment, Deal, Ledger, MerchantRating, Operator, OrderMerchant, Signup, Ticket,
                         User, Withdrawal, now)
 from bot.services import admins, bsc, deals, money, operators, orders, settings
@@ -190,7 +190,13 @@ async def deal_of_request(request: web.Request) -> Deal:
 async def request_view(request: web.Request) -> web.Response:
     """A free request as a merchant sees it before taking it."""
     s, user, _ = ctx(request)
-    d = await deal_of_request(request)
+    try:
+        d = await deal_of_request(request)
+    except AppError:  # taken meanwhile: the merchant who took it (or anyone who may) gets the deal itself
+        d = await s.get(Deal, int(request.match_info["id"]))
+        if d is None or d.status == "searching":
+            raise
+        d = await deal_of(request)
     return await deal_response(s, d, user.id)
 
 
@@ -254,7 +260,7 @@ async def dispute(request: web.Request) -> web.Response:
     from bot.handlers.deal import REASONS, log as deal_log, push, settle_by_operator
     s, user, bot = ctx(request)
     d = await deal_of(request)
-    buyer = user.id == d.buyer_id
+    buyer = own_purchase(d, user.id)
     if buyer and not ((at := deals.buyer_dispute_at(d)) and now() >= at):
         raise AppError(409, "not_allowed", "Спор пока недоступен — обновите сделку")
     if not buyer and (deals.checker(d) != user.id or d.status != "paid"):

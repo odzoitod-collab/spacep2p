@@ -225,6 +225,11 @@ async def order_timeouts(bot: Bot) -> None:
         # requests still searching reach merchants approved and chats connected since the last send
         for d in (await s.scalars(select(Deal).where(Deal.status == "searching", Deal.expires_at >= now()))).all():
             await order_handlers.broadcast(bot, s, d, first=False)
+        # Bybit orders still waiting for an operator reach operators added since and those a send failed for
+        for d in (await s.scalars(select(Deal).where(Deal.status == "checking", Deal.via_bybit,
+                                                     Deal.operator_id.is_(None), Deal.expires_at >= now()))).all():
+            await order_handlers.notify_operators(bot, s, d, await s.get(User, d.seller_id) if d.seller_id else None,
+                                                  first=False)
 
 
 async def stats_topic(bot: Bot) -> None:

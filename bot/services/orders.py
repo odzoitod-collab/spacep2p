@@ -472,3 +472,15 @@ async def forget_offers(s: AsyncSession, deal_id: int, kinds: tuple[str, ...] = 
     rows = (await s.execute(select(OrderOffer.user_id, OrderOffer.msg_id, OrderOffer.kind).where(*where))).all()
     await s.execute(delete(OrderOffer).where(*where))
     return [(uid, mid, kind) for uid, mid, kind in rows if mid]
+
+
+RETRY_OFFER = timedelta(seconds=60)  # a request that did not reach someone (flood control, network) is sent again
+
+
+async def retry_failed(s: AsyncSession, deal_id: int, kind: str) -> None:
+    """Forget offers of this request that failed for a passing reason (msg_id NULL, not a decline) a minute ago, so
+    the next send reaches those merchants, chats or operators again. msg_id 0 — the chat is gone for good (blocked,
+    kicked): not retried. Does not commit."""
+    await s.execute(delete(OrderOffer).where(
+        OrderOffer.deal_id == deal_id, OrderOffer.kind == kind, OrderOffer.msg_id.is_(None), ~OrderOffer.declined,
+        OrderOffer.created_at < now() - RETRY_OFFER))

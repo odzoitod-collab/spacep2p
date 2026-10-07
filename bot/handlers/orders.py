@@ -20,7 +20,8 @@ from bot.handlers.deal import deal_screen, log as deal_log, push
 from bot.handlers.seller import BANKS, check_bank, check_holder, check_requisites
 from bot.models import Deal, Event, OrderMerchant, OrderOffer, Team, User, now
 from bot.services import deals, events, money, operators, orders, settings
-from bot.ui import (app_btn, at, clean, close_kb, deep_link, esc, field, manual, mark, notify, ok, person, quote, safe_text,
+from bot.ui import (app_btn, at, clean, close_kb, deep_link, deliver, esc, field, gone, manual, mark, notify, ok, person,
+                    quote, safe_text,
                     section, show, title,
                     warn)
 
@@ -130,7 +131,7 @@ _posted: dict[tuple[int, int], str] = {}  # (chat, message) -> the text last put
 async def sync_chat_posts(bot: Bot, s: AsyncSession, d: Deal) -> None:
     """Every chat post of this request shows its current state (the take button only while it is searching)."""
     rows = (await s.execute(select(OrderOffer.user_id, OrderOffer.msg_id).where(
-        OrderOffer.deal_id == d.id, OrderOffer.kind == "chat", OrderOffer.msg_id.is_not(None)))).all()
+        OrderOffer.deal_id == d.id, OrderOffer.kind == "chat", OrderOffer.msg_id > 0))).all()
     for chat, mid in rows:
         team = await s.scalar(select(Team.id).where(Team.chat_id == chat))
         text = clean(chat_text(d))
@@ -158,6 +159,8 @@ async def broadcast(bot: Bot, s: AsyncSession, d: Deal, first: bool = True) -> i
     """Send the request to every merchant and chat that has not seen it. Commits.
     Merchants with more completed deals first; first=False: a periodic re-send to merchants approved later and chats
     added later — quiet if nobody new. A failed delivery is remembered too, so a blocked bot is not retried."""
+    await orders.retry_failed(s, d.id, "merchant")
+    await orders.retry_failed(s, d.id, "chat")
     merchants = await orders.eligible(s, d)
     best = await orders.first_wave(s, d, [u.id for _, u in merchants])  # the first seconds: the best ones, no chats
     if best is not None:
@@ -168,8 +171,8 @@ async def broadcast(bot: Bot, s: AsyncSession, d: Deal, first: bool = True) -> i
         problem = orders.bybit_problem((await orders.reputation(s, u.id))[0], d)
         if problem and u.balance < d.seller_debit:
             continue  # neither way is open to him for this request
-        m = await notify(bot, u.id, offer_text(d, u, problem), offer_kb(d, u, problem), silent=u.quiet)
-        s.add(OrderOffer(deal_id=d.id, user_id=u.id, msg_id=m.message_id if m else None))
+        m, lost = await deliver(bot, u.id, offer_text(d, u, problem), offer_kb(d, u, problem), silent=u.quiet)
+        s.add(OrderOffer(deal_id=d.id, user_id=u.id, msg_id=m.message_id if m else 0 if lost else None))
         sent += m is not None
     posted = set((await s.scalars(select(OrderOffer.user_id).where(OrderOffer.deal_id == d.id,
                                                                    OrderOffer.kind == "chat"))).all())
@@ -178,16 +181,18 @@ async def broadcast(bot: Bot, s: AsyncSession, d: Deal, first: bool = True) -> i
         if chat in posted:
             continue
         payload = f"o{d.id}" + (f"_t{team}" if team else "")
+        lost = False
         try:
             markup = chat_markup(await deep_link(bot, payload), d)
             m = await safe_text(lambda t: bot.send_message(chat, t, reply_markup=markup, disable_web_page_preview=True),
                                 clean(chat_text(d)))
             _posted[(chat, m.message_id)] = clean(chat_text(d))
             in_chats += 1
-        except TelegramAPIError as e:
-            m = None
-            await events.alert_once(s, "app:chat", "post_failed", f"Заявка не опубликована в чате {chat}: {e}"[:300])
-        s.add(OrderOffer(deal_id=d.id, user_id=chat, msg_id=m.message_id if m else None, kind="chat"))
+        except TelegramAPIError as e:  # gone (bot removed): not retried for this request; else again in a minute
+            m, lost = None, gone(e)
+            await events.alert_once(s, f"chat:{chat}", "post_failed", (f"Заявка #{d.id} не опубликована в чате "
+                                    f"{chat}: {e}" + ("" if lost else " — повторю через минуту"))[:300])
+        s.add(OrderOffer(deal_id=d.id, user_id=chat, msg_id=m.message_id if m else 0 if lost else None, kind="chat"))
     if sent or in_chats or first:
         deal_log(s, d, "offered", f"Заявка на {money.fmt(d.amount_rub)} ₽ разослана: мерчантам {sent}, в чаты "
                                   f"{in_chats}" + ("" if first else " (досыл)"), notice=True)
@@ -593,25 +598,37 @@ def operator_offer_text(d: Deal, merchant: User | None, rep: str = "") -> str:
     ] if line is not None)
 
 
-async def notify_operators(bot: Bot, s: AsyncSession, d: Deal, merchant: User | None) -> None:
-    """Every operator gets «Принять ордер»; the first one who accepts gets the link, the others' messages close.
-    Commits."""
-    got = 0
+async def notify_operators(bot: Bot, s: AsyncSession, d: Deal, merchant: User | None, first: bool = True) -> int:
+    """Every operator gets «Принять ордер» — always with sound, whatever his quiet setting: an order waits for him;
+    the first one who accepts gets the link, the others' messages close. Operators who already have this offer are
+    skipped, so it is safe to call again: first=False (order_timeouts, every 20 s) reaches operators added since and
+    those a send failed for a passing reason (flood control, network). Returns how many got it now. Commits."""
+    await orders.retry_failed(s, d.id, "operator")
+    have = set((await s.scalars(select(OrderOffer.user_id).where(
+        OrderOffer.deal_id == d.id, OrderOffer.kind == "operator"))).all())
+    team = [oid for oid in await operators.ids(s) if oid not in (d.seller_id, d.buyer_id)]  # never his own order
+    todo = [oid for oid in team if oid not in have]
+    if not todo:
+        return 0
+    got, missed = 0, []
     rep = orders.rep_line(*await orders.reputation(s, d.seller_id)) if d.seller_id else ""
-    for oid in await operators.ids(s):
-        if oid in (d.seller_id, d.buyer_id):
-            continue  # an operator never checks his own order or his own purchase
-        who = await s.get(User, oid)
-        m = await notify(bot, oid, operator_offer_text(d, merchant, rep),
-                         kb(btn("Принять ордер", f"opq:go:{d.id}", "ok", style="success"),
-                            [btn("Найти другого мерчанта", f"opq:nm:{d.id}", "search"),
-                             app_btn("В приложении", f"deal/{d.id}")], back("x", "Скрыть", "cross")),
-                         silent=bool(who and who.quiet))
-        s.add(OrderOffer(deal_id=d.id, user_id=oid, msg_id=m.message_id if m else None, kind="operator"))
+    for oid in todo:
+        m, lost = await deliver(bot, oid, operator_offer_text(d, merchant, rep),
+                                kb(btn("Принять ордер", f"opq:go:{d.id}", "ok", style="success"),
+                                   [btn("Найти другого мерчанта", f"opq:nm:{d.id}", "search"),
+                                    app_btn("В приложении", f"deal/{d.id}")], back("x", "Скрыть", "cross")))
+        s.add(OrderOffer(deal_id=d.id, user_id=oid, msg_id=m.message_id if m else 0 if lost else None,
+                         kind="operator"))
         got += m is not None
-    if not got:
+        if m is None:
+            missed.append(f"{oid}" + (" (бот заблокирован или не запущен)" if lost else " (сбой Telegram, повторю)"))
+    if first and not got and not have:
         deal_log(s, d, "notify_failed", f"Ни один оператор не получил Bybit-ордер по заявке #{d.id}", alert=True)
+    elif missed and first:
+        await events.alert_once(s, f"deal:{d.id}", "operators_missed", f"Bybit-ордер по заявке #{d.id} не дошёл до "
+                                f"операторов: {', '.join(missed)}"[:900])
     await s.commit()
+    return got
 
 
 async def _operator(c: CallbackQuery, s: AsyncSession) -> bool:

@@ -1,6 +1,7 @@
 """Strait Pay merchant API over HTTP (aiohttp, runs in the bot process). Reference: docs/API.md."""
 import asyncio
 import hashlib
+from contextlib import suppress
 import re
 import logging
 from decimal import Decimal, InvalidOperation
@@ -247,7 +248,6 @@ async def create_order(request: web.Request) -> web.Response:
 
 async def request_order(request: web.Request, amount: Decimal, sender_bank: str | None, ext: str | None,
                         payer: str | None = None):
-    from bot.handlers.orders import broadcast
     s, client, owner, bot = ctx(request)
     try:
         d = await orders.create_request(s, owner, amount, sender_bank, client=client, external_id=ext, payer_id=payer)
@@ -268,8 +268,34 @@ async def request_order(request: web.Request, amount: Decimal, sender_bank: str 
         await s.rollback()
         d = await s.scalar(select(Deal).where(Deal.api_client_id == client.id, Deal.external_id == ext))
         return await order_response(s, d)
-    await broadcast(bot, s, d)
+    await wait_broadcast(bot, d.id)
     return await order_response(s, d, 202)
+
+
+BROADCAST_WAIT = 5  # seconds the API answer waits for the request to reach merchants; the rest goes on in background
+_sending: set[asyncio.Task] = set()
+
+
+async def _broadcast(bot: Bot, did: int) -> None:
+    from bot.handlers.orders import broadcast
+    try:
+        async with Session() as s:
+            d = await s.get(Deal, did)
+            if d is not None and d.status == "searching":
+                await broadcast(bot, s, d)
+    except Exception:  # the order exists: order_timeouts sends it again within 20 s
+        log.exception("API order #%s: broadcast failed", did)
+
+
+async def wait_broadcast(bot: Bot, did: int) -> None:
+    """Send the new request to merchants and chats in its own session. Many merchants take a while (Telegram allows
+    ~25 messages a second): the client's HTTP call must not time out and retry because of it, and a failed send must
+    not turn a created order into a 500."""
+    task = asyncio.create_task(_broadcast(bot, did))
+    _sending.add(task)
+    task.add_done_callback(_sending.discard)
+    with suppress(asyncio.TimeoutError):
+        await asyncio.wait_for(asyncio.shield(task), BROADCAST_WAIT)
 
 
 WAIT_MAX = 30  # seconds a long poll may hold

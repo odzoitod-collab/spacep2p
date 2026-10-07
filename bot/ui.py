@@ -542,16 +542,36 @@ def with_app(uid: int, text: str, markup: InlineKeyboardMarkup) -> InlineKeyboar
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-async def notify(bot: Bot, uid: int, text: str, markup: InlineKeyboardMarkup | None = None,
-                 silent: bool = False) -> Message | None:
-    """Separate message (notification). Returns None if it could not be delivered (blocked bot etc.) or there is
-    nobody to deliver to. A deal's notification opens the deal in the mini app (with_app)."""
+def gone(e: Exception) -> bool:
+    """Telegram will refuse this chat every time (blocked, kicked, deleted, never started): no point to retry."""
+    return isinstance(e, TelegramForbiddenError) or (
+        isinstance(e, TelegramBadRequest) and any(x in str(e).lower() for x in (
+            "chat not found", "user is deactivated", "bot was kicked", "have no rights", "not enough rights")))
+
+
+async def deliver(bot: Bot, uid: int, text: str, markup: InlineKeyboardMarkup | None = None,
+                  silent: bool = False) -> tuple[Message | None, bool]:
+    """notify() that also tells why it failed: (message, False) sent; (None, True) the chat is gone for good;
+    (None, False) a passing failure (flood control, network) — worth another try later. Never raises: one bad
+    recipient must not stop a send to the others."""
     if not uid:
-        return None
+        return None, True
     markup = with_app(uid, text, markup or close_kb())
     try:
         return await safe_text(lambda t: bot.send_message(
             uid, t, reply_markup=markup, disable_notification=silent, disable_web_page_preview=True),
-            clean(text))
-    except TelegramAPIError:
-        return None
+            clean(text)), False
+    except TelegramAPIError as e:
+        if not gone(e):
+            log.warning("notification to %s not sent: %s", uid, e)
+        return None, gone(e)
+    except Exception:
+        log.exception("notification to %s failed", uid)
+        return None, False
+
+
+async def notify(bot: Bot, uid: int, text: str, markup: InlineKeyboardMarkup | None = None,
+                 silent: bool = False) -> Message | None:
+    """Separate message (notification). Returns None if it could not be delivered (blocked bot etc.) or there is
+    nobody to deliver to. A deal's notification opens the deal in the mini app (with_app)."""
+    return (await deliver(bot, uid, text, markup, silent))[0]

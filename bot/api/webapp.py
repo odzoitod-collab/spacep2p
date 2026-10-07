@@ -273,8 +273,14 @@ async def stats(request: web.Request) -> web.Response:
 
 # ---------- deals ----------
 
+def own_purchase(d: Deal, uid: int) -> bool:
+    """The viewer is this deal's buyer in person. The buyer of an API order is the token owner only on paper — the
+    payer is the service's customer, so the owner (an admin, usually) sees such a deal as the administration does."""
+    return uid == d.buyer_id and d.api_client_id is None
+
+
 def role_of(d: Deal, uid: int) -> str:
-    if uid == d.buyer_id:
+    if own_purchase(d, uid):
         return "buyer"
     if d.via_bybit and (uid == d.operator_id or d.status == "checking" and d.operator_id is None
                         and uid not in (d.buyer_id, d.seller_id)):
@@ -303,7 +309,7 @@ def actions(d: Deal, uid: int, who: dict | None = None) -> list[str]:
     from bot.handlers.admin import verdict_allowed
     from bot.handlers.relay import chat_people
     who = who or {}
-    out, buyer = [], uid == d.buyer_id
+    out, buyer = [], own_purchase(d, uid)
     if buyer and d.status in ("searching", "assigned", "checking"):
         out.append("cancel_request")
     if buyer and d.status == "waiting_payment":
@@ -413,13 +419,16 @@ async def deal_of(request: web.Request) -> Deal:
     except ValueError:
         raise AppError(404, "not_found", "Сделка не найдена")
     d = await s.get(Deal, did, populate_existing=True)
-    free = (d is not None and d.via_bybit and d.status == "checking" and d.operator_id is None
-            and await operators.is_operator(s, user.id))  # an order waiting for an operator: any operator sees it
-    if d is None or (user.id not in (d.buyer_id, d.seller_id, d.operator_id) and not admins.is_admin(user.id)
-                     and not free) \
-            or (d.api_client_id and user.id == d.buyer_id and user.id not in (d.seller_id, d.operator_id)):
+    if d is None:
         raise AppError(404, "not_found", "Сделка не найдена")
-    return d
+    if admins.is_admin(user.id) or user.id in (d.seller_id, d.operator_id) or own_purchase(d, user.id):
+        return d
+    if d.via_bybit and await operators.is_operator(s, user.id):
+        if d.status == "checking" and d.operator_id is None:
+            return d  # an order waiting for an operator: any operator sees it
+        raise AppError(409, "taken", "Ордер уже принял другой оператор или заявка закрыта")
+    raise AppError(404, "not_found", "Сделка не найдена" if d.api_client_id is None or user.id != d.buyer_id else
+                   "Это заказ вашего API: следите за ним по вебхукам или GET /v1/orders/{id}")
 
 
 async def viewer(s, uid: int) -> dict:
@@ -448,7 +457,7 @@ async def deal_cancel(request: web.Request) -> web.Response:
     from bot.handlers.orders import cancel_request, request_cancelled
     s, user, bot = ctx(request)
     d = await deal_of(request)
-    if d.buyer_id != user.id:
+    if not own_purchase(d, user.id):
         raise AppError(403, "forbidden", "Отменить может только покупатель")
     if d.status in ("searching", "assigned", "checking"):
         res = await cancel_request(s, d.id)
@@ -488,7 +497,7 @@ async def deal_receipt(request: web.Request) -> web.Response:
     from bot.handlers.deal import MAX_FILE, accept_receipt, send_to_seller
     s, user, bot = ctx(request)
     d = await deal_of(request)
-    if d.buyer_id != user.id or d.status not in ("waiting_payment", "expired"):
+    if not own_purchase(d, user.id) or d.status not in ("waiting_payment", "expired"):
         raise AppError(409, "not_allowed", "Чек сейчас не принимается — обновите сделку")
     data, name = b"", "check.pdf"
     if request.content_type.startswith("multipart/"):
