@@ -63,6 +63,9 @@ def test_seller_disputes_with_a_file_and_the_admin_decides(go):
             await c.post(f"/app/api/deals/{d.id}/receipt", headers=as_(BUYER), data=form)
             seller = (await (await c.get(f"/app/api/deals/{d.id}", headers=as_(SELLER))).json())["deal"]
             assert {"confirm", "dispute", "receipt_view"} <= set(seller["actions"])
+            # participants see each other by role only: no names, @usernames or IDs
+            assert seller["people"] == [{"role": "Покупатель", "me": False}, {"role": "Мерчант", "me": True}]
+            assert "parties" not in seller and str(BUYER) not in str(seller["people"])
             no_proof = FormData()
             no_proof.add_field("reason", "not_received")
             assert (await c.post(f"/app/api/deals/{d.id}/dispute", headers=as_(SELLER), data=no_proof)).status == 422

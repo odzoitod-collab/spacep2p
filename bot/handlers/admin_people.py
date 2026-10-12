@@ -165,7 +165,7 @@ async def cb_operator_status(c: CallbackQuery, bot: Bot, s: AsyncSession, user: 
         from bot.handlers.orders import notify_operators
         for d in returned:
             if d.status == "checking":
-                await notify_operators(bot, s, d, await s.get(User, d.seller_id) if d.seller_id else None)
+                await notify_operators(bot, s, d)
         for d in closed:
             await push(bot, s, d.buyer_id, d, f"Сделка #{d.id} закрыта: оператор больше не работает. Не переводите "
                                               "по ней — уже перевели, загрузите чек")

@@ -12,7 +12,8 @@ const $nav = document.getElementById("nav");
 const $navIn = $nav.querySelector(".in") || $nav;
 const $toast = document.getElementById("toast");
 const $side = document.getElementById("side");
-const S = { me: null, seq: 0, timers: [], drafts: {}, stack: [], ava: null, sheet: null, keep: false, chatSeen: {}, tab: {}, reported: 0, viewer: null };
+const S = { me: null, seq: 0, timers: [], drafts: {}, stack: [], ava: null, sheet: null, keep: false, chatSeen: {}, tab: {}, reported: 0, viewer: null,
+  scrolls: {}, dir: null, restore: null, hero: false, tint: null, reveal: null, counted: false };
 const store = {
   get(k, d) { try { const v = localStorage.getItem("sp:" + k); return v == null ? d : v; } catch (e) { return d; } },
   set(k, v) { try { localStorage.setItem("sp:" + k, v); } catch (e) { /* storage off */ } },
@@ -26,11 +27,22 @@ function applyTheme() {
   const sys = (tg && tg.colorScheme) || (window.matchMedia && matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
   const dark = mode === "dark" || (mode === "auto" && sys === "dark");
   document.documentElement.dataset.theme = dark ? "dark" : "light";
-  const paper = dark ? "#0a1120" : "#f1f5fb";
+  const paper = dark ? "#06112a" : "#eef5ff";
   try {
-    if (tg && tg.setHeaderColor) { tg.setHeaderColor(paper); tg.setBackgroundColor(paper); }
-    if (tg && tg.isVersionAtLeast && tg.isVersionAtLeast("7.10")) tg.setBottomBarColor(dark ? "#0e1626" : "#ffffff");
+    if (tg && tg.setBackgroundColor) tg.setBackgroundColor(paper);
+    if (tg && tg.isVersionAtLeast && tg.isVersionAtLeast("7.10")) tg.setBottomBarColor(dark ? "#0a1630" : "#ffffff");
   } catch (e) { /* older clients */ }
+  S.tint = null;
+  tint();
+}
+/* Telegram's header takes the azure of the hero while the hero is on screen, the paper color below it */
+function tint() {
+  const dark = document.documentElement.dataset.theme === "dark";
+  const hero = S.hero && $app.querySelector(".hero");
+  const color = hero && window.scrollY < hero.offsetHeight - 24 ? (dark ? "#1592f0" : "#24adff") : (dark ? "#06112a" : "#eef5ff");
+  if (color === S.tint) return;
+  S.tint = color;
+  try { if (tg && tg.setHeaderColor) tg.setHeaderColor(color); } catch (e) { /* older clients */ }
 }
 function setTheme(mode) { store.set("theme", mode); applyTheme(); if (typeof MB !== "undefined") MB.show(); }
 
@@ -84,8 +96,8 @@ const MB = {
     try {
       if (S.sheet || S.viewer) { tg.MainButton.hide(); return; }
       const dark = document.documentElement.dataset.theme === "dark";
-      const color = MB.cfg.red ? (dark ? "#ff6b62" : "#d83b31") : (dark ? "#4b90ff" : "#1b6fe8");
-      tg.MainButton.setParams({ text: MB.cfg.text.slice(0, 60), color: MB.cfg.active ? color : (dark ? "#24324c" : "#c7d3e6"),
+      const color = MB.cfg.red ? (dark ? "#ff6b62" : "#d4342a") : (dark ? "#1f8cff" : "#0a6fe6");
+      tg.MainButton.setParams({ text: MB.cfg.text.slice(0, 60), color: MB.cfg.active ? color : (dark ? "#1c2e55" : "#c3d5ee"),
         text_color: "#ffffff", is_active: MB.cfg.active, is_visible: true, has_shine_effect: MB.cfg.shine && MB.cfg.active });
     } catch (e) { /* an old client */ }
   },
@@ -291,8 +303,8 @@ const P = {
   back: '<path d="M15 5.5 8.5 12l6.5 6.5"/>',
   orders: '<path d="M6 4.5h12a1 1 0 0 1 1 1V20l-3-2-3 2-3-2-3 2-2-1.3V5.5a1 1 0 0 1 1-1Z"/><path d="M9 9h6M9 12.5h6"/>',
 };
-/* the logo: the strait between two shores */
-const LOGO = '<svg viewBox="0 0 36 36" aria-hidden="true"><rect width="36" height="36" rx="11" fill="var(--accent)"/><path d="M7 14c3.5-3 7.5-3 11 0s7.5 3 11 0M7 22c3.5-3 7.5-3 11 0s7.5 3 11 0" fill="none" stroke="#fff" stroke-width="2.4" stroke-linecap="round"/></svg>';
+/* the logo: the S of two arrows, as on the banners */
+const LOGO = '<img src="/docs/static/logo.png" alt="">';
 /* the empty states: a small animated picture instead of a gray icon */
 const ART = {
   deals: '<path class="ring" d="M44 6a26 26 0 1 1-.1 0" fill="none" stroke="currentColor" stroke-opacity=".18" stroke-width="2" stroke-dasharray="4 6"/><g class="float"><rect x="26" y="18" width="36" height="28" rx="7" fill="var(--accent-soft)" stroke="currentColor" stroke-width="2"/><path d="M33 28h22M33 35h14" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/></g>',
@@ -300,7 +312,10 @@ const ART = {
   ok: '<path class="ring" d="M44 6a26 26 0 1 1-.1 0" fill="none" stroke="currentColor" stroke-opacity=".18" stroke-width="2" stroke-dasharray="4 6"/><g class="float"><circle cx="44" cy="32" r="15" fill="var(--accent-soft)" stroke="currentColor" stroke-width="2"/><path d="m37 32 5 5 9-10" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></g>',
 };
 const art = (name) => `<svg class="art" viewBox="0 0 88 64" aria-hidden="true">${ART[name] || ART.deals}</svg>`;
-const WAVES = '<svg class="waves" viewBox="0 0 400 70" preserveAspectRatio="none" aria-hidden="true"><path d="M0 40c50-22 100-22 150 0s100 22 150 0 70-18 100-6v36H0Z" fill="rgba(255,255,255,.22)"/><path d="M0 50c60-18 110-18 160 0s110 18 160 0 60-12 80-6v26H0Z" fill="rgba(255,255,255,.18)"/></svg>';
+/* the banner's light trail: a faint line and a bright comet running along it */
+const TRAIL_D = "M120 420C250 380 345 315 340 215S300 75 400 20";
+const TRAIL = `<svg class="trail" viewBox="0 0 390 420" preserveAspectRatio="xMaxYMin slice" fill="none" aria-hidden="true"><path d="${TRAIL_D}" stroke="rgba(255,255,255,.32)" stroke-width="1.5"/><path class="t" d="${TRAIL_D}" stroke="#fff" stroke-width="3" stroke-linecap="round"/></svg>`;
+const COINS = '<span class="chip3d" style="right:18px;top:calc(var(--safe-top) + 112px)">₮</span>';
 const LOADER = '<svg class="loader" viewBox="0 0 50 50" aria-hidden="true"><circle cx="25" cy="25" r="20" fill="none" stroke="currentColor" stroke-width="4"/></svg>';
 const ic = (name, cls) => `<svg${cls ? ` class="${cls}"` : ""} viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${P[name] || ""}</svg>`;
 const chev = () => ic("chev", "chev");
@@ -384,11 +399,15 @@ const tag = (text, tone, icon) => `<span class="tag ${tone || ""}">${icon ? ic(i
 const kv = (k, v) => `<div class="kv"><span>${k}</span><b>${v}</b></div>`;
 const titleBlock = (title, sub) => `<div class="title"><h1>${esc(title)}</h1>${sub ? `<p>${sub}</p>` : ""}</div>`;
 
+/* skeletons keep the shape of the screen: the hero is already azure, so the content only fades in over it */
+const hsk = (h, w, mt) => `<div class="sk glass-sk" style="height:${h}px;width:${w || "100%"};margin-top:${mt || 0}px"></div>`;
+const heroSk = (inner, deck) => `<section class="hero">${TRAIL}${inner}</section><div class="deck">${deck}</div>`;
 const SK = {
-  home: () => `<div class="sk" style="height:44px;width:58%;margin:6px 0 12px"></div><div class="sk" style="height:132px"></div><div class="sk" style="height:62px;margin-top:10px"></div>${SK.rows(3)}`,
-  rows: (k = 4) => `<div class="sk" style="height:14px;width:34%;margin:22px 2px 10px"></div>${Array.from({ length: k }, () => `<div class="sk" style="height:56px;margin-top:6px"></div>`).join("")}`,
+  home: () => heroSk(`${hsk(42, "56%", 0)}${hsk(16, "28%", 22)}${hsk(44, "64%", 8)}${hsk(78, "100%", 24)}`, `<div class="sk" style="height:68px"></div>${SK.rows(3)}`),
+  admin: () => heroSk(`${hsk(24, "48%", 46)}${hsk(48, "100%", 16)}${hsk(66, "100%", 12)}`, SK.rows(3)),
+  rows: (k = 4) => `<div class="sk" style="height:18px;width:40%;margin:22px 2px 10px"></div>${Array.from({ length: k }, () => `<div class="sk" style="height:62px;margin-top:6px"></div>`).join("")}`,
   page: () => `<div class="sk" style="height:28px;width:46%;margin:8px 0 14px"></div><div class="sk" style="height:120px"></div>${SK.rows(3)}`,
-  deal: () => `<div class="sk" style="height:24px;width:40%;margin:8px 0 14px"></div><div class="sk" style="height:38px;width:62%"></div><div class="sk" style="height:6px;margin:16px 0"></div><div class="sk" style="height:150px"></div><div class="sk" style="height:44px;margin-top:12px"></div>`,
+  deal: () => heroSk(`${hsk(26, "44%", 46)}${hsk(44, "62%", 14)}${hsk(16, "54%", 8)}${hsk(5, "100%", 18)}`, `<div class="sk" style="height:180px"></div><div class="sk" style="height:56px;margin-top:12px"></div>`),
 };
 
 function topBar(p) {
@@ -397,11 +416,33 @@ function topBar(p) {
   return `<div class="top">${root ? "" : `<button class="ibtn" data-back aria-label="Назад">${ic("back")}</button><button class="ibtn" data-go="" aria-label="Главная">${ic("home2")}</button>`}<span class="sp"></span>${fsBtn()}</div>`;
 }
 
+/* opts.hero: the screen's azure top (with the page's own bar in it); html then goes on the white deck under it.
+   A fresh screen fades in over its skeleton and its cards rise; a background refresh (S.keep) does not move. */
 function view(c, html, opts = {}) {
   if (!c.alive()) return false;
-  $app.innerHTML = `<div class="screen">${topBar(path())}${html}</div>`;
-  if (!opts.keepScroll) window.scrollTo(0, 0);
+  const anim = S.keep ? "" : "swap lift";
+  const bar = topBar(path());
+  $app.innerHTML = opts.hero != null
+    ? `<div class="screen ${anim}"><section class="hero">${TRAIL}${opts.coins ? COINS : ""}${bar}${opts.hero}</section><div class="deck">${html}</div></div>`
+    : `<div class="screen ${anim}">${bar}${html}</div>`;
+  S.hero = opts.hero != null;
+  if (S.restore != null && !S.keep) { window.scrollTo(0, S.restore); S.restore = null; }
+  else if (!opts.keepScroll) window.scrollTo(0, 0);
+  tint();
   return true;
+}
+
+/* a number that counts up to its value once — the balance on the first look */
+function countUp(el, to, fmt) {
+  if (!el || matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+  const t0 = performance.now(), dur = 750;
+  const step = (t) => {
+    const k = Math.min(1, (t - t0) / dur);
+    if (!el.isConnected) return;
+    el.firstChild.textContent = fmt(to * (1 - Math.pow(1 - k, 3)));
+    if (k < 1) requestAnimationFrame(step);
+  };
+  requestAnimationFrame(step);
 }
 
 function on(sel, fn, root) {
@@ -480,40 +521,41 @@ async function home(c) {
   ].join("");
   const line = r.merchant === "approved" ? `<div class="line"><span class="dot ${w.line ? "on" : ""}"></span><div class="mid"><b>${w.line ? "На линии" : "Не на линии"}</b><small>${w.line ? "Заявки покупателей приходят вам" : "Заявки не приходят — включите, когда готовы"}</small></div><button class="sw green ${w.line ? "on" : ""}" id="line" aria-label="На линии"></button></div>`
     : r.seller ? `<div class="line"><span class="dot ${m.user.online ? "on" : ""}"></span><div class="mid"><b>${m.user.online ? "На смене" : "Не на смене"}</b><small>${m.user.online ? `Карт в потоке: ${w.cards_on || 0}` : "Покупатели не видят ваши карты"}</small></div><button class="sw green ${m.user.online ? "on" : ""}" id="shift" aria-label="Смена"></button></div>` : "";
-  const left = `
-    <section class="balance">${WAVES}
-      <div class="lbl"><span>Баланс</span><span class="num">1 USDT = ${NF.format(n(m.rate.rate))} ₽</span></div>
-      <div class="sum">${usdt(b.available)}<small>USDT</small></div>
-      <div class="sub">≈ ${rub(n(b.available) * n(m.rate.rate))}${m.rate.own ? " · ваши условия" : ""}</div>
-      ${n(b.frozen) || locked || b.debt || n(b.team) ? `<div class="facts">
-        ${n(b.frozen) ? tag(`В сделках ${usdt(b.frozen)}`, "", "lock") : ""}
-        ${locked ? tag(`Можно вывести ${usdt(b.withdrawable)}`) : ""}
-        ${b.debt ? tag(`Долг оператора ${usdt(b.debt)}`) : ""}
-        ${n(b.team) ? tag(`Командный ${usdt(b.team)}`) : ""}</div>` : ""}
-    </section>
-    <div class="quick">
-      <button data-go="deposit"><span>${ic("down")}</span>Пополнить</button>
-      <button data-go="withdraw"><span>${ic("up")}</span>Вывести</button>
-      <button data-go="buy"><span>${ic("swap")}</span>Купить</button>
-      <button data-go="${r.merchant === "approved" ? "orders" : "sell"}"><span>${ic(r.merchant === "approved" ? "orders" : "card")}</span>${r.merchant === "approved" ? "Заявки" : "Продать"}</button>
-    </div>
-    ${line}
-    ${work ? `${sec("Работа")}<div class="list">${work}</div>` : ""}`;
-  const right = `
-    ${action.length ? `${sec("Нужно ваше действие")}<div class="list">${action.map((d) => dealRow(d, true)).join("")}</div>` : ""}
-    ${sec("Активные сделки", list.deals.length ? `<button data-go="deals">Все</button>` : "")}
-    <div class="list">${rest.length ? rest.map(dealRow).join("") : action.length ? empty("check", "Остальные сделки закрыты") :
-      empty("swap", "Открытых сделок нет", `<button class="btn sm" data-go="buy" style="margin:12px auto 0">${ic("swap")}Купить USDT</button>`)}</div>
-    ${sec("История", hist.items.length ? `<button data-go="history">Вся история</button>` : "")}
-    <div class="list">${hist.items.length ? hist.items.slice(0, 6).map(historyRow).join("") : empty("clock", "Операций пока нет")}</div>`;
-  if (!view(c, `
+  const hero = `
     <div class="bar">
       <button class="who" data-go="profile">${avatar()}<div><b>${esc(u.first_name || m.user.name || "Профиль")}</b><small>${m.user.username ? "@" + esc(m.user.username) : "ID " + m.user.id}</small></div></button>
       ${m.links.manager ? `<button class="ibtn" data-open="${esc(m.links.manager)}" aria-label="Менеджер">${ic("headset")}</button>` : ""}
       ${fsBtn()}
     </div>
+    <div class="lbl"><span>Баланс</span><span class="num">1 USDT = ${NF.format(n(m.rate.rate))} ₽</span></div>
+    <div class="sum" id="sum">${usdt(b.available)}<small>USDT</small></div>
+    <div class="sub">≈ ${rub(n(b.available) * n(m.rate.rate))}${m.rate.own ? " · ваши условия" : ""}</div>
+    ${n(b.frozen) || locked || b.debt || n(b.team) ? `<div class="facts">
+      ${n(b.frozen) ? tag(`В сделках ${usdt(b.frozen)}`, "", "lock") : ""}
+      ${locked ? tag(`Можно вывести ${usdt(b.withdrawable)}`) : ""}
+      ${b.debt ? tag(`Долг оператора ${usdt(b.debt)}`) : ""}
+      ${n(b.team) ? tag(`Командный ${usdt(b.team)}`) : ""}</div>` : ""}
+    <div class="quick">
+      <button data-go="deposit"><span>${ic("down")}</span>Пополнить</button>
+      <button data-go="withdraw"><span>${ic("up")}</span>Вывести</button>
+      <button data-go="buy"><span>${ic("swap")}</span>Купить</button>
+      <button data-go="${r.merchant === "approved" ? "orders" : "sell"}"><span>${ic(r.merchant === "approved" ? "orders" : "card")}</span>${r.merchant === "approved" ? "Заявки" : "Продать"}</button>
+    </div>`;
+  const left = `
+    ${line}
+    ${work ? `${sec("Работа")}<div class="list">${work}</div>` : ""}
+    ${action.length ? `${sec("Нужно ваше действие")}<div class="list">${action.map((d) => dealRow(d, true)).join("")}</div>` : ""}
+    ${sec("Активные сделки", list.deals.length ? `<button data-go="deals">Все · ${list.deals.length}</button>` : "")}
+    <div class="list">${rest.length ? rest.map(dealRow).join("") : action.length ? empty("check", "Остальные сделки закрыты") :
+      empty("swap", "Открытых сделок нет", `<button class="btn sm" data-go="buy" style="margin:12px auto 0">${ic("swap")}Купить USDT</button>`)}</div>`;
+  const right = `
+    ${sec("История", hist.items.length ? `<button data-go="history">Вся история</button>` : "")}
+    <div class="list">${hist.items.length ? hist.items.slice(0, 6).map(historyRow).join("") : empty("clock", "Операций пока нет")}</div>`;
+  const first = !S.counted && !S.keep;
+  if (!view(c, `
     <div class="grid2"><div class="col">${left}</div><div class="col">${right}</div></div>
-    <div class="foot">Strait Pay · P2P-обмен USDT ⇄ RUB</div>`)) return;
+    <div class="foot">Strait Pay · P2P-обмен USDT ⇄ RUB</div>`, { hero, coins: true })) return;
+  if (first) { S.counted = true; countUp($app.querySelector("#sum"), n(b.available), usdt); }
   setBadge(m.counts.action);
   drawNav(path());
   on("#line", (sw) => busy(sw, async () => { try { await api("merchant", { body: { online: !w.line } }); haptic("success"); toast(w.line ? "Вы не на линии — заявки не приходят" : "Вы на линии — заявки приходят"); S.keep = true; render(); } catch (e) { toast(e.message, true); } }));
@@ -690,17 +732,25 @@ async function dealScreen(c, id, tab, offer) {
   const timer = d.expires_at && ["waiting_payment", "searching", "assigned", "checking"].includes(d.status);
   const what = d.status === "waiting_payment" ? (d.role === "buyer" ? "Оплатите за" : "Покупатель оплачивает") :
     d.status === "searching" ? "Поиск реквизитов" : d.status === "assigned" ? (d.role === "seller" ? "Ответьте за" : "Мерчант готовит реквизиты") : "Проверка ордера";
-  const html = `
+  const hero = `
     <div class="deal-head"><h1>${label} #${d.id}${d.bybit ? " · Bybit" : ""}</h1>${tag(d.status_text, TONE[d.status])}</div>
     <div class="amount"><div class="rub">${rub(d.amount_rub)}</div><div class="to">${amountLine(d)}</div></div>
     ${straitBar(d)}
     ${d.status === "completed" ? `<div class="done-mark"><svg viewBox="0 0 36 36" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><circle class="c" cx="18" cy="18" r="16"/><path class="k" d="m11 18.5 5 5 9-10"/></svg>Сделка завершена</div>` : ""}
     ${timer ? `<div class="timer-line" id="tl"><span>${what}</span><b id="timer">${mmss(left(d.expires_at))}</b></div>` : ""}
-    ${d.held && d.role !== "buyer" ? `<p class="hint">${ic("lock").replace("<svg", '<svg style="width:13px;height:13px;vertical-align:-2px"')} Срока нет: сделку ведёт и закрывает оператор.</p>` : ""}
-    ${chat ? `<button class="chat-open" data-go="deal/${d.id}/chat">${ic("chat")}<span class="sp">Чат сделки<small id="chatline">Покупатель, продавец${d.bybit ? ", оператор" : ""} и администрация</small></span><span class="badge" id="unread" hidden></span>${chev()}</button>` : ""}
+    ${d.held && d.role !== "buyer" ? `<p class="hint">${ic("lock").replace("<svg", '<svg style="width:13px;height:13px;vertical-align:-2px"')} Срока нет: сделку ведёт и закрывает оператор.</p>` : ""}`;
+  const html = `
+    ${peopleCard(d)}
+    ${chat ? `<button class="chat-open" data-go="deal/${d.id}/chat">${ic("chat")}<span class="sp">Чат сделки<small id="chatline">Покупатель, мерчант${d.bybit ? ", оператор" : ""} и администрация</small></span><span class="badge" id="unread" hidden></span>${chev()}</button>` : ""}
     <div id="pane">${dealPane(d)}</div>
     ${dealActions(d)}`;
-  if (!view(c, html, { keepScroll: S.keep })) return;
+  if (!view(c, html, { keepScroll: S.keep, hero })) return;
+  on("[data-reveal]", (b) => {
+    const open = S.reveal !== d.id;
+    S.reveal = open ? d.id : null;
+    b.textContent = open ? "Скрыть данные" : "Показать данные";
+    $app.querySelectorAll(".people .who-data, .people [data-card]").forEach((x) => { x.hidden = !open; });
+  });
   if (timer) every(1000, () => { const t = $app.querySelector("#timer"); if (!t) return; const sLeft = left(d.expires_at); t.textContent = mmss(sLeft); $app.querySelector("#tl").classList.toggle("low", sLeft < 180); });
   bindDeal(c, d, offer);
   MB.take($app.querySelector(".dock > .btn"), { shine: true });
@@ -740,6 +790,24 @@ async function chatUnread(c, d) {
   every(6000, async () => { try { const r = await api(`deals/${d.id}/chat?after=${last}`); if (r.messages.length) { data.messages.push(...r.messages); last = r.messages[r.messages.length - 1].id; await refreshUnread(); show(); } } catch (e) { /* retry */ } });
 }
 
+/* who takes part, by role only (М · П · О). Participants never see names, @usernames or IDs; the admin gets them
+   behind «Показать данные» (d.parties is sent to admins only). */
+const ROLE_AVA = { "Покупатель": "p", "Мерчант": "m", "Оператор": "o" };
+const ROLE_ABOUT = { "Покупатель": "покупает USDT", "Мерчант": "продаёт USDT", "Оператор": "ведёт Bybit-ордер" };
+function peopleCard(d) {
+  const ava = (role) => `<span class="role-ava ${ROLE_AVA[role] || "m"}" aria-hidden="true">${esc(role[0])}</span>`;
+  const about = (role) => (role === "Покупатель" && d.paid_at ? `чек прикреплён ${when(d.paid_at)}` : ROLE_ABOUT[role] || "");
+  if (d.parties) {
+    const open = S.reveal === d.id;
+    return `${sec("Участники", `<button data-reveal>${open ? "Скрыть данные" : "Показать данные"}</button>`)}<div class="list people">${d.parties.map((p) => `<div class="row">${ava(p.role)}
+      <span class="mid"><b>${esc(p.role)}</b><small>${about(p.role)}</small><span class="who-data" ${open ? "" : "hidden"}>${esc(p.name || "—")}${p.username ? " · @" + esc(p.username) : ""} · ID ${p.id}</span></span>
+      <button class="btn sm soft" data-card data-go="admin/user/${p.id}" ${open ? "" : "hidden"}>Карточка</button></div>`).join("")}</div>`;
+  }
+  if (!d.people || !d.people.length) return "";
+  return `${sec("Участники", `<span class="people-note">${ic("lock")}Ники и ID скрыты</span>`)}<div class="list people">${d.people.map((p) => `<div class="row">${ava(p.role)}
+    <span class="mid"><b>${esc(p.role)}${p.me ? ' <span style="color:var(--muted);font-weight:600">· вы</span>' : ""}</b><small>${about(p.role)}</small></span></div>`).join("")}</div>`;
+}
+
 function dealPane(d) {
   const parts = [];
   if (d.requisites) parts.push(requisites(d));
@@ -757,7 +825,6 @@ function dealPane(d) {
       ${kv("Доказательств", `${d.dispute.files}${d.actions.includes("evidence") ? ` · ваших ${d.dispute.mine} из ${d.dispute.max}` : ""}`)}
       ${d.resolution ? `<p class="hint" style="margin-top:8px">Решение: ${esc(d.resolution)}</p>` : ""}</div>`);
   else if (d.resolution) parts.push(`<div class="box pad" style="margin-top:12px"><p class="hint" style="margin:0">Решение: ${esc(d.resolution)}</p></div>`);
-  if (d.parties) parts.push(`${sec("Участники")}<div class="list">${d.parties.map((p) => `<div class="row"><span class="ic">${ic("user")}</span><span class="mid"><b>${esc(p.name || "—")}</b><small>${esc(p.role)} · ${p.username ? "@" + esc(p.username) + " · " : ""}ID ${p.id}</small></span><button class="link-btn" data-copy="${p.id}" data-what="ID">ID</button></div>`).join("")}</div>`);
   if (d.files && d.files.length) parts.push(`${sec("Материалы")}<div class="list">${d.files.map((f) => `<button class="row" data-file="${f.n}" data-kind="${f.kind}"><span class="ic">${ic({ photo: "image", video: "video", document: "file", text: "chat" }[f.kind] || "file")}</span><span class="mid"><b>${esc(f.title)}</b><small>${f.kind === "text" ? esc(f.text) : "посмотреть"}</small></span>${chev()}</button>`).join("")}</div>`);
   parts.push(`${sec("Детали")}<div class="box pad">
       ${kv("Курс", `<span class="num">${NF.format(n(d.rate))} ₽</span>`)}
@@ -1360,7 +1427,7 @@ async function teamScreen(c) {
   }
   const share = `https://t.me/share/url?url=${encodeURIComponent(t.link)}&text=${encodeURIComponent("Работаю в Strait Pay — заходи в мою команду")}`;
   if (!view(c, `${titleBlock(`Команда «${t.name}»`, t.status === "approved" ? `Вы тимлид · ${esc(t.pct)}% от сделок участников` : "Команда приостановлена администрацией")}
-    <section class="balance" style="margin-top:12px">${WAVES}
+    <section class="balance" style="margin-top:12px">${TRAIL}
       <div class="lbl"><span>Командный баланс</span><span>${t.members} в команде</span></div>
       <div class="sum">${usdt(t.balance)}<small>USDT</small></div>
       <div class="sub">Сегодня +${usdt(st("today").income)} · 7 дней +${usdt(st("week").income)} USDT</div>
@@ -1534,23 +1601,38 @@ async function operatorScreen(c) {
 async function adminScreen(c) {
   const [a, m] = await Promise.all([api("admin"), me()]);
   const k = a.counts, mo = a.money;
-  const tile = (go, label, value, alert, sub) => `<button class="tile ${alert ? "alert" : ""}" ${go ? `data-go="${go}"` : ""}><small>${label}</small><b>${value}</b>${sub ? `<em>${sub}</em>` : ""}</button>`;
-  const hub = (go, icon, tone, title, sub, badge) => `<button class="row" data-go="${go}"><span class="ic ${tone}">${ic(icon)}</span><span class="mid"><b>${title}</b><small>${sub}</small></span>${badge ? `<span class="badge">${badge}</span>` : ""}${chev()}</button>`;
-  if (!view(c, `${titleBlock("Администрирование", `24 часа: ${a.day.deals} сделок · ${rub(a.day.rub)} · +${usdt(a.day.income)} USDT`)}
-    <div class="tiles four" style="margin-top:10px">
-      ${tile("admin/deals?dispute", "Споры", k.disputes, k.disputes)}
-      ${tile("admin/deals?paid", "Ждут подтверждения", k.slow, k.slow, "дольше срока")}
-      ${tile("admin/deals?open", "Открытых сделок", k.open, false, `ищут реквизиты: ${k.searching}`)}
-      ${tile("admin/desk", "Выводы", k.unknown_wd || k.queued_wd, k.unknown_wd, k.unknown_wd ? "на проверке" : "в очереди")}
-    </div>
+  const kpi = (go, label, value, hot) => `<button class="glass ${hot ? "hot" : ""}" data-go="${go}"><b>${value}</b><small>${label}</small></button>`;
+  const hub = (go, icon, title, badge) => `<button data-go="${go}"><span>${ic(icon)}</span>${title}${badge ? `<i class="badge">${badge}</i>` : ""}</button>`;
+  /* everything that waits for an admin, one list, the buttons right in the row */
+  const item = (tone, icon, title, sub, act) => `<div class="item"><div class="head"><span class="ic ${tone}">${ic(icon)}</span><span class="mid"><b>${title}</b><small>${sub}</small></span>${act || ""}</div></div>`;
+  const open = (go, text) => `<button class="btn sm" data-go="${go}">${text}</button>`;
+  const queue = [
+    ...a.disputes.map((d) => item("red", "scale", `#${d.id} · ${rub(d.amount_rub)}`, `Спор · ${when(d.created_at)}`, open(`deal/${d.id}`, "Разобрать"))),
+    ...a.slow.map((d) => item("amber", "clock", `#${d.id} · ${rub(d.amount_rub)}`, `Мерчант молчит · ${when(d.created_at)}`, open(`deal/${d.id}`, "Открыть"))),
+    ...a.withdrawals.map((w) => `<div class="item"><div class="head"><span class="ic amber">${ic("up")}</span><span class="mid"><b class="num">Вывод #${w.id} · ${usdt(w.amount)} USDT</b><small class="mono">${esc((w.address || "").slice(0, 8))}…${esc((w.address || "").slice(-6))} · ID ${w.user_id}</small></span></div>
+      <div class="btns"><button class="btn sm soft" data-wd="${w.id}" data-act="done">Выполнен</button><button class="btn sm line red" data-wd="${w.id}" data-act="refund">Вернуть</button></div></div>`),
+    k.signups ? item("violet", "user", `Заявки на вход · ${k.signups}`, "Ждут решения", open("admin/signups", "Открыть")) : "",
+  ].filter(Boolean);
+  const hero = `
+    <div class="h-title">Админ-панель</div>
+    <div class="h-sub">24 ч · ${a.day.deals} сделок · ${rub(a.day.rub)} · +${usdt(a.day.income)} USDT</div>
+    <form class="search glass" id="asearch"><span>${ic("search")}</span><input id="aq" type="search" enterkeyhint="search" autocomplete="off" placeholder="Сделка, ID или @ник" aria-label="Поиск: номер сделки, ID или @юзернейм"></form>
+    <div class="kpis">
+      ${kpi("admin/deals?dispute", "Споры", k.disputes, k.disputes)}
+      ${kpi("admin/deals?paid", "Чек ждёт", k.slow, k.slow)}
+      ${kpi("admin/deals?open", "Открыто", k.open, false)}
+      ${kpi("admin/desk", "Выводы", k.unknown_wd || k.queued_wd, k.unknown_wd)}
+    </div>`;
+  if (!view(c, `
     <div class="grid2"><div class="col">
-      ${sec("Разделы")}<div class="list">
-        ${hub("admin/users", "people", "accent", "Пользователи", "Поиск, баланс, бан, рейтинг мерчанта")}
-        ${hub("admin/signups", "user", "amber", "Заявки на вход", k.signups ? "Ждут решения" : "Новых нет", k.signups)}
-        ${hub("admin/desk", "wallet", "accent", "Касса BEP-20", mo.hot && !mo.hot.error ? `${usdt(mo.hot.usdt)} USDT · ${mo.hot.bnb} BNB` : "Балансы, очередь выводов")}
-        ${hub("admin/finance", "chart", "green", "Финансы", "Что есть, что должны, сколько можно забрать")}
-        ${hub("admin/deals?all", "search", "", "Все сделки", "Поиск по номеру или ID")}
+      ${sec("Требует действия", queue.length ? `<span class="people-note">${queue.length}</span>` : "")}
+      ${queue.length ? `<div class="inbox">${queue.join("")}</div>${a.withdrawals.length ? `<p class="hint">Старые сети (TON / xRocket): проверьте перевод в обозревателе. Решают владельцы.</p>` : ""}`
+        : `<div class="list">${empty("check", "Всё обработано — споров и проверок нет")}</div>`}
+      ${sec("Разделы")}<div class="hub">
+        ${hub("admin/users", "people", "Люди")}${hub("admin/deals?all", "deals", "Сделки")}
+        ${hub("admin/desk", "wallet", "Касса", k.queued_wd)}${hub("admin/finance", "chart", "Финансы")}
       </div>
+    </div><div class="col">
       ${sec("Деньги")}<div class="box pad">
         ${kv("Балансы пользователей", `<span class="num">${usdt(mo.users)} USDT</span>`)}
         ${mo.hot ? (mo.hot.error ? kv("Касса BEP-20", "нет ответа сети") : kv("Касса BEP-20", `<span class="num">${usdt(mo.hot.usdt)} USDT · <span class="${mo.hot.low ? "minus" : ""}">${mo.hot.bnb} BNB</span></span>`)) : kv("Касса BEP-20", "выключена")}
@@ -1559,20 +1641,21 @@ async function adminScreen(c) {
       </div>
       ${k.tickets || k.merchants || k.adjustments ? `${sec("Ещё в боте")}<div class="box pad">
         ${k.merchants ? kv("Анкет мерчантов", k.merchants) : ""}${k.tickets ? kv("Обращений", k.tickets) : ""}${k.adjustments ? kv("Корректировок ждут подтверждения", k.adjustments) : ""}</div>` : ""}
-    </div><div class="col">
-      ${a.disputes.length ? `${sec("Споры")}<div class="list">${a.disputes.map(dealRow).join("")}</div>` : ""}
-      ${a.slow.length ? `${sec("Продавец молчит")}<div class="list">${a.slow.map(dealRow).join("")}</div>` : ""}
-      ${a.withdrawals.length ? `${sec("Выводы на проверке")}<div class="list">${a.withdrawals.map((w) => `<div class="row"><span class="ic red">${ic("up")}</span><span class="mid"><b class="num">#${w.id} · ${usdt(w.amount)} USDT</b><small class="mono">${esc((w.address || "").slice(0, 8))}…${esc((w.address || "").slice(-6))} · ID ${w.user_id}</small></span>
-        <button class="btn sm soft" data-wd="${w.id}" data-act="done">Выполнен</button><button class="btn sm line red" data-wd="${w.id}" data-act="refund" style="margin-left:6px">Вернуть</button></div>`).join("")}</div><p class="hint">Старые сети (TON / xRocket): проверьте перевод в обозревателе. Решают владельцы.</p>` : ""}
-      ${!a.disputes.length && !a.slow.length && !a.withdrawals.length ? `${sec("Очереди")}<div class="list">${empty("check", "Всё обработано — споров и проверок нет")}</div>` : ""}
-    </div></div>`)) return;
+    </div></div>`, { hero })) return;
+  const form = $app.querySelector("#asearch");
+  form.onsubmit = (e) => {  // a number — the deals (a deal number or a user's ID), a name or @username — the people
+    e.preventDefault();
+    const q = form.querySelector("#aq").value.trim();
+    if (!q) return;
+    if (/^\d+$/.test(q)) { S.adminQ = q; go("admin/deals?all"); } else { S.userQ = q; go("admin/users"); }
+  };
   on("[data-wd]", async (b) => {
     const refund = b.dataset.act === "refund";
     if (!(await confirmBox(refund ? `Вернуть средства по выводу #${b.dataset.wd}? Только если перевод точно не ушёл.` : `Подтвердить выполнение вывода #${b.dataset.wd}? Только если нашли перевод в сети.`))) return;
     busy(b, async () => { try { const r = await api(`admin/withdrawals/${b.dataset.wd}`, { body: { action: b.dataset.act } }); toast(r.message); S.keep = true; render(); } catch (e) { toast(e.message, true); } });
   });
   if (m) drawNav(path());
-  every(10000, async () => { try { const f = await api("admin"); if (c.alive() && JSON.stringify([f.counts, f.disputes.map((x) => x.id)]) !== JSON.stringify([a.counts, a.disputes.map((x) => x.id)])) { S.keep = true; render(); } } catch (e) { /* retry */ } });
+  every(10000, async () => { try { const f = await api("admin"); if (c.alive() && document.activeElement !== form.querySelector("#aq") && JSON.stringify([f.counts, f.disputes.map((x) => x.id)]) !== JSON.stringify([a.counts, a.disputes.map((x) => x.id)])) { S.keep = true; render(); } } catch (e) { /* retry */ } });
 }
 
 const stars = (v) => { const k = Math.round(n(v) / 2); return `<span class="stars">${"★".repeat(k)}${"☆".repeat(5 - k)}</span>`; };
@@ -1635,7 +1718,7 @@ async function adminDesk(c) {
   const d = await api("admin/desk");
   if (!d.on) { view(c, `${titleBlock("Касса BEP-20")}<div class="box pad" style="margin-top:10px"><p style="margin:0">Касса выключена: ${esc(d.error)}</p></div>`); return; }
   if (!view(c, `${titleBlock("Касса USDT · BEP-20", "Горячий кошелёк платит выводы и газ")}
-    <section class="balance" style="margin-top:12px">${WAVES}
+    <section class="balance" style="margin-top:12px">${TRAIL}
       <div class="lbl"><span>Свободно на горячем</span><span>${d.pending ? `в сети ${d.pending}` : ""}</span></div>
       <div class="sum">${d.chain_error ? "—" : usdt(d.usdt)}<small>USDT</small></div>
       <div class="sub">${d.chain_error ? "Сеть не ответила" : `Касса всего ${usdt(d.total)} USDT · газ ${d.bnb} BNB${d.low ? " — мало" : ""}`}</div>
@@ -1815,7 +1898,7 @@ const ROUTES = [
   [/^deposit$/, depositScreen, "page"], [/^withdraw$/, withdrawScreen, "page"], [/^history$/, historyScreen, "page"],
   [/^work$/, workScreen, "page"], [/^cards$/, cardsScreen, "page"], [/^card\/new$/, cardNew, "page"], [/^card\/(\d+)$/, cardScreen, "page"],
   [/^orders$/, ordersScreen, "page"], [/^operator$/, operatorScreen, "page"], [/^team$/, teamScreen, "page"],
-  [/^admin$/, adminScreen, "page"], [/^admin\/deals(?:\?(\w+))?$/, adminDeals, "page"],
+  [/^admin$/, adminScreen, "admin"], [/^admin\/deals(?:\?(\w+))?$/, adminDeals, "page"],
   [/^admin\/users$/, adminUsers, "page"], [/^admin\/user\/(\d+)$/, adminUser, "page"], [/^admin\/desk$/, adminDesk, "page"],
   [/^admin\/finance$/, adminFinance, "page"], [/^admin\/signups$/, adminSignups, "page"],
   [/^profile$/, profile, "page"], [/^stats$/, statsScreen, "page"], [/^guides$/, guidesScreen, "page"], [/^guide\/([a-z]+)$/, guideScreen, "page"],
@@ -1855,13 +1938,16 @@ function parent(p) {
 
 const path = () => (location.hash.startsWith("#/") ? decodeURIComponent(location.hash.slice(2)) : "");
 
+/* the next screen slides in the direction of the move; «back» returns to where the previous page was scrolled */
 function go(p, opts = {}) {
   const cur = path();
+  S.scrolls[cur] = window.scrollY;
   if (!opts.replace && cur !== p) {
     if (isRoot(p)) S.stack = [];
     else S.stack.push(cur);
     if (S.stack.length > 30) S.stack.shift();
   }
+  S.dir = opts.replace || isRoot(p) ? "tab" : "fwd";
   history.replaceState(null, "", location.pathname + location.search + "#/" + p);
   render();
 }
@@ -1872,6 +1958,8 @@ function back() {
   const p = path();
   let prev = S.stack.length ? S.stack.pop() : parent(p);
   if (prev === p) prev = parent(p);
+  S.dir = "back";
+  S.restore = S.scrolls[prev] || null;
   history.replaceState(null, "", location.pathname + location.search + "#/" + prev);
   render();
 }
@@ -1895,9 +1983,18 @@ function setBadge(count) {
 function drawNav(p) {
   const tab = TAB_OF(p);
   const k = counts();
-  $navIn.innerHTML = tabs().map(([t, label, icon]) => `<button data-tab="${t}" class="${t === tab ? "on" : ""}"><span class="pill">${ic(icon)}</span>${label}${k[t] ? `<span class="badge">${k[t]}</span>` : `<span class="badge" hidden></span>`}</button>`).join("");
+  const list = tabs(), keys = list.map(([t]) => t).join("|");
+  if ($navIn.dataset.keys !== keys) {  // built once: later only the classes change, so the pill glides between tabs
+    $navIn.dataset.keys = keys;
+    $navIn.innerHTML = list.map(([t, label, icon]) => `<button data-tab="${t}"><span class="pill">${ic(icon)}</span>${label}<span class="badge" hidden></span></button>`).join("");
+  }
   $nav.hidden = false;
-  $navIn.querySelectorAll("[data-tab]").forEach((b) => { b.onclick = () => { haptic("select"); if (b.dataset.tab === tab && isRoot(p)) { window.scrollTo({ top: 0, behavior: "smooth" }); return; } go(b.dataset.tab); }; });
+  $navIn.querySelectorAll("[data-tab]").forEach((b) => {
+    const t = b.dataset.tab, badge = b.querySelector(".badge");
+    b.classList.toggle("on", t === tab);
+    badge.textContent = k[t] || ""; badge.hidden = !k[t];
+    b.onclick = () => { haptic("select"); if (t === tab && isRoot(p)) { window.scrollTo({ top: 0, behavior: "smooth" }); return; } go(t); };
+  });
   drawSide(p);
   syncBack();
 }
@@ -1933,7 +2030,12 @@ async function render() {
   document.body.classList.toggle("no-nav", route[2] === "chat");
   drawNav(p);
   const c = { t, alive: () => t === S.seq && path() === p };
-  if (!S.keep && route[2] !== "chat") { $app.innerHTML = `<div class="screen">${SK[route[2]]()}</div>`; window.scrollTo(0, 0); }
+  if (!S.keep) {
+    S.hero = /^(home|deal|admin)$/.test(route[2]);
+    if (route[2] !== "chat") { $app.innerHTML = `<div class="screen ${S.dir || "tab"}">${SK[route[2]]()}</div>`; window.scrollTo(0, 0); }
+    tint();
+  }
+  S.dir = null;
   try { await route[1](c, ...p.match(route[0]).slice(1)); }
   catch (e) { if (c.alive()) failView(c, e); }
   finally { if (t === S.seq) S.keep = false; }
@@ -1973,6 +2075,7 @@ function netBanner() {
 window.addEventListener("offline", netBanner);
 window.addEventListener("online", () => { netBanner(); toast("Связь восстановлена"); if (!S.sheet && !S.viewer) { S.keep = true; render(); } });
 window.addEventListener("resize", syncHeight);
+window.addEventListener("scroll", () => { if (S.hero) tint(); }, { passive: true });
 
 (function start() {
   applyTheme();

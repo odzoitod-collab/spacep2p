@@ -333,6 +333,7 @@ def test_bybit_order_flow_without_balance(go):
         for part in ("Сумма ордера: 52 000 ₽", "Курс мерчанта: 104 ₽", "Зайти на: 500 USDT"):
             assert part in plain(to_op)
         assert LINK not in to_op  # the link only goes to the operator who accepts the order
+        assert str(M1) not in to_op and "Мерчант:" not in plain(to_op)  # the merchant is a role, never a name or ID
         assert f"opq:go:{d.id}" in b.session.buttons(OP) and f"opq:go:{d.id}" in b.session.buttons(OP2)
 
         await b.run(cb(OP, f"opq:go:{d.id}"))

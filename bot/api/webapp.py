@@ -378,6 +378,10 @@ def deal_json(d: Deal, card: Card | None, uid: int, full: bool = True, who: dict
         "resolution": d.resolution,
         "merchant_rate": num(d.merchant_rate) if role in ("seller", "operator", "admin") else None,
         "seller_debit": num(d.seller_debit) if role in ("seller", "operator", "admin") else None,
+        # who takes part — roles only: participants never see each other's names, @usernames or IDs
+        "people": [{"role": r, "me": pid == uid} for r, pid in (
+            ("Покупатель", d.buyer_id), ("Мерчант", d.seller_id), ("Оператор", d.operator_id if d.via_bybit else None))
+            if pid],
     })
     if d.dispute_reason:
         from bot.handlers.deal import REASONS

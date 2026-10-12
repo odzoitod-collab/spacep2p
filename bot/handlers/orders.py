@@ -575,20 +575,19 @@ async def send_link(bot: Bot, s: AsyncSession, user: User, did: int, url: str) -
             kb(btn("Выдать реквизиты", f"orq:give:{d.id}", "key", style="success"), back("x", "Скрыть", "cross")))
         return d
     await push(bot, s, d.buyer_id, d, f"Ордер по заявке #{d.id} найден — оператор проверяет его и выдаёт реквизиты")
-    await notify_operators(bot, s, d, user)
+    await notify_operators(bot, s, d)
     return d
 
 
 # ---------- operators: accept a Bybit order, give its requisites ----------
 
-def operator_offer_text(d: Deal, merchant: User | None, rep: str = "") -> str:
+def operator_offer_text(d: Deal, rep: str = "") -> str:
     return "\n".join(line for line in [
         f"{pe('bell')} <b>Bybit-ордер · заявка #{d.id} · {money.usdt(d.seller_debit)} USDT</b>",
         f"• Сумма ордера: <b>{money.fmt(d.amount_rub)} ₽</b>",
         f"• Курс мерчанта: <b>{money.fmt(d.merchant_rate)} ₽</b> за 1 USDT",
         f"• Зайти на: <b>{money.usdt(d.seller_debit)} USDT</b>",
         f"• Покупатель переводит из: {esc(d.sender_bank)}" if d.sender_bank else "",
-        f"• Мерчант: {esc(merchant.name or '—') if merchant else '—'} (<code>{d.seller_id}</code>)",
         f"• Репутация мерчанта: {rep}" if rep else None,
         f"• Принять до {at(d.expires_at)}",
         "",
@@ -598,7 +597,7 @@ def operator_offer_text(d: Deal, merchant: User | None, rep: str = "") -> str:
     ] if line is not None)
 
 
-async def notify_operators(bot: Bot, s: AsyncSession, d: Deal, merchant: User | None, first: bool = True) -> int:
+async def notify_operators(bot: Bot, s: AsyncSession, d: Deal, first: bool = True) -> int:
     """Every operator gets «Принять ордер» — always with sound, whatever his quiet setting: an order waits for him;
     the first one who accepts gets the link, the others' messages close. Operators who already have this offer are
     skipped, so it is safe to call again: first=False (order_timeouts, every 20 s) reaches operators added since and
@@ -613,7 +612,7 @@ async def notify_operators(bot: Bot, s: AsyncSession, d: Deal, merchant: User | 
     got, missed = 0, []
     rep = orders.rep_line(*await orders.reputation(s, d.seller_id)) if d.seller_id else ""
     for oid in todo:
-        m, lost = await deliver(bot, oid, operator_offer_text(d, merchant, rep),
+        m, lost = await deliver(bot, oid, operator_offer_text(d, rep),
                                 kb(btn("Принять ордер", f"opq:go:{d.id}", "ok", style="success"),
                                    [btn("Найти другого мерчанта", f"opq:nm:{d.id}", "search"),
                                     app_btn("В приложении", f"deal/{d.id}")], back("x", "Скрыть", "cross")))
@@ -791,7 +790,7 @@ async def cb_operator_back(c: CallbackQuery, bot: Bot, s: AsyncSession, user: Us
     operators.log(s, user.id, d, "returned", "вернул ордер другим операторам")
     await s.commit()
     await show(bot, user, f"{pe('ok')} Ордер по заявке #{d.id} возвращён — его примет другой оператор.", close_kb(), c)
-    await notify_operators(bot, s, d, await s.get(User, d.seller_id))
+    await notify_operators(bot, s, d)
 
 
 RECREATE_LIMIT = 3  # then the deal goes to another merchant: one merchant does not hold a buyer forever
