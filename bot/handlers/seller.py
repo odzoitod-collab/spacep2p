@@ -1,8 +1,10 @@
 import re
+from contextlib import suppress
 from datetime import timedelta
 from decimal import Decimal
 
 from aiogram import Bot, F, Router
+from aiogram.exceptions import TelegramAPIError
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
@@ -11,8 +13,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.emoji import back, btn, kb, pe
 from bot.models import Card, Deal, User, now
-from bot.services import deals, events, money, settings
-from bot.ui import app_btn, esc, manual, ok, quote, show, title, warn
+from bot.services import bsc, deals, events, money, settings
+from bot.ui import app_btn, esc, manual, ok, quote, section, show, title, warn
 
 router = Router()
 
@@ -25,6 +27,14 @@ class AddCard(StatesGroup):
     holder = State()
     min = State()
     max = State()
+    confirm = State()
+
+
+class CreateSellDeal(StatesGroup):
+    amount = State()
+    bank = State()
+    requisites = State()
+    holder = State()
     confirm = State()
 
 
@@ -92,6 +102,11 @@ async def seller_menu(bot: Bot, s: AsyncSession, user: User, src=None, note: str
             f"Открытых сделок: <b>{len(todo)}</b>" + (f" · ждут проверки: <b>{len(need_check)}</b>" if need_check else ""),
         ),
     ]
+    dep_enabled = settings.get("insurance_deposit_enabled") != "0"
+    dep_amount = settings.dec("insurance_deposit_amount") or Decimal(1500)
+    if dep_enabled and user.balance < dep_amount:
+        lines.append(f"{pe('warn')} Требуется страховой депозит <b>{money.usdt(dep_amount)} USDT</b>. "
+                     "Нажмите «Страховой депозит» или напишите «Оплатить» для пополнения.")
     if not cards:
         lines.append(f"{pe('info')} Добавьте карту или СБП — сразу выйдете на смену и попадёте в список покупателей.")
     elif user.balance <= 0:
@@ -107,11 +122,13 @@ async def seller_menu(bot: Bot, s: AsyncSession, user: User, src=None, note: str
         if need_check else None,
         btn("Уйти со смены", "sl:on:0", style="danger") if user.is_online
         else btn("Выйти на смену", "sl:on:1", "live", style="success") if cards else None,
+        btn("Создать сделку на продажу", "sl:create_deal", "plus", style="primary"),
         *[btn(("🟢 " if vis[c.id][0] else "⏸ ") + card_label(c), f"cd:{c.id}") for c in cards],
         btn("Добавить карту", "sl:add", "plus", style=None if cards else "primary"),
         app_btn("Карты в приложении", "cards"),
         [btn(f"В работе ({len(todo)})" if todo else "В работе", "sl:work", "fire"), btn("Статистика", "sl:st", "stats")],
-        btn("Настройки", "sl:cfg", "settings"),
+        [btn("Страховой депозит", "sl:deposit", "lock"), btn("Настройки", "sl:cfg", "settings")]
+        if dep_enabled else btn("Настройки", "sl:cfg", "settings"),
         back("menu", "В меню"),
     ), src)
 
@@ -180,10 +197,115 @@ async def cb_seller_settings(c: CallbackQuery, bot: Bot, s: AsyncSession, user: 
         back("sl", "Панель мерчанта")), c)
 
 
+async def open_seller(bot: Bot, s: AsyncSession, user: User, src=None) -> None:
+    dep_enabled = settings.get("insurance_deposit_enabled") != "0"
+    dep_amount = settings.dec("insurance_deposit_amount") or Decimal(1500)
+    if not dep_enabled or user.balance >= dep_amount:
+        return await seller_menu(bot, s, user, src)
+    cards = await _cards(s, user.id)
+    today = await deals.seller_stats(s, user.id, deals.day_start())
+    if cards and (today["n"] > 0 or user.is_online):
+        await seller_menu(bot, s, user, src)
+    else:
+        await seller_deposit_screen(bot, s, user, src)
+
+
+async def seller_deposit_screen(bot: Bot, s: AsyncSession, user: User, src=None, note: str = "") -> None:
+    cards = await _cards(s, user.id)
+    dep_amount = settings.dec("insurance_deposit_amount") or Decimal(1500)
+    lines = [
+        title(pe("lock"), "Страховой депозит · Продажа USDT"),
+        f"{pe('info')} Для входа в панель мерчанта и продажи USDT на карту требуется страховой депозит.",
+        quote(
+            f"• Сумма депозита: <b>{money.usdt(dep_amount)} USDT</b> (${money.fmt(dep_amount)})",
+            "• Сеть депозита: <b>BNB Smart Chain (BEP-20)</b>",
+            "• Назначение: <b>Обеспечение безопасности P2P-сделок</b>",
+        ),
+        "Для продажи USDT за рубли (работы в качестве мерчанта и добавления карт) "
+        f"необходимо внести страховой депозит в размере <b>{money.usdt(dep_amount)} USDT</b> (${money.fmt(dep_amount)}).\n\n"
+        "Депозит замораживается на вашем балансе в качестве гарантии и защищает участников "
+        "P2P-сделок от неисполнения обязательств.\n\n"
+        "Вы также можете сразу создать сделку на продажу USDT с указанием суммы "
+        "и реквизитов вашей карты.\n\n"
+        "Чтобы получить персональный адрес для оплаты, нажмите кнопку <b>«Оплатить»</b> ниже "
+        "или напишите в чат сообщение <b>«Оплатить»</b>.\n\n"
+        f"Подробно — в {manual('инструкции')}.",
+    ]
+    await show(bot, user, "\n".join(lines) + note, kb(
+        btn("Оплатить", "sl:dep_pay", "card", style="success"),
+        btn("Создать сделку на продажу", "sl:create_deal", "plus", style="primary"),
+        btn("Панель мерчанта", "sl:panel", "card") if cards else None,
+        back("menu", "В меню"),
+    ), src)
+
+
+async def seller_deposit_pay_screen(bot: Bot, s: AsyncSession, user: User, src=None, note: str = "") -> None:
+    if not bsc.ready():
+        return await seller_deposit_screen(bot, s, user, src, warn(bsc.OFF))
+    dep_amount = settings.dec("insurance_deposit_amount") or Decimal(1500)
+    addr = await bsc.deposit_address(s, user.id)
+    lines = [
+        title(pe("plus"), "Оплата страхового депозита · BEP-20"),
+        quote(
+            f"• Сумма к оплате: <b>{money.usdt(dep_amount)} USDT</b>",
+            "• Сеть: <b>BNB Smart Chain (BEP-20)</b>",
+            "• Монета: <b>USDT</b>",
+        ),
+        section("key", "Адрес BEP-20 для оплаты"),
+        f"<code>{addr}</code>",
+        "",
+        quote("Переводите только <b>USDT в сети BNB Smart Chain (BEP-20)</b> — другая монета или сеть не зачислится. "
+              "На бирже или в кошельке выбирайте сеть «BSC (BEP20)»."),
+        f"Адрес закреплён за вашим аккаунтом. После перевода <b>{money.usdt(dep_amount)} USDT</b> депозит зачислится автоматически "
+        "в течение нескольких секунд после подтверждения транзакции в сети BSC.\n\n"
+        "После пополнения вы можете выставить сделку на продажу нужной суммы USDT на свои реквизиты.",
+    ]
+    await show(bot, user, "\n".join(lines) + note, kb(
+        btn("Скопировать адрес", icon="key", copy=addr, style="primary"),
+        btn("Создать сделку на продажу", "sl:create_deal", "plus"),
+        [btn("Адрес в BscScan", icon="search", url=bsc.address_url(addr)), app_btn("В приложении", "deposit")],
+        back("sl", "Назад к условиям"),
+    ), src)
+
+
 @router.callback_query(F.data == "sl")
 async def cb_seller(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User, state: FSMContext):
     await state.clear()
+    await open_seller(bot, s, user, c)
+
+
+@router.callback_query(F.data.in_({"sl:deposit", "sl:dep_info"}))
+async def cb_seller_deposit_info(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User, state: FSMContext):
+    await state.clear()
+    await seller_deposit_screen(bot, s, user, c)
+
+
+@router.callback_query(F.data == "sl:dep_pay")
+async def cb_seller_deposit_pay(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User, state: FSMContext):
+    await state.clear()
+    await seller_deposit_pay_screen(bot, s, user, c)
+
+
+@router.callback_query(F.data.in_({"sl:panel", "sl:menu"}))
+async def cb_seller_panel(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User, state: FSMContext):
+    await state.clear()
     await seller_menu(bot, s, user, c)
+
+
+@router.message(F.text.regexp(r"(?i)^(оплатить|оплата|pay)(?:\s.*)?$"))
+async def msg_pay_deposit(m: Message, bot: Bot, s: AsyncSession, user: User, state: FSMContext):
+    await state.clear()
+    with suppress(TelegramAPIError):
+        await m.delete()
+    await seller_deposit_pay_screen(bot, s, user)
+
+
+@router.message(F.text.regexp(r"(?i)^(продать|продать\s+юсдт|продать\s+usdt|продать\s+юсдт\s+в\s+руб)(?:\s.*)?$"))
+async def msg_sell_trigger(m: Message, bot: Bot, s: AsyncSession, user: User, state: FSMContext):
+    await state.clear()
+    with suppress(TelegramAPIError):
+        await m.delete()
+    await open_seller(bot, s, user)
 
 
 def _shift_note(user: User, cards: list[Card], busy: dict, used: dict) -> str:
@@ -629,3 +751,267 @@ async def cb_save(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User, state
     await card_screen(bot, s, user, card, c, note=ok("Реквизиты сохранены и включены"
                                                      + ("" if was_online else ", вы вышли на смену")
                                                      + ". Лимит банка на входящие за день — кнопка «Лимит в день»."))
+
+
+# ---------- create sell deal with card & deposit ----------
+
+def _csd_step(n: int, text: str) -> str:
+    return f"{title(pe('plus'), 'Сделка на продажу USDT')} · шаг {n} из 5\n\n{text}"
+
+
+def _csd_bank_kb():
+    rows = [[btn(b, f"sl:csd_b:{i + j}", "bank") for j, b in enumerate(BANKS[i:i + 2])]
+            for i in range(0, len(BANKS), 2)]
+    return kb(*rows, back("sl", "Отмена", "cross"))
+
+
+@router.callback_query(F.data == "sl:create_deal")
+async def cb_create_sell_deal(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User, state: FSMContext):
+    await state.clear()
+    await state.set_state(CreateSellDeal.amount)
+    rate = settings.dec("rate")
+    dep_enabled = settings.get("insurance_deposit_enabled") != "0"
+    dep_amount = settings.dec("insurance_deposit_amount") or Decimal(1500)
+    has_dep = user.balance >= dep_amount
+    dep_str = (("Активен" if has_dep else f"Требуется {money.usdt(dep_amount)} USDT")
+               if dep_enabled else "Не требуется")
+    text = _csd_step(1, "\n".join([
+        "Укажите сумму в <b>USDT</b>, которую вы хотите выставить на продажу.",
+        "",
+        quote(
+            f"Текущий курс: <b>{money.fmt(rate)} ₽</b> за 1 USDT",
+            f"Страховой депозит: <b>{dep_str}</b>",
+            f"Доступно на балансе: <b>{money.usdt(user.balance)} USDT</b>",
+        ),
+        "Отправьте сумму USDT сообщением (например, <code>500</code> или <code>1500</code>):",
+    ]))
+    await show(bot, user, text, kb(back("sl", "Отмена", "cross")), c)
+
+
+@router.message(F.text.regexp(r"(?i)^(создать сделку|создать заявку|продать на сумму)(?:\s.*)?$"))
+async def msg_create_sell_deal_trigger(m: Message, bot: Bot, s: AsyncSession, user: User, state: FSMContext):
+    await state.clear()
+    with suppress(TelegramAPIError):
+        await m.delete()
+    await state.set_state(CreateSellDeal.amount)
+    rate = settings.dec("rate")
+    dep_enabled = settings.get("insurance_deposit_enabled") != "0"
+    dep_amount = settings.dec("insurance_deposit_amount") or Decimal(1500)
+    has_dep = user.balance >= dep_amount
+    dep_str = (("Активен" if has_dep else f"Требуется {money.usdt(dep_amount)} USDT")
+               if dep_enabled else "Не требуется")
+    text = _csd_step(1, "\n".join([
+        "Укажите сумму в <b>USDT</b>, которую вы хотите выставить на продажу.",
+        "",
+        quote(
+            f"Текущий курс: <b>{money.fmt(rate)} ₽</b> за 1 USDT",
+            f"Страховой депозит: <b>{dep_str}</b>",
+            f"Доступно на балансе: <b>{money.usdt(user.balance)} USDT</b>",
+        ),
+        "Отправьте сумму USDT сообщением (например, <code>500</code> или <code>1500</code>):",
+    ]))
+    await show(bot, user, text, kb(back("sl", "Отмена", "cross")))
+
+
+@router.message(CreateSellDeal.amount, F.text)
+async def msg_csd_amount(m: Message, bot: Bot, user: User, state: FSMContext):
+    raw = m.text.replace(" ", "").replace(",", ".").replace("$", "").strip()
+    try:
+        val = Decimal(raw)
+    except Exception:
+        val = None
+    if val is None or not val.is_finite() or val <= 0 or val > Decimal("10000000"):
+        return await show(bot, user, _csd_step(1, "Введите корректную сумму USDT для продажи:\n\n"
+                          + warn("Сумма должна быть положительным числом, например 500")),
+                          kb(back("sl", "Отмена", "cross")))
+    amount_usdt = val.quantize(Decimal("0.01"))
+    rate = settings.dec("rate")
+    amount_rub = (amount_usdt * rate).quantize(Decimal("0.01"))
+    await state.update_data(amount_usdt=str(amount_usdt), amount_rub=str(amount_rub))
+    await state.set_state(CreateSellDeal.bank)
+    text = _csd_step(2, "\n".join([
+        quote(
+            f"Сумма к продаже: <b>{money.usdt(amount_usdt)} USDT</b>",
+            f"Сумма к получению: <b>{money.fmt(amount_rub)} ₽</b>",
+            f"Курс: <b>{money.fmt(rate)} ₽</b>",
+        ),
+        "Выберите банк для получения рублей на карту/СБП или отправьте его название:",
+    ]))
+    await show(bot, user, text, _csd_bank_kb())
+
+
+async def _after_csd_bank(bot: Bot, user: User, state: FSMContext, bank: str, src=None):
+    await state.update_data(bank=bank)
+    await state.set_state(CreateSellDeal.requisites)
+    data = await state.get_data()
+    amount_usdt = Decimal(data["amount_usdt"])
+    amount_rub = Decimal(data["amount_rub"])
+    text = _csd_step(3, "\n".join([
+        quote(
+            f"Сумма: <b>{money.usdt(amount_usdt)} USDT</b> (~{money.fmt(amount_rub)} ₽)",
+            f"Банк: <b>{esc(bank)}</b>",
+        ),
+        "Отправьте номер банковской карты (16–19 цифр) или номер телефона СБП (+7...):",
+    ]))
+    await show(bot, user, text, kb(back("sl", "Отмена", "cross")), src)
+
+
+@router.callback_query(CreateSellDeal.bank, F.data.startswith("sl:csd_b:"))
+async def cb_csd_bank(c: CallbackQuery, bot: Bot, user: User, state: FSMContext):
+    idx = c.data.split(":")[2]
+    if not idx.isdigit() or int(idx) >= len(BANKS):
+        return await c.answer("Банк недоступен", show_alert=True)
+    await _after_csd_bank(bot, user, state, BANKS[int(idx)], c)
+
+
+@router.message(CreateSellDeal.bank, F.text)
+async def msg_csd_bank(m: Message, bot: Bot, user: User, state: FSMContext):
+    bank = check_bank(m.text)
+    if not bank:
+        return await show(bot, user, _csd_step(2, "Выберите банк:\n\n"
+                          + warn("Название банка — от 2 до 40 символов")),
+                          _csd_bank_kb())
+    await _after_csd_bank(bot, user, state, bank)
+
+
+@router.message(CreateSellDeal.requisites, F.text)
+async def msg_csd_requisites(m: Message, bot: Bot, s: AsyncSession, user: User, state: FSMContext):
+    raw = m.text.strip()
+    digits = re.sub(r"\D", "", raw)
+    kind, value, err = None, None, ""
+    if len(digits) == 11 and digits[0] in "78":
+        kind = "sbp"
+        value = "+7" + digits[1:]
+    elif 16 <= len(digits) <= 19 and luhn(digits):
+        kind = "card"
+        value = digits
+    elif len(digits) in (16, 17, 18, 19):
+        kind = "card"
+        err = "Номер карты не прошёл проверку — проверьте цифры"
+    else:
+        err = "Отправьте 16–19 цифр номера карты или номер телефона СБП (+7...)"
+
+    if err or not value:
+        return await show(bot, user, _csd_step(3, "Отправьте реквизиты ещё раз:\n\n" + warn(err or "Неверный формат")),
+                          kb(back("sl", "Отмена", "cross")))
+
+    q = select(Card.user_id).where(Card.requisites == value, ~Card.is_deleted)
+    owner = await s.scalar(q.limit(1))
+    if owner is not None and owner != user.id:
+        return await show(bot, user, _csd_step(3, "Отправьте другие реквизиты:\n\n"
+                          + warn("Эти реквизиты уже используются другим продавцом.")),
+                          kb(back("sl", "Отмена", "cross")))
+
+    await state.update_data(kind=kind, requisites=value)
+    await state.set_state(CreateSellDeal.holder)
+    data = await state.get_data()
+    text = _csd_step(4, "\n".join([
+        quote(
+            f"Банк: <b>{esc(data['bank'])}</b>",
+            f"Реквизиты: <code>{esc(value)}</code> ({'карта' if kind == 'card' else 'СБП'})",
+        ),
+        "Отправьте ФИО получателя перевода (как видит банк, например <code>Иван Иванович И.</code>):",
+    ]))
+    await show(bot, user, text, kb(back("sl", "Отмена", "cross")))
+
+
+@router.message(CreateSellDeal.holder, F.text)
+async def msg_csd_holder(m: Message, bot: Bot, user: User, state: FSMContext):
+    fio = check_holder(m.text)
+    if not fio:
+        return await show(bot, user, _csd_step(4, "Отправьте ФИО получателя:\n\n"
+                          + warn("Укажите ФИО буквами, минимум 2 слова")),
+                          kb(back("sl", "Отмена", "cross")))
+    await state.update_data(holder=fio)
+    await state.set_state(CreateSellDeal.confirm)
+    data = await state.get_data()
+    dep_enabled = settings.get("insurance_deposit_enabled") != "0"
+    dep_amount = settings.dec("insurance_deposit_amount") or Decimal(1500)
+    has_dep = user.balance >= dep_amount
+    dep_str = ("Обеспечено страховым депозитом ($1 500)" if has_dep else f"Требуется страховой депозит ({money.usdt(dep_amount)} USDT)") if dep_enabled else "Страховой депозит отключён"
+
+    text = "\n".join([
+        title(pe("doc"), "Проверьте данные сделки на продажу"),
+        "",
+        quote(
+            f"Сумма к продаже: <b>{money.usdt(Decimal(data['amount_usdt']))} USDT</b> (~{money.fmt(Decimal(data['amount_rub']))} ₽)",
+            f"Банк: <b>{esc(data['bank'])}</b>",
+            f"Реквизиты: <code>{esc(data['requisites'])}</code>",
+            f"Получатель: <b>{esc(fio)}</b>",
+            f"Статус депозита: <b>{dep_str}</b>",
+        ),
+        f"{pe('warn')} Покупатели будут переводить рубли на эти реквизиты. "
+        "Проверьте правильность номера карты и ФИО перед подтверждением.",
+    ])
+    await show(bot, user, text, kb(
+        btn("Подтвердить и опубликовать", "sl:csd_save", "ok", style="success"),
+        btn("Оплатить депозит", "sl:dep_pay", "card", style="primary")
+        if dep_enabled and not has_dep else None,
+        back("sl", "Отмена", "cross"),
+    ))
+
+
+@router.callback_query(CreateSellDeal.confirm, F.data == "sl:csd_save")
+async def cb_csd_save(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User, state: FSMContext):
+    data = await state.get_data()
+    await state.clear()
+    if not data or "requisites" not in data:
+        return await seller_menu(bot, s, user, c)
+
+    amount_usdt = Decimal(data["amount_usdt"])
+    amount_rub = Decimal(data["amount_rub"])
+
+    q = select(Card).where(Card.user_id == user.id, Card.requisites == data["requisites"], ~Card.is_deleted)
+    card = await s.scalar(q.limit(1))
+    if card:
+        card.bank = data["bank"]
+        card.holder = data["holder"]
+        card.max_rub = max(card.max_rub, amount_rub)
+        card.is_active = True
+    else:
+        card = Card(
+            user_id=user.id,
+            kind=data["kind"],
+            bank=data["bank"],
+            requisites=data["requisites"],
+            holder=data["holder"],
+            min_rub=min(amount_rub, Decimal("1000")),
+            max_rub=amount_rub,
+            is_active=True,
+        )
+        s.add(card)
+
+    user.is_online = True
+    await s.flush()
+
+    events.add(s, f"card:{card.id}", "sell_deal_created",
+               f"Создана сделка на продажу {money.usdt(amount_usdt)} USDT ({money.fmt(amount_rub)} ₽)",
+               user.id, notice=True)
+
+    dep_enabled = settings.get("insurance_deposit_enabled") != "0"
+    dep_amount = settings.dec("insurance_deposit_amount") or Decimal(1500)
+    has_dep = user.balance >= dep_amount
+
+    lines = [
+        title(pe("ok"), "Сделка на продажу опубликована"),
+        "",
+        quote(
+            f"Сумма: <b>{money.usdt(amount_usdt)} USDT</b> (~{money.fmt(amount_rub)} ₽)",
+            f"Банк: <b>{esc(card.bank)}</b>",
+            f"Реквизиты: <code>{esc(card.requisites)}</code>",
+            f"Получатель: <b>{esc(card.holder)}</b>",
+            f"Лимиты сделок: <b>{money.fmt(card.min_rub)} – {money.fmt(card.max_rub)} ₽</b>",
+            f"Страховой депозит: <b>{'Обеспечено' if has_dep or not dep_enabled else 'Требуется оплата'}</b>",
+        ),
+        f"{pe('live')} <b>Вы на смене</b>. Реквизиты активны и доступны покупателям для обмена.\n"
+        "Когда покупатель откроет сделку, вам придёт уведомление с деталями.",
+    ]
+    if dep_enabled and not has_dep:
+        lines.append(f"\n{pe('warn')} Для стабильной работы не забудьте внести страховой депозит "
+                     f"<b>{money.usdt(dep_amount)} USDT</b>.")
+
+    await show(bot, user, "\n".join(lines), kb(
+        btn("Панель мерчанта", "sl:panel", "card", style="primary"),
+        btn("Оплатить депозит", "sl:dep_pay", "card", style="success") if dep_enabled and not has_dep else None,
+        back("menu", "В главное меню"),
+    ), c)

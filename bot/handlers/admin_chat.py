@@ -37,6 +37,8 @@ LINKS_PER_HOUR = 5
 
 
 def chat_id() -> int | None:
+    if settings.get("chat_enabled") == "0":
+        return None
     v = settings.get("chat_id")
     return int(v) if v else None
 
@@ -250,13 +252,27 @@ async def chat_screen(bot: Bot, s: AsyncSession, admin: User, src=None, note: st
                   quote("Кнопка «Чат» в меню выдаёт каждому личную ссылку на один вход. Закреп — баннер со сводкой, "
                         "обновляется каждые 5 мин. Все ордерные заявки публикуются в чат с кнопкой «Взять заявку "
                         "в боте».")]
+    chat_on = settings.get("chat_enabled") != "0"
+    toggle_text = "Отключить чат (скрыть из бота)" if chat_on else "Включить чат в боте"
+    toggle_target = "0" if chat_on else "1"
     await show(bot, admin, "\n".join(lines) + note, kb(
+        btn(toggle_text, f"ach:toggle:{toggle_target}", "pause" if chat_on else "live",
+            style="danger" if chat_on else "success"),
         btn("Войти в чат", url=invite, icon="people", style="success") if invite else None,
         btn("Ссылка в чат для меня", "ach:inv", "people") if chat and not invite else None,
         btn("Обновить закреп", "ach:pin", "refresh", style="primary") if chat else None,
         btn("Изменить ID чата" if chat else "Задать ID чата", "acx:chat_id", "pencil"),
         [btn("Инфо-канал", "achn", "bell"), btn("Рассылка", "abc", "bell")],
         back("a", "Админ-панель")), src)
+
+
+@router.callback_query(F.data.regexp(r"^ach:toggle:([01])$"))
+async def cb_chat_toggle(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User, state: FSMContext):
+    await state.set_state(None)
+    val = c.data.split(":")[2]
+    await settings.put(s, "chat_enabled", val)
+    note = ok("Чат включён" if val == "1" else "Чат отключён: скрыт из меню и проверок в боте")
+    await chat_screen(bot, s, user, c, note)
 
 
 # ---------- admin: broadcast ----------

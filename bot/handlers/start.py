@@ -74,7 +74,7 @@ async def main_menu(bot: Bot, s: AsyncSession, user: User, is_admin: bool, src=N
         if is_op else None,
         [btn("Мои сделки", inline="сделки "), btn("Помощь", "info")],
         [btn("Команда", "tm"), btn(f"{BRAND} API", "api")],
-        [btn("Чат", "chat") if settings.get("chat_id") else None,
+        [btn("Чат", "chat") if settings.get("chat_enabled") != "0" and settings.get("chat_id") else None,
          btn("Канал", url=settings.raw("channel_link")) if settings.get("channel_id") and settings.raw("channel_link")
          else None],
         btn("Вопросы менеджеру", url=manager_url()) if manager_url() else None,

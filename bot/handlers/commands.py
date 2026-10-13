@@ -18,7 +18,7 @@ from bot.handlers.api_user import api_screen
 from bot.handlers.deal import deal_screen, deals_screen
 from bot.handlers.market import buy_screen
 from bot.handlers.orders import merchant_screen, take_screen
-from bot.handlers.seller import seller_menu
+from bot.handlers.seller import open_seller, seller_menu
 from bot.handlers.start import info_screen, main_menu
 from bot.handlers.team import joined_screen, team_screen
 from bot.handlers.wallet import op_screen, wallet_screen
@@ -135,7 +135,7 @@ async def cmd_buy(m: Message, bot: Bot, s: AsyncSession, user: User, state: FSMC
 @router.message(Command("sell"))
 async def cmd_sell(m: Message, bot: Bot, s: AsyncSession, user: User, state: FSMContext):
     await state.clear()
-    await seller_menu(bot, s, user)
+    await open_seller(bot, s, user)
 
 
 @router.message(Command("wallet"))

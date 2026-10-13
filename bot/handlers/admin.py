@@ -163,11 +163,35 @@ async def cb_admin_section(c: CallbackQuery, bot: Bot, s: AsyncSession, user: Us
             [btn("Пополнения и выводы", "al", "list"), btn("Финансы", "afin", "stats")],
             [btn("Комиссии", "acm", "percent"), btn("Отчёты CSV", "arp", "doc")]]
     else:
+        dep_on = settings.get("insurance_deposit_enabled") != "0"
+        chat_on = settings.get("chat_enabled") != "0"
         head, about, rows = "Настройки", "Правила, тексты, чат сообщества, API и журнал действий.", [
             [btn("Все настройки", "as", "settings"), btn("Чат и канал", "ach", "people")],
+            [btn(f"Депозит: {'ВКЛ' if dep_on else 'ВЫКЛ'}", f"as:tg:dep:{'0' if dep_on else '1'}", "lock",
+                 style="success" if dep_on else "danger"),
+             btn(f"Чат: {'ВКЛ' if chat_on else 'ВЫКЛ'}", f"as:tg:chat:{'0' if chat_on else '1'}", "people",
+                 style="success" if chat_on else "danger")],
             [btn(_n("API", q["api_apps"]), "aapi", "key"), btn("Журнал", "aa", "list")]]
     await show(bot, user, "\n".join([title(pe("settings"), head), "", about]),
                kb(*rows, back("a", "Админ-панель")), c)
+
+
+@router.callback_query(F.data.regexp(r"^as:tg:dep:([01])$"))
+async def cb_toggle_dep(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User, state: FSMContext):
+    await state.set_state(None)
+    val = c.data.split(":")[3]
+    await settings.put(s, "insurance_deposit_enabled", val)
+    audit.log(s, user.id, "setting", "insurance_deposit_enabled", val)
+    await cb_admin_section(c, bot, s, user, state)
+
+
+@router.callback_query(F.data.regexp(r"^as:tg:chat:([01])$"))
+async def cb_toggle_chat(c: CallbackQuery, bot: Bot, s: AsyncSession, user: User, state: FSMContext):
+    await state.set_state(None)
+    val = c.data.split(":")[3]
+    await settings.put(s, "chat_enabled", val)
+    audit.log(s, user.id, "setting", "chat_enabled", val)
+    await cb_admin_section(c, bot, s, user, state)
 
 
 def _n(label: str, n: int) -> str:
@@ -207,6 +231,7 @@ SHORT = {"rate": "курс", "order_rate": "ордер", "seller_pct": "карт
          "late_hold_minutes": "залог", "escalate_minutes": "автоспор", "webapp_url": "приложение",
          "webapp_link": "app-ссылка", "card_min_rub": "карта от",
          "operator_max_debt": "долг до", "abandon_limit": "брошенных", "abandon_pause_minutes": "пауза",
+         "insurance_deposit_enabled": "страх. депозит", "insurance_deposit_amount": "сумма страх.", "chat_enabled": "чат",
          "card_parallel": "на карту", "order_first_wave": "лучшим", "order_wave_seconds": "через"}
 
 

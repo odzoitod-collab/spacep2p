@@ -29,6 +29,8 @@ ENTRY_COMMANDS = {"/start", "/menu", "/buy", "/sell", "/wallet", "/deals", "/api
 
 
 def chat_id() -> int | None:
+    if settings.get("chat_enabled") == "0":
+        return None
     v = settings.get("chat_id")
     return int(v) if v else None
 

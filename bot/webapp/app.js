@@ -629,7 +629,16 @@ async function exchange(c, side) {
 
 function sellPane(m) {
   const r = m.roles;
-  return `<div class="list">
+  return `
+    <div class="box pad" style="margin-bottom:12px;border:1px solid rgba(56,189,248,0.25)">
+      <div style="display:flex;align-items:center;gap:8px;font-weight:600;font-size:15px">
+        <span class="ic sea" style="width:24px;height:24px">${ic("shield")}</span>
+        <span>Страховой депозит: 1 500 USDT</span>
+      </div>
+      <p class="hint" style="margin:6px 0 10px">Для продажи USDT и приёма платежей на свои реквизиты требуется страховой депозит $1 500 (сеть BEP-20). Он гарантирует безопасность сделок.</p>
+      <button class="btn sm" data-go="deposit">${ic("card")}Оплатить депозит (1 500 USDT)</button>
+    </div>
+    <div class="list">
       <button class="row" data-go="cards"><span class="ic sea">${ic("card")}</span><span class="mid"><b>Своя карта или СБП</b><small>Покупатели переводят рубли на вашу карту · доход ${esc(m.terms.seller_pct)}%</small></span>${chev()}</button>
       <button class="row" data-go="orders"><span class="ic amber">${ic("bell")}</span><span class="mid"><b>Реквизиты под сумму</b><small>Заявки покупателей · курс ${NF.format(n(m.terms.order_rate))} ₽ за USDT</small></span>${chev()}</button>
     </div>

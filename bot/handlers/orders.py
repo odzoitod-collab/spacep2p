@@ -149,7 +149,8 @@ async def sync_chat_posts(bot: Bot, s: AsyncSession, d: Deal) -> None:
 
 async def chats(s: AsyncSession) -> list[tuple[int, int | None]]:
     """(chat id, team id) where requests are posted: the community chat and every working team's chat."""
-    out = [(int(settings.get("chat_id")), None)] if settings.get("chat_id") else []
+    chat_on = settings.get("chat_enabled") != "0"
+    out = [(int(settings.get("chat_id")), None)] if chat_on and settings.get("chat_id") else []
     rows = (await s.execute(select(Team.chat_id, Team.id).where(Team.status == "approved",
                                                                 Team.chat_id.is_not(None)))).all()
     return out + [(cid, tid) for cid, tid in rows if cid not in {c for c, _ in out}]

@@ -48,10 +48,13 @@ SPEC: dict[str, tuple[str, str, str]] = {
     "bsc_withdraw_fee": ("1", "dec", "BEP-20: фикс. комиссия вывода"),
     "team_pct": ("1", "pct", "Тимлиду от сделок команды"),
     "chat_id": ("", "chat", "Чат сообщества"),
+    "chat_enabled": ("1", "int0", "Чат сообщества (1 — вкл, 0 — выкл)"),
     "channel_id": ("", "chat", "Инфо-канал"),
     "join_required": ("1", "int0", "Вступление в чат и канал"),
     "channel_autopost_hours": ("24", "int0", "Автопост в канал, часов"),
     "signup_review": ("1", "int0", "Вход новых пользователей"),
+    "insurance_deposit_enabled": ("1", "int0", "Страховой депозит мерчанта (1 — вкл, 0 — выкл)"),
+    "insurance_deposit_amount": ("1500", "dec", "Размер страхового депозита, USDT"),
     "docs_url": ("https://straitpay.best/docs", "url", "Сайт с инструкциями"),
     "webapp_url": ("", "url", "Мини-приложение"),
     "webapp_link": ("", "url", "Приложение: t.me-ссылка"),
@@ -74,10 +77,10 @@ GROUPS: list[tuple[str, list[str]]] = [
     ("Сроки сделок", ["deal_minutes", "buyer_max_open", "abandon_limit", "abandon_pause_minutes", "card_parallel", "confirm_minutes", "escalate_minutes", "late_hold_minutes", "late_minutes",
                       "online_minutes"]),
     ("Кошелёк и лимиты", ["bsc_withdraw_min", "card_min_rub",
-                          "adjust_approval_usdt", "withdraw_turnover"]),
-    ("Правила и лог-чат", ["log_all", "signup_review", "join_required"]),
+                          "adjust_approval_usdt", "withdraw_turnover", "insurance_deposit_amount"]),
+    ("Правила и лог-чат", ["log_all", "signup_review", "join_required", "insurance_deposit_enabled"]),
     ("Тексты, поддержка, чат", ["support", "manager", "tutorial", "manual_url", "docs_url", "webapp_url", "webapp_link",
-                                "chat_id", "channel_id",
+                                "chat_enabled", "chat_id", "channel_id",
                                 "channel_autopost_hours"]),
     ("Ордерные реквизиты", ["order_min_rub", "order_max_rub", "order_search_minutes", "order_take_minutes",
                             "order_link_minutes", "order_pay_minutes", "order_check_minutes", "strike_limit",
@@ -141,7 +144,8 @@ HINTS = {
     "team_pct": "Процент от суммы сделки (в USDT по курсу сделки), который тимлид получает с каждой завершённой "
                 "сделки участника команды. Платит площадка из своего дохода по сделке, не больше него.",
 }
-FLAGS = ("log_all", "signup_review", "join_required", "withdraw_turnover")
+FLAGS = ("log_all", "signup_review", "join_required", "withdraw_turnover",
+         "insurance_deposit_enabled", "chat_enabled")
 RATES = ("rate", "order_rate")  # RUB per 1 USDT
 
 _cache: dict[str, str] = {}
@@ -200,7 +204,9 @@ def human(key: str, value: str | None = None) -> str:
         return {"log_all": {"1": "все события", "0": "только проблемы"},
                 "signup_review": {"1": "по заявке", "0": "открыт всем"},
                 "join_required": {"1": "обязательно", "0": "по желанию"},
-                "withdraw_turnover": {"1": "включено", "0": "выключено"}}[key].get(v, v)
+                "withdraw_turnover": {"1": "включено", "0": "выключено"},
+                "insurance_deposit_enabled": {"1": "включено", "0": "выключено"},
+                "chat_enabled": {"1": "включён", "0": "выключен"}}[key].get(v, v)
     if key == "online_minutes" and v == "0":
         return "выключено"
     if key == "adjust_approval_usdt" and Decimal(v) == 0:
