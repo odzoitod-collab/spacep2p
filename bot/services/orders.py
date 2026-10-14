@@ -21,6 +21,7 @@ to work it when he takes it:
 Order merchants have no percent: they sell at the fixed order_rate, seller_debit = amount_rub / order_rate. The deal's
 terms are fixed when the request is created. While searching/assigned/checking, expires_at is the stage deadline.
 """
+import re
 from datetime import timedelta
 from decimal import ROUND_HALF_UP, Decimal
 from urllib.parse import urlsplit
@@ -39,8 +40,10 @@ BYBIT_HOSTS = ("bybit.com", "bybitglobal.com", "bybit.eu", "bybit.kz", "bybit.nl
 
 def bybit_link(raw: str | None) -> str | None:
     """A Bybit order link as given by the merchant, or None if it is not one."""
-    url = (raw or "").strip()
-    if not url.startswith("http"):
+    text = (raw or "").strip()
+    found = re.search(r"(?<![\w./@=?&-])(?:https?://)?(?:[\w-]+\.)*bybit[\w-]*\.[a-z]{2,}/[^\s<>\"']+", text, re.I)
+    url = found.group(0).rstrip(".,;:!?)»") if found else text
+    if not url.lower().startswith("http"):
         url = "https://" + url
     try:
         parts = urlsplit(url)

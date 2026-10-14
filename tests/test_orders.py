@@ -16,7 +16,7 @@ from sqlalchemy import select
 from bot import models, tasks
 from bot.api.server import build_app
 from bot.models import Deal, Event, Ledger, Operator, OrderMerchant, User
-from bot.services import api, deals, money
+from bot.services import api, deals, money, orders
 from tests.harness import cb, msg, plain
 from tests.test_api import apply_and_approve, auth
 from tests.test_scenarios import ADMIN, BUYER, OTHER, PDF, SELLER, create_deal, ready, user
@@ -532,3 +532,11 @@ def test_requisites_in_one_message():
     assert parse_requisites("89001234567 Почта Банк") == (("sbp", "+79001234567", "Почта Банк", ""), "")
     assert parse_requisites("+7 900 123-45-67")[1] == "Добавьте банк получателя"
     assert parse_requisites("Сбербанк")[1] == "Не вижу номера карты или телефона"
+
+
+def test_bybit_link_is_found_in_shared_text():
+    assert orders.bybit_link("Мой ордер:\nhttps://i.bybit.com/4abhMK9 .") == "https://i.bybit.com/4abhMK9"
+    assert orders.bybit_link("i.bybit.com/4abhMK9") == "https://i.bybit.com/4abhMK9"
+    assert orders.bybit_link("https://evil.test/?u=bybit.com/abc") is None
+    assert orders.bybit_link("https://bybit.com.evil.test/abc") is None
+    assert orders.bybit_link("ссылки нет") is None

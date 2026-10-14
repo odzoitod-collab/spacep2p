@@ -2,6 +2,7 @@
 Bybit order or from the balance, giving requisites or the order link), operators (accepting a Bybit order, giving its
 requisites) and the broadcast of requests — to every merchant and into the community and team chats.
 Money and state transitions live in services/orders.py."""
+import logging
 import re
 from contextlib import suppress
 from datetime import timedelta
@@ -25,6 +26,7 @@ from bot.ui import (app_btn, at, clean, close_kb, deep_link, deliver, esc, field
                     section, show, title,
                     warn)
 
+log = logging.getLogger(__name__)
 router = Router()
 REAPPLY_AFTER = timedelta(hours=24)
 SPEED = ["до 5 минут", "5–10 минут", "10–15 минут"]
@@ -540,6 +542,7 @@ async def msg_link(m: Message, bot: Bot, s: AsyncSession, user: User, state: FSM
         return await show(bot, user, warn("Заявка уже не у вас"), close_kb())
     url = orders.bybit_link(m.text)
     if not url:
+        log.info("bybit link rejected: deal %s user %s text %r", d.id, user.id, (m.text or "")[:200])
         return await link_screen(bot, s, user, d, state, note=warn(
             "Нужна ссылка на ордер Bybit: https://www.bybit.com/… (скопируйте из приложения Bybit)"))
     did = d.id
