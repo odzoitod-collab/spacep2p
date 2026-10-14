@@ -12,7 +12,7 @@ from decimal import Decimal
 from aiogram.exceptions import TelegramAPIError
 from aiogram.types import BufferedInputFile
 from aiohttp import web
-from sqlalchemy import func, select
+from sqlalchemy import false, func, select
 
 from bot.api.webapp import AppError, body, ctx, deal_json, deal_of, deal_response, iso, num, own_purchase
 from bot.models import (Adjustment, Deal, Ledger, MerchantRating, Operator, OrderMerchant, Signup, Ticket,
@@ -480,7 +480,8 @@ async def admin_deals(request: web.Request) -> web.Response:
     q = select(Deal)
     f = request.query.get("filter", "open")
     if (num_q := request.query.get("q", "").strip().lstrip("#")).isdigit():
-        q = q.where((Deal.id == int(num_q)) | (Deal.buyer_id == int(num_q)) | (Deal.seller_id == int(num_q)))
+        n = int(num_q)  # a Telegram ID does not fit deals.id (int32)
+        q = q.where((Deal.id == n if n < 2**31 else false()) | (Deal.buyer_id == n) | (Deal.seller_id == n))
     elif f == "dispute":
         q = q.where(Deal.status == "dispute")
     elif f == "paid":
@@ -489,7 +490,7 @@ async def admin_deals(request: web.Request) -> web.Response:
         q = q.where(Deal.status.in_(deals.OPEN))
     elif f == "closed":
         q = q.where(Deal.status.not_in(deals.OPEN))
-    if (before := request.query.get("before", "")).isdigit():
+    if (before := request.query.get("before", "")).isdigit() and int(before) < 2**31:
         q = q.where(Deal.id < int(before))
     rows = (await s.scalars(q.order_by(Deal.id.desc()).limit(30))).all()
     return web.json_response({"deals": [deal_json(d, None, user.id, full=False) for d in rows]})

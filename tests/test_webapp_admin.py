@@ -136,3 +136,15 @@ def test_a_pdf_receipt_is_streamed_to_the_page(go):
             js = await c.get("/app/vendor/pdf.min.js")
             assert js.status == 200 and (await c.get("/app/vendor/evil.js")).status == 404
     go(fn)
+
+
+def test_admin_deal_search_by_telegram_id_beyond_int32(go):
+    async def fn(b):
+        await ready(b)
+        async with http(b) as c:
+            r = await c.get("/app/api/admin/deals?q=8652754831", headers=as_(ADMIN))
+            assert r.status == 200 and (await r.json())["deals"] == []
+            r = await c.get(f"/app/api/admin/deals?q={BUYER}", headers=as_(ADMIN))
+            assert r.status == 200
+            assert (await c.get("/app/api/admin/deals?before=8652754831", headers=as_(ADMIN))).status == 200
+    go(fn)
