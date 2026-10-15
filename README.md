@@ -2,6 +2,8 @@
 
 aiogram 3 · PostgreSQL · USDT в сети TON (собственные кошельки, Toncenter API, tonutils).
 
+Реквизиты из чата ордера Bybit — модуль `bot/services/bybit.py`, к боту пока не подключён: [docs/BYBIT.md](docs/BYBIT.md).
+
 ## Запуск
 ```bash
 cp .env.example .env            # заполнить BOT_TOKEN, ADMIN_IDS, MASTER_SECRET (до первого запуска)
