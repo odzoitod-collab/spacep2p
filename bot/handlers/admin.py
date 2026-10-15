@@ -118,6 +118,7 @@ async def admin_screen(bot: Bot, s: AsyncSession, user: User, src=None):
         [btn("Ввод и вывод", "al", "wallet"), btn("Карты", "ac:0", "card")],
         [btn("Отчёты CSV", "arp", "doc"), btn("Обращения", "atl", "support")],
         [btn("USDT TON", "atn", "wallet"), btn("API для сервисов", "aapi", "key")],
+        btn("Bybit", "bb", "settings"),
         btn("Финансы: сколько можно забрать", "afin", style="success"),
         [btn("Комиссии", "acm", "percent"), btn("Ордерные мерчанты", "aoml", "key")],
         [btn("Настройки", "as", "settings"), btn("Журнал", "aa", "list")],

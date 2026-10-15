@@ -10,7 +10,7 @@ from bot import models, tasks
 from bot.app import build_dispatcher
 from bot.config import config
 from bot.handlers import commands
-from bot.services import api, settings, ton, xrocket
+from bot.services import api, bybit_orders, settings, ton, xrocket
 
 
 async def main() -> None:
@@ -29,6 +29,7 @@ async def main() -> None:
     async with models.Session() as s:
         await settings.load(s)
     xrocket.rocket = xrocket.XRocket(config.xrocket_token, config.xrocket_base_url)
+    await bybit_orders.setup()
     if ton.enabled():
         ton.chain = ton.Chain()
         logging.info("USDT TON deposits on; gas wallet %s", ton.friendly(ton.gas_address()))
@@ -54,6 +55,7 @@ async def main() -> None:
         if runner is not None:
             await runner.cleanup()
         await api.close()
+        await bybit_orders.close()
         await xrocket.rocket.close()
         if ton.chain is not None:
             await ton.chain.close()

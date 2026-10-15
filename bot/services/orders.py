@@ -127,11 +127,14 @@ async def take(s: AsyncSession, deal_id: int, merchant: User) -> Deal:
 
 
 async def give_requisites(s: AsyncSession, deal_id: int, merchant: User, kind: str, bank: str, number: str,
-                          holder: str, minutes: int) -> Deal:
+                          holder: str, minutes: int, *, bybit_verified: bool = False) -> Deal:
     """The merchant's requisites for this deal: an unlisted one-off card; the buyer's payment timer starts."""
     d = await s.get(Deal, deal_id, with_for_update=True, populate_existing=True)
     if d is None or d.status != "assigned" or d.seller_id != merchant.id:
         raise DealError("Заявка уже не у вас", "not_yours")
+    from bot.services.bybit_orders import held
+    if await held(s, deal_id) and not bybit_verified:
+        raise DealError("Реквизиты получает Bybit. Ручная замена недоступна.", "bybit_active")
     if deals.aware(d.expires_at) < now():
         raise DealError("Время на выдачу реквизитов вышло — заявка передана другим мерчантам", "late")
     if minutes not in pay_choices():
@@ -149,6 +152,9 @@ async def release(s: AsyncSession, deal_id: int, why: str = "declined") -> Deal 
     offered this request again. Does not commit."""
     d = await s.get(Deal, deal_id, with_for_update=True, populate_existing=True)
     if d is None or d.status != "assigned":
+        return None
+    from bot.services.bybit_orders import held
+    if await held(s, deal_id):
         return None
     merchant = d.seller_id
     await money.unfreeze(s, merchant, d.seller_debit, f"deal:{d.id}")

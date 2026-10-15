@@ -18,6 +18,8 @@ os.environ["ADMIN_IDS"] = "[1, 2]"  # 2 = second admin for approvals
 os.environ["LOG_CHAT_ID"] = "1"  # never use the log chat from a developer's .env
 os.environ["EMOJI_MODE"] = "premium"
 os.environ["TON_SEED"] = "ab" * 32  # test-only secret: deposit addresses are derived from it
+os.environ["BYBIT_ENABLED"] = "false"
+os.environ["BYBIT_ACCOUNTS"] = "[]"  # never load production exchange credentials into tests
 
 from aiogram import Bot, Dispatcher  # noqa: E402
 from aiogram.client.default import DefaultBotProperties  # noqa: E402

@@ -16,6 +16,8 @@ from bot.handlers import wallet as wallet_handlers
 from bot.handlers.wallet import check_deposit, reconcile, send_cheque
 from bot.models import Deal, Deposit, Session, User, Withdrawal, now
 from bot.services import api, deals, events, money, orders, settings, ton, xrocket
+from bot.config import config
+from bot.services import bybit_orders
 from bot.ui import notify
 
 log = logging.getLogger(__name__)
@@ -311,4 +313,6 @@ def start(bot: Bot) -> list[asyncio.Task]:
             asyncio.create_task(loop(order_timeouts, bot, 20)),
             asyncio.create_task(loop(payout_queue, bot, 30)),
             asyncio.create_task(loop(stats_topic, bot, 600))] + (
-        [asyncio.create_task(loop(ton_cycle, bot, 30))] if ton.enabled() else [])
+        [asyncio.create_task(loop(ton_cycle, bot, 30))] if ton.enabled() else []) + (
+        [asyncio.create_task(loop(bybit_orders.cycle, bot, config.bybit_poll_seconds))]
+        if config.bybit_enabled else [])

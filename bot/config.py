@@ -1,7 +1,14 @@
 from typing import Literal
 
-from pydantic import field_validator
+from pydantic import BaseModel, Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class BybitCredential(BaseModel):
+    name: str = Field(pattern=r"^[a-zA-Z0-9_-]{1,32}$")
+    uid: str = Field(pattern=r"^[0-9]{1,32}$")
+    api_key: SecretStr
+    api_secret: SecretStr
 
 
 class Config(BaseSettings):
@@ -32,6 +39,21 @@ class Config(BaseSettings):
     api_port: int = 8080
     api_public_url: str = ""  # e.g. https://api.straitpay.com — shown to clients; default http://host:port
     api_receipt_mb: int = 10
+
+    # Credentials stay outside the database and Telegram. One active order per account initially.
+    bybit_enabled: bool = False
+    bybit_testnet: bool = False
+    bybit_accounts: list[BybitCredential] = []
+    bybit_poll_seconds: int = Field(default=15, ge=5, le=300)
+
+    @field_validator("bybit_accounts")
+    @classmethod
+    def _bybit_accounts(cls, values: list[BybitCredential]) -> list[BybitCredential]:
+        if len({v.name for v in values}) != len(values) or len({v.uid for v in values}) != len(values):
+            raise ValueError("Bybit account names and UIDs must be unique")
+        if any(not v.api_key.get_secret_value() or not v.api_secret.get_secret_value() for v in values):
+            raise ValueError("Bybit credentials must not be empty")
+        return values
 
     @property
     def api_url(self) -> str:

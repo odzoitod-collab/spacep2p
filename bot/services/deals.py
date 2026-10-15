@@ -4,7 +4,7 @@ from decimal import Decimal
 from sqlalchemy import exists, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from bot.models import Card, Deal, User, now
+from bot.models import BybitOrder, Card, Deal, User, now
 from bot.services import money, settings
 
 OPEN = ("searching", "assigned", "waiting_payment", "paid", "dispute")
@@ -281,6 +281,10 @@ async def _check_client(s: AsyncSession, client, amount_rub: Decimal) -> None:
 
 async def _move(s: AsyncSession, deal_id: int, frm: tuple[str, ...], to: str, **values) -> Deal | None:
     """Atomic status transition. Returns fresh deal or None if status already changed."""
+    job = await s.get(BybitOrder, deal_id)
+    if job and job.order_id and job.stage not in ("completed", "cancelled"):
+        if to in ("cancelled", "void", "searching") or (to == "completed" and job.stage != "settling"):
+            return None  # an exchange order cannot be closed using the legacy manual controls
     values["closed_at"] = None if to in OPEN else now()
     res = await s.execute(
         update(Deal).where(Deal.id == deal_id, Deal.status.in_(frm)).values(status=to, **values)
@@ -306,6 +310,9 @@ async def expire(s: AsyncSession, deal_id: int) -> Deal | None:
     the last minute can still upload the receipt and the seller cannot withdraw that money meanwhile."""
     await s.get(Deal, deal_id, with_for_update=True, populate_existing=True)
     hold = settings.num("late_hold_minutes")
+    job = await s.get(BybitOrder, deal_id)
+    if job and job.order_id and job.stage not in ("completed", "cancelled"):
+        hold = max(hold, 1)  # never release collateral before the external order is resolved
     d = await _move(s, deal_id, ("waiting_payment",), "expired", close_reason="expired", funds_held=hold > 0,
                     hold_until=now() + timedelta(minutes=hold) if hold else None)
     if d and not hold:
@@ -317,6 +324,9 @@ async def release_hold(s: AsyncSession, deal_id: int) -> Deal | None:
     """Hold is over and no receipt came: give the seller the funds back (once)."""
     d = await s.get(Deal, deal_id, with_for_update=True, populate_existing=True)
     if not d or d.status != "expired" or not d.funds_held:
+        return None
+    from bot.services.bybit_orders import held
+    if await held(s, deal_id):
         return None
     d.funds_held = False
     await money.unfreeze(s, d.seller_id, d.seller_debit, f"deal:{d.id}")
@@ -389,10 +399,13 @@ async def add_evidence(s: AsyncSession, deal_id: int, uid: int, item: list) -> D
 
 
 async def complete(s: AsyncSession, deal_id: int, frm=("paid", "dispute"), actual_rub: Decimal | None = None,
-                   reason: str = "confirmed") -> Deal | None:
+                   reason: str = "confirmed", *, bybit_verified: bool = False) -> Deal | None:
     """Release coins to buyer. actual_rub re-prices the deal by the amount really received."""
     d = await s.get(Deal, deal_id, with_for_update=True, populate_existing=True)
     if not d or d.status not in frm:
+        return None
+    job = await s.get(BybitOrder, deal_id)
+    if job and job.order_id and (not bybit_verified or job.stage != "settling"):
         return None
     for uid in sorted((d.buyer_id, d.seller_id)):
         await money.lock(s, uid)

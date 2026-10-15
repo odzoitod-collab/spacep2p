@@ -2,6 +2,9 @@
 
 aiogram 3 · PostgreSQL · xRocket Pay API (новый, не Legacy).
 
+Первый этап автоматизации оператора Bybit: [готовые функции и ограничения](docs/BYBIT.md).
+Автоматический вход по объявлению и отмена покупателем пока не подключены; интеграция выключена по умолчанию.
+
 ## Запуск
 ```bash
 cp .env.example .env            # заполнить BOT_TOKEN, ADMIN_IDS, XROCKET_TOKEN

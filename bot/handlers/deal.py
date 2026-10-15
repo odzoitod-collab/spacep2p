@@ -477,11 +477,17 @@ async def accept_receipt(s: AsyncSession, d: Deal, buyer: User, fid: str, unique
     if reused:
         log(s, paid, "receipt_reused", f"Этот же файл чека уже присылали по сделке #{reused} — возможна подделка",
             alert=True)
+    from bot.services.bybit_orders import receipt_attached
+    await receipt_attached(s, paid, reused=bool(reused), late=late)
     await s.commit()
     return paid, late, reused, ""
 
 
 async def send_to_seller(bot: Bot, s: AsyncSession, paid: Deal, late: bool, reused: int | None) -> None:
+    from bot.services.bybit_orders import held
+    if await held(s, paid.id):
+        # The durable Bybit worker sends the file; do not present legacy bank-confirmation buttons.
+        return
     card = await card_of(s, paid)
     head = ("Покупатель прислал чек" + (" после окончания срока" if late else "") + " — проверьте поступление"
             + (f". ВНИМАНИЕ: этот файл уже присылали по сделке #{reused}, сверяйте только выписку банка" if reused else ""))

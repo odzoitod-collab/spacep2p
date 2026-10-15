@@ -101,6 +101,54 @@ class Deal(Base):
     sender_bank: Mapped[str | None] = mapped_column(String(40))  # order requisites: the buyer's bank
 
 
+class BybitAccount(Base):
+    __tablename__ = "bybit_accounts"
+    name: Mapped[str] = mapped_column(String(32), primary_key=True)
+    uid: Mapped[str] = mapped_column(String(32), unique=True)
+    enabled: Mapped[bool] = mapped_column(default=True)
+    paused_until: Mapped[datetime | None]
+    last_used_at: Mapped[datetime | None]
+    # Local accounting of completed purchases; not a live exchange wallet balance.
+    acquired_usdt: Mapped[Decimal] = mapped_column(USDT, default=Decimal(0))
+
+
+class BybitOrder(Base):
+    __tablename__ = "bybit_orders"
+    deal_id: Mapped[int] = mapped_column(ForeignKey("deals.id"), primary_key=True)
+    account_name: Mapped[str | None] = mapped_column(ForeignKey("bybit_accounts.name"), index=True)
+    ad_id: Mapped[str] = mapped_column(String(32))
+    order_id: Mapped[str | None] = mapped_column(String(32), unique=True)
+    # awaiting_entry -> requisites -> receipt -> waiting_release -> completed; review / cancelled
+    stage: Mapped[str] = mapped_column(String(24), default="awaiting_entry", index=True)
+    resume_stage: Mapped[str | None] = mapped_column(String(24))
+    session_id: Mapped[str | None] = mapped_column(Text)
+    payment_id: Mapped[str | None] = mapped_column(String(64))
+    payment_type: Mapped[str | None] = mapped_column(String(32))
+    receipt_url: Mapped[str | None] = mapped_column(Text)
+    receipt_sent: Mapped[bool] = mapped_column(default=False)
+    send_attempted_at: Mapped[datetime | None]
+    paid_attempted_at: Mapped[datetime | None]
+    expected_quantity: Mapped[Decimal | None] = mapped_column(USDT)
+    received_quantity: Mapped[Decimal | None] = mapped_column(USDT)
+    created_at: Mapped[datetime] = mapped_column(default=now)
+    updated_at: Mapped[datetime] = mapped_column(default=now)
+    error_code: Mapped[str | None] = mapped_column(String(64))
+
+
+class BybitAction(Base):
+    __tablename__ = "bybit_actions"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    deal_id: Mapped[int] = mapped_column(ForeignKey("deals.id"), index=True)
+    account_name: Mapped[str | None] = mapped_column(String(32))
+    order_id: Mapped[str | None] = mapped_column(String(32))
+    action: Mapped[str] = mapped_column(String(32))
+    result: Mapped[str] = mapped_column(String(16))
+    code: Mapped[str | None] = mapped_column(String(64))
+    # Only bounded, explicitly selected values: never request headers or raw chat/API bodies.
+    details: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(default=now)
+
+
 class Deposit(Base):
     __tablename__ = "deposits"
     id: Mapped[int] = mapped_column(primary_key=True)

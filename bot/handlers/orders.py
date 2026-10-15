@@ -236,6 +236,7 @@ async def give_screen(bot: Bot, s: AsyncSession, user: User, d: Deal, state: FSM
         *[btn(f"{t.bank} {mask(t)} · {t.holder[:18]}", f"orq:tpl:{d.id}:{t.id}", "refresh", style="primary")
           for t in templates],
         [btn("Новая карта", f"orq:k:{d.id}:card", "card"), btn("Новый СБП", f"orq:k:{d.id}:sbp", "sbp")],
+        btn("Ссылка Bybit", f"orq:bybit:{d.id}", "link") if config.bybit_enabled else None,
         btn("Отказаться", f"orq:drop:{d.id}", "cross"),
     ), src)
 
